@@ -12,6 +12,27 @@ That's it. The default configuration works out of the box for most services: SQS
 
 ## Docker Compose
 
+### Building a local source image
+
+Use the repository helper when testing a local or dirty Floci checkout:
+
+```bash
+docker/build-local-image.sh floci/floci:local
+```
+
+The image records the base Git revision, a deterministic digest of tracked and
+untracked changes, and the build timestamp as image labels. This makes a shared
+local image auditable without copying the source tree into every consuming
+worktree:
+
+```bash
+docker image inspect floci/floci:local \
+  --format '{{json .Config.Labels}}'
+```
+
+Use `docker/build-local-image.sh --metadata-only` to print the provenance that
+would be applied without starting a build.
+
 ### Minimal (stateless)
 
 ```yaml title="docker-compose.yml"

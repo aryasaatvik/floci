@@ -3,6 +3,12 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
+      args:
+        VERSION: ${FLOCI_BUILD_VERSION:-latest}
+        SOURCE_REVISION: ${FLOCI_SOURCE_REVISION:-unknown}
+        SOURCE_PATCH_SHA256: ${FLOCI_SOURCE_PATCH_SHA256:-clean}
+        SOURCE_DIRTY: ${FLOCI_SOURCE_DIRTY:-false}
+        BUILD_CREATED: ${FLOCI_BUILD_CREATED:-unknown}
     tty: true
     ports:
       - "4566:4566"
