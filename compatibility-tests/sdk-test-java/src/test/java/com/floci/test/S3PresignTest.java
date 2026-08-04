@@ -4,7 +4,9 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
@@ -15,6 +17,8 @@ import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
+import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
+import software.amazon.awssdk.services.s3.presigner.model.PresignedGetObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.model.PresignedPutObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.model.PutObjectPresignRequest;
 
@@ -38,6 +42,8 @@ class S3PresignTest {
     private static S3Presigner presigner;
     private static final String BUCKET = TestFixtures.uniqueName("sdk-s3-presign");
     private static final String KEY = "presigned-tagged-put.txt";
+    private static final String CONTENT_TYPE_KEY = "presigned-content-type-put.txt";
+    private static final String SESSION_KEY = "presigned-session-get.txt";
 
     @BeforeAll
     static void setup() {
@@ -59,6 +65,8 @@ class S3PresignTest {
                 s3.deleteObject(DeleteObjectRequest.builder().bucket(BUCKET).key(KEY).build());
             } catch (Exception ignored) {
             }
+            s3.deleteObject(DeleteObjectRequest.builder().bucket(BUCKET).key(CONTENT_TYPE_KEY).build());
+            s3.deleteObject(DeleteObjectRequest.builder().bucket(BUCKET).key(SESSION_KEY).build());
             try {
                 s3.deleteBucket(DeleteBucketRequest.builder().bucket(BUCKET).build());
             } catch (Exception ignored) {
@@ -129,5 +137,77 @@ class S3PresignTest {
                 StandardCharsets.UTF_8
         );
         assertThat(downloaded).isEqualTo(content);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "FLOCI_AUTH_VALIDATE_SIGNATURES", matches = "(?i)true")
+    @DisplayName("SigV4 validation accepts an AWS SDK pre-signed PUT and rejects a signed header mutation")
+    void presignedPutValidatesAwsSdkCanonicalHeaders() throws Exception {
+        PresignedPutObjectRequest presigned = presigner.presignPutObject(
+                PutObjectPresignRequest.builder()
+                        .signatureDuration(Duration.ofMinutes(10))
+                        .putObjectRequest(PutObjectRequest.builder()
+                                .bucket(BUCKET)
+                                .key(CONTENT_TYPE_KEY)
+                                .contentType("text/plain")
+                                .build())
+                        .build());
+
+        assertThat(put(presigned, "text/plain", "valid signed content-type")).isEqualTo(200);
+        assertThat(put(presigned, "application/json", "mutated signed content-type")).isEqualTo(403);
+    }
+
+    @Test
+    @EnabledIfEnvironmentVariable(named = "FLOCI_AUTH_VALIDATE_SIGNATURES", matches = "(?i)true")
+    @DisplayName("SigV4 validation includes the AWS SDK session token in the canonical query")
+    void presignedGetValidatesAwsSdkSessionToken() throws Exception {
+        s3.putObject(PutObjectRequest.builder().bucket(BUCKET).key(SESSION_KEY).build(),
+                software.amazon.awssdk.core.sync.RequestBody.fromString("session-token GET"));
+
+        try (S3Presigner sessionPresigner = S3Presigner.builder()
+                .endpointOverride(TestFixtures.endpoint())
+                .region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsSessionCredentials.create("test", "test", "session-token")))
+                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
+                .build()) {
+            PresignedGetObjectRequest presigned = sessionPresigner.presignGetObject(
+                    GetObjectPresignRequest.builder()
+                            .signatureDuration(Duration.ofMinutes(10))
+                            .getObjectRequest(GetObjectRequest.builder().bucket(BUCKET).key(SESSION_KEY).build())
+                            .build());
+
+            assertThat(presigned.url().getQuery()).contains("X-Amz-Security-Token=session-token");
+            assertThat(get(presigned.url())).isEqualTo(200);
+        }
+    }
+
+    private static int put(PresignedPutObjectRequest presigned, String contentType, String content) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) presigned.url().openConnection();
+        connection.setRequestMethod("PUT");
+        connection.setDoOutput(true);
+
+        for (Map.Entry<String, List<String>> entry : presigned.httpRequest().headers().entrySet()) {
+            if ("content-type".equalsIgnoreCase(entry.getKey())) {
+                continue;
+            }
+            for (String value : entry.getValue()) {
+                connection.addRequestProperty(entry.getKey(), value);
+            }
+        }
+        connection.setRequestProperty("Content-Type", contentType);
+
+        byte[] body = content.getBytes(StandardCharsets.UTF_8);
+        connection.setFixedLengthStreamingMode(body.length);
+        try (OutputStream output = connection.getOutputStream()) {
+            output.write(body);
+        }
+        return connection.getResponseCode();
+    }
+
+    private static int get(java.net.URL url) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+        connection.setRequestMethod("GET");
+        return connection.getResponseCode();
     }
 }

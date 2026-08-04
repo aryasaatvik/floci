@@ -38,7 +38,6 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
 
         String amzDate = queryParams.getFirst("X-Amz-Date");
         String expiresStr = queryParams.getFirst("X-Amz-Expires");
-        String signature = queryParams.getFirst("X-Amz-Signature");
 
         int expires;
         try {
@@ -58,18 +57,8 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
 
         // Optionally verify signature (if validateSignatures is enabled)
         if (presignGenerator.shouldValidateSignatures()) {
-            String path = requestContext.getUriInfo().getPath();
-            String[] parts = path.split("/", 3);
-            if (parts.length < 3) {
-                requestContext.abortWith(errorResponse(403, "AccessDenied",
-                        "Invalid pre-signed URL path."));
-                return;
-            }
-            String bucket = parts[1];
-            String key = parts[2];
-            String method = requestContext.getMethod();
-
-            if (!presignGenerator.verifySignature(method, bucket, key, amzDate, expires, signature)) {
+            if (!presignGenerator.verifySignature(requestContext.getMethod(),
+                    requestContext.getUriInfo().getRequestUri(), requestContext.getHeaders())) {
                 requestContext.abortWith(errorResponse(403, "SignatureDoesNotMatch",
                         "The request signature we calculated does not match the signature you provided."));
             }
