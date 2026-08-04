@@ -1,20 +1,24 @@
 package io.github.hectorvent.floci.services.apigatewayv2;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
-import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.services.apigatewayv2.model.*;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -33,7 +37,11 @@ public class ApiGatewayV2Service {
     private final StorageBackend<String, IntegrationResponse> integrationResponseStore;
     private final StorageBackend<String, Model> modelStore;
     private final StorageBackend<String, VpcLink> vpcLinkStore;
+    private final StorageBackend<String, DomainName> domainNameStore;
+    private final StorageBackend<String, ApiMapping> apiMappingStore;
     private final RegionResolver regionResolver;
+
+    public record ApiOwner(String accountId, String region) {}
 
     @Inject
     public ApiGatewayV2Service(StorageFactory storageFactory, EmulatorConfig config, RegionResolver regionResolver) {
@@ -56,6 +64,10 @@ public class ApiGatewayV2Service {
         this.modelStore = storageFactory.create("apigatewayv2", "apigatewayv2-models.json",
                 new TypeReference<>() {});
         this.vpcLinkStore = storageFactory.create("apigatewayv2", "apigatewayv2-vpclinks.json",
+                new TypeReference<>() {});
+        this.domainNameStore = storageFactory.create("apigatewayv2", "apigatewayv2-domainnames.json",
+                new TypeReference<>() {});
+        this.apiMappingStore = storageFactory.create("apigatewayv2", "apigatewayv2-apimappings.json",
                 new TypeReference<>() {});
         this.regionResolver = regionResolver;
     }
@@ -86,7 +98,7 @@ public class ApiGatewayV2Service {
         Map<String, String> tags = (Map<String, String>) request.get("tags");
         String overrideId = ReservedTags.extractOverrideApiId(tags);
         String apiId = overrideId != null ? overrideId : shortId(10);
-        if (apiStore.get(apiKey(region, apiId)).isPresent()) {
+        if (apiIdExists(apiId)) {
             throw new AwsException("ConflictException",
                     "API with id '" + apiId + "' already exists", 409);
         }
@@ -126,6 +138,38 @@ public class ApiGatewayV2Service {
                 .orElseThrow(() -> new AwsException("NotFoundException", "Invalid API id specified", 404));
     }
 
+    /** Resolves the account and region that own an API ID for unsigned data-plane requests. */
+    public Optional<ApiOwner> findApiOwner(String apiId) {
+        if (!(apiStore instanceof AccountAwareStorageBackend<Api> accountAware)) {
+            return apiStore.keys().stream()
+                    .filter(key -> key.endsWith("::" + apiId))
+                    .map(key -> new ApiOwner(regionResolver.getAccountId(), regionFromApiKey(key)))
+                    .findFirst();
+        }
+
+        List<AccountAwareStorageBackend.AccountEntry<Api>> matches = accountAware
+                .scanAllAccountEntries(key -> key.endsWith("::" + apiId));
+        if (matches.size() > 1) {
+            throw new AwsException("ConflictException",
+                    "API id '" + apiId + "' is ambiguous across accounts", 409);
+        }
+        return matches.stream()
+                .findFirst()
+                .map(entry -> new ApiOwner(entry.accountId(), regionFromApiKey(entry.key())));
+    }
+
+    private boolean apiIdExists(String apiId) {
+        return findApiOwner(apiId).isPresent();
+    }
+
+    private String regionFromApiKey(String key) {
+        int delimiter = key.indexOf("::");
+        if (delimiter <= 0) {
+            throw new IllegalStateException("Invalid API storage key: " + key);
+        }
+        return key.substring(0, delimiter);
+    }
+
     public List<Api> getApis(String region) {
         String prefix = region + "::";
         return apiStore.scan(k -> k.startsWith(prefix));
@@ -145,6 +189,10 @@ public class ApiGatewayV2Service {
         deleteByPrefix(modelStore, prefix);
         deleteByPrefix(routeResponseStore, prefix);
         deleteByPrefix(integrationResponseStore, prefix);
+        apiMappingStore.keys().stream()
+                .filter(key -> key.startsWith(region + "::"))
+                .filter(key -> apiMappingStore.get(key).map(mapping -> apiId.equals(mapping.getApiId())).orElse(false))
+                .forEach(apiMappingStore::delete);
         LOG.infov("Deleted HTTP API: {0} in {1}", apiId, region);
     }
 
@@ -534,6 +582,12 @@ public class ApiGatewayV2Service {
         Map<String, String> stageVariables = (Map<String, String>) request.get("stageVariables");
         stage.setStageVariables(stageVariables);
 
+        @SuppressWarnings("unchecked")
+        Map<String, String> tags = (Map<String, String>) request.get("tags");
+        if (tags != null) {
+            stage.setTags(ReservedTags.stripApiGatewayReservedTags(tags));
+        }
+
         stageStore.put(stageKey(region, apiId, stage.getStageName()), stage);
         LOG.infov("Created stage: {0} for API {1}", stage.getStageName(), apiId);
         return stage;
@@ -862,15 +916,172 @@ public class ApiGatewayV2Service {
         vpcLinkStore.delete(vpcLinkKey(region, vpcLinkId));
     }
 
+    // ──────────────────────────── Custom Domains & API Mappings ────────────────────────────
+
+    public DomainName createDomainName(String region, Map<String, Object> request) {
+        String name = (String) request.get("domainName");
+        if (name == null || name.isBlank()) {
+            throw new AwsException("BadRequestException", "DomainName must not be blank", 400);
+        }
+        String key = domainNameKey(region, name);
+        if (domainNameStore.get(key).isPresent()) {
+            throw new AwsException("ConflictException", "Domain name already exists", 409);
+        }
+
+        DomainName domain = new DomainName();
+        domain.setDomainName(name);
+        domain.setDomainNameArn("arn:aws:apigateway:" + region + "::/domainnames/" + name);
+        domain.setDomainNameConfigurations(domainConfigurations(name, request.get("domainNameConfigurations")));
+        domain.setMutualTlsAuthentication(objectMap(request.get("mutualTlsAuthentication")));
+        domain.setRoutingMode((String) request.getOrDefault("routingMode", "API_MAPPING_ONLY"));
+        domain.setApiMappingSelectionExpression("$request.basepath");
+        domain.setTags(stringMap(request.get("tags")));
+        domainNameStore.put(key, domain);
+        return domain;
+    }
+
+    public DomainName getDomainName(String region, String name) {
+        return domainNameStore.get(domainNameKey(region, name))
+                .orElseThrow(() -> new AwsException("NotFoundException", "Domain name not found", 404));
+    }
+
+    public List<DomainName> getDomainNames(String region) {
+        return domainNameStore.scan(key -> key.startsWith(region + "::"));
+    }
+
+    public DomainName updateDomainName(String region, String name, Map<String, Object> request) {
+        DomainName domain = getDomainName(region, name);
+        if (request.containsKey("domainNameConfigurations") && request.get("domainNameConfigurations") != null) {
+            domain.setDomainNameConfigurations(domainConfigurations(name, request.get("domainNameConfigurations")));
+        }
+        if (request.containsKey("mutualTlsAuthentication")) {
+            domain.setMutualTlsAuthentication(objectMap(request.get("mutualTlsAuthentication")));
+        }
+        if (request.containsKey("routingMode") && request.get("routingMode") != null) {
+            domain.setRoutingMode((String) request.get("routingMode"));
+        }
+        domainNameStore.put(domainNameKey(region, name), domain);
+        return domain;
+    }
+
+    public void deleteDomainName(String region, String name) {
+        getDomainName(region, name);
+        domainNameStore.delete(domainNameKey(region, name));
+        String prefix = region + "::" + name + "::";
+        deleteByPrefix(apiMappingStore, prefix);
+    }
+
+    public ApiMapping createApiMapping(String region, String domainName, Map<String, Object> request) {
+        getDomainName(region, domainName);
+        String apiId = (String) request.get("apiId");
+        if (apiId == null || apiId.isBlank()) {
+            throw new AwsException("BadRequestException", "ApiId must not be blank", 400);
+        }
+        getApi(region, apiId);
+        String mappingKey = (String) request.get("apiMappingKey");
+        String normalizedMappingKey = mappingKey == null ? "" : mappingKey;
+        boolean duplicate = getApiMappings(region, domainName).stream()
+                .anyMatch(mapping -> normalizedMappingKey.equals(
+                        mapping.getApiMappingKey() == null ? "" : mapping.getApiMappingKey()));
+        if (duplicate) {
+            throw new AwsException("ConflictException", "API mapping key already exists", 409);
+        }
+
+        ApiMapping mapping = new ApiMapping();
+        mapping.setApiMappingId(shortId(8));
+        mapping.setApiId(apiId);
+        mapping.setApiMappingKey(mappingKey);
+        mapping.setStage((String) request.get("stage"));
+        apiMappingStore.put(apiMappingKey(region, domainName, mapping.getApiMappingId()), mapping);
+        return mapping;
+    }
+
+    public ApiMapping getApiMapping(String region, String domainName, String mappingId) {
+        getDomainName(region, domainName);
+        return apiMappingStore.get(apiMappingKey(region, domainName, mappingId))
+                .orElseThrow(() -> new AwsException("NotFoundException", "API mapping not found", 404));
+    }
+
+    public List<ApiMapping> getApiMappings(String region, String domainName) {
+        getDomainName(region, domainName);
+        return apiMappingStore.scan(key -> key.startsWith(region + "::" + domainName + "::"));
+    }
+
+    public ApiMapping updateApiMapping(String region, String domainName, String mappingId, Map<String, Object> request) {
+        ApiMapping mapping = getApiMapping(region, domainName, mappingId);
+        if (request.containsKey("apiId") && request.get("apiId") != null) {
+            String apiId = (String) request.get("apiId");
+            getApi(region, apiId);
+            mapping.setApiId(apiId);
+        }
+        if (request.containsKey("apiMappingKey")) {
+            String mappingKey = (String) request.get("apiMappingKey");
+            String normalizedMappingKey = mappingKey == null ? "" : mappingKey;
+            boolean duplicate = getApiMappings(region, domainName).stream()
+                    .filter(candidate -> !mappingId.equals(candidate.getApiMappingId()))
+                    .anyMatch(candidate -> normalizedMappingKey.equals(
+                            candidate.getApiMappingKey() == null ? "" : candidate.getApiMappingKey()));
+            if (duplicate) {
+                throw new AwsException("ConflictException", "API mapping key already exists", 409);
+            }
+            mapping.setApiMappingKey(mappingKey);
+        }
+        if (request.containsKey("stage")) {
+            mapping.setStage((String) request.get("stage"));
+        }
+        apiMappingStore.put(apiMappingKey(region, domainName, mappingId), mapping);
+        return mapping;
+    }
+
+    public void deleteApiMapping(String region, String domainName, String mappingId) {
+        getApiMapping(region, domainName, mappingId);
+        apiMappingStore.delete(apiMappingKey(region, domainName, mappingId));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> objectMap(Object value) {
+        return value instanceof Map<?, ?> map ? new HashMap<>((Map<String, Object>) map) : null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, String> stringMap(Object value) {
+        return value instanceof Map<?, ?> map ? new HashMap<>((Map<String, String>) map) : null;
+    }
+
+    private static List<Map<String, Object>> domainConfigurations(String name, Object value) {
+        if (!(value instanceof List<?> configurations)) {
+            return new ArrayList<>();
+        }
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object configuration : configurations) {
+            if (!(configuration instanceof Map<?, ?> map)) {
+                throw new AwsException("BadRequestException", "DomainNameConfigurations must contain objects", 400);
+            }
+            Map<String, Object> normalized = new HashMap<>();
+            map.forEach((key, entryValue) -> normalized.put(String.valueOf(key), entryValue));
+            if ("REGIONAL".equals(normalized.get("endpointType"))) {
+                normalized.putIfAbsent("apiGatewayDomainName", name + ".regional.local");
+                normalized.putIfAbsent("hostedZoneId", "Z2FDTNDATAQYL2");
+            }
+            result.add(normalized);
+        }
+        return result;
+    }
+
     // ──────────────────────────── Standalone Tagging ────────────────────────────
 
-    /**
-     * Parses an API Gateway v2 resource ARN and returns a two-element array
-     * [region, apiId]. Throws BadRequestException if the ARN is malformed.
-     *
-     * Expected format: arn:aws:apigateway:{region}::/apis/{apiId}
-     */
-    private String[] parseArn(String resourceArn) {
+    private sealed interface TaggableResource permits ApiResource, StageResource, DomainNameResource {
+        String region();
+    }
+
+    private record ApiResource(String region, String apiId) implements TaggableResource {}
+
+    private record StageResource(String region, String apiId, String stageName) implements TaggableResource {}
+
+    private record DomainNameResource(String region, String domainName) implements TaggableResource {}
+
+    /** Parses the API and Stage ARN shapes accepted by API Gateway v2 tagging operations. */
+    private TaggableResource parseTaggableResource(String resourceArn) {
         if (resourceArn == null || resourceArn.isBlank()) {
             throw new AwsException("BadRequestException", "ResourceArn must not be blank", 400);
         }
@@ -881,50 +1092,92 @@ public class ApiGatewayV2Service {
             throw new AwsException("BadRequestException",
                     "Invalid ResourceArn format: " + resourceArn, 400);
         }
-        String region = arn.region();
-        String resource = arn.resource(); // e.g. "/apis/abc1234567"
-        int lastSlash = resource.lastIndexOf('/');
-        if (lastSlash < 0 || lastSlash == resource.length() - 1) {
-            throw new AwsException("BadRequestException",
-                    "Cannot extract apiId from ResourceArn: " + resourceArn, 400);
+        if (!"apigateway".equals(arn.service()) || !arn.accountId().isEmpty()) {
+            throw invalidTaggableResourceArn(resourceArn);
         }
-        String apiId = resource.substring(lastSlash + 1);
-        return new String[]{region, apiId};
+
+        String[] segments = arn.resource().split("/", -1);
+        if (segments.length == 3
+                && segments[0].isEmpty()
+                && "apis".equals(segments[1])
+                && !segments[2].isEmpty()) {
+            return new ApiResource(arn.region(), segments[2]);
+        }
+        if (segments.length == 5
+                && segments[0].isEmpty()
+                && "apis".equals(segments[1])
+                && !segments[2].isEmpty()
+                && "stages".equals(segments[3])
+                && !segments[4].isEmpty()) {
+            return new StageResource(arn.region(), segments[2], segments[4]);
+        }
+        if (segments.length == 3
+                && segments[0].isEmpty()
+                && "domainnames".equals(segments[1])
+                && !segments[2].isEmpty()) {
+            return new DomainNameResource(arn.region(), segments[2]);
+        }
+        throw invalidTaggableResourceArn(resourceArn);
+    }
+
+    private AwsException invalidTaggableResourceArn(String resourceArn) {
+        return new AwsException("BadRequestException",
+                "Unsupported API Gateway v2 ResourceArn: " + resourceArn, 400);
+    }
+
+    private Map<String, String> readTags(TaggableResource resource) {
+        Map<String, String> tags = switch (resource) {
+            case ApiResource api -> getApi(api.region(), api.apiId()).getTags();
+            case StageResource stage -> getStage(stage.region(), stage.apiId(), stage.stageName()).getTags();
+            case DomainNameResource domain -> getDomainName(domain.region(), domain.domainName()).getTags();
+        };
+        return tags == null ? new HashMap<>() : new HashMap<>(tags);
+    }
+
+    private void writeTags(TaggableResource resource, Map<String, String> tags) {
+        switch (resource) {
+            case ApiResource ref -> {
+                Api api = getApi(ref.region(), ref.apiId());
+                api.setTags(tags);
+                apiStore.put(apiKey(ref.region(), ref.apiId()), api);
+            }
+            case StageResource ref -> {
+                Stage stage = getStage(ref.region(), ref.apiId(), ref.stageName());
+                stage.setTags(tags);
+                stage.setLastUpdatedDate(System.currentTimeMillis());
+                stageStore.put(stageKey(ref.region(), ref.apiId(), ref.stageName()), stage);
+            }
+            case DomainNameResource ref -> {
+                DomainName domain = getDomainName(ref.region(), ref.domainName());
+                domain.setTags(tags);
+                domainNameStore.put(domainNameKey(ref.region(), ref.domainName()), domain);
+            }
+        }
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags) {
         ReservedTags.rejectApiGatewayReservedTagsOnUpdate(tags);
-        String[] parsed = parseArn(resourceArn);
-        String region = parsed[0];
-        String apiId  = parsed[1];
-        Api api = getApi(region, apiId);
+        TaggableResource resource = parseTaggableResource(resourceArn);
         if (tags != null && !tags.isEmpty()) {
-            if (api.getTags() == null) {
-                api.setTags(new java.util.HashMap<>());
-            }
-            api.getTags().putAll(tags);
+            Map<String, String> updated = readTags(resource);
+            updated.putAll(tags);
+            writeTags(resource, updated);
+        } else {
+            readTags(resource);
         }
-        apiStore.put(apiKey(region, apiId), api);
     }
 
     public void untagResource(String resourceArn, List<String> tagKeys) {
-        String[] parsed = parseArn(resourceArn);
-        String region = parsed[0];
-        String apiId  = parsed[1];
-        Api api = getApi(region, apiId);
-        if (tagKeys != null && api.getTags() != null) {
-            tagKeys.forEach(k -> api.getTags().remove(k));
+        TaggableResource resource = parseTaggableResource(resourceArn);
+        Map<String, String> updated = readTags(resource);
+        if (tagKeys != null) {
+            tagKeys.forEach(updated::remove);
         }
-        apiStore.put(apiKey(region, apiId), api);
+        writeTags(resource, updated);
     }
 
     public Map<String, String> getTags(String resourceArn) {
-        String[] parsed = parseArn(resourceArn);
-        String region = parsed[0];
-        String apiId  = parsed[1];
-        Api api = getApi(region, apiId);
-        Map<String, String> tags = api.getTags();
-        return (tags != null) ? new java.util.HashMap<>(tags) : java.util.Collections.emptyMap();
+        return readTags(parseTaggableResource(resourceArn));
     }
 
     // ──────────────────────────── Key helpers ────────────────────────────
@@ -967,6 +1220,14 @@ public class ApiGatewayV2Service {
 
     private String vpcLinkKey(String region, String vpcLinkId) {
         return region + "::" + vpcLinkId;
+    }
+
+    private String domainNameKey(String region, String domainName) {
+        return region + "::" + domainName;
+    }
+
+    private String apiMappingKey(String region, String domainName, String apiMappingId) {
+        return region + "::" + domainName + "::" + apiMappingId;
     }
 
     private static String shortId(int length) {

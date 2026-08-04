@@ -627,6 +627,10 @@ public class ApiGatewayV2JsonHandler {
             ObjectNode stageVariables = node.putObject("StageVariables");
             s.getStageVariables().forEach(stageVariables::put);
         }
+        if (s.getTags() != null && !s.getTags().isEmpty()) {
+            ObjectNode tags = node.putObject("Tags");
+            s.getTags().forEach(tags::put);
+        }
         return node;
     }
 

@@ -28,7 +28,9 @@ import io.github.hectorvent.floci.services.apigateway.model.UsagePlanKey;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Api;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Authorizer;
+import io.github.hectorvent.floci.services.apigatewayv2.model.ApiMapping;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Deployment;
+import io.github.hectorvent.floci.services.apigatewayv2.model.DomainName;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Integration;
 import io.github.hectorvent.floci.services.apigatewayv2.model.IntegrationResponse;
 import io.github.hectorvent.floci.services.apigatewayv2.model.Model;
@@ -973,6 +975,125 @@ public class ApiGatewayController {
         }
     }
 
+    // ──────────────────────────── Custom Domains & API Mappings (v2) ────────────────────────────
+
+    @POST
+    @Path("/v2/domainnames")
+    public Response createV2DomainName(@Context HttpHeaders headers, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            DomainName domain = v2Service.createDomainName(region, request);
+            return Response.status(201).entity(toV2DomainNameNode(domain).toString())
+                    .type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    @GET
+    @Path("/v2/domainnames")
+    public Response getV2DomainNames(@Context HttpHeaders headers) {
+        String region = regionResolver.resolveRegion(headers);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("items");
+        v2Service.getDomainNames(region).forEach(domain -> items.add(toV2DomainNameNode(domain)));
+        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/v2/domainnames/{domainName}")
+    public Response getV2DomainName(@Context HttpHeaders headers, @PathParam("domainName") String domainName) {
+        String region = regionResolver.resolveRegion(headers);
+        return Response.ok(toV2DomainNameNode(v2Service.getDomainName(region, domainName)).toString())
+                .type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @PATCH
+    @Path("/v2/domainnames/{domainName}")
+    public Response updateV2DomainName(@Context HttpHeaders headers, @PathParam("domainName") String domainName, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            DomainName domain = v2Service.updateDomainName(region, domainName, request);
+            return Response.ok(toV2DomainNameNode(domain).toString()).type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    @DELETE
+    @Path("/v2/domainnames/{domainName}")
+    public Response deleteV2DomainName(@Context HttpHeaders headers, @PathParam("domainName") String domainName) {
+        String region = regionResolver.resolveRegion(headers);
+        v2Service.deleteDomainName(region, domainName);
+        return Response.noContent().build();
+    }
+
+    @POST
+    @Path("/v2/domainnames/{domainName}/apimappings")
+    public Response createApiMapping(@Context HttpHeaders headers, @PathParam("domainName") String domainName, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            ApiMapping mapping = v2Service.createApiMapping(region, domainName, request);
+            return Response.status(201).entity(toV2ApiMappingNode(mapping).toString())
+                    .type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    @GET
+    @Path("/v2/domainnames/{domainName}/apimappings")
+    public Response getApiMappings(@Context HttpHeaders headers, @PathParam("domainName") String domainName) {
+        String region = regionResolver.resolveRegion(headers);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("items");
+        v2Service.getApiMappings(region, domainName).forEach(mapping -> items.add(toV2ApiMappingNode(mapping)));
+        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/v2/domainnames/{domainName}/apimappings/{apiMappingId}")
+    public Response getApiMapping(@Context HttpHeaders headers,
+                                  @PathParam("domainName") String domainName,
+                                  @PathParam("apiMappingId") String apiMappingId) {
+        String region = regionResolver.resolveRegion(headers);
+        return Response.ok(toV2ApiMappingNode(v2Service.getApiMapping(region, domainName, apiMappingId)).toString())
+                .type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @PATCH
+    @Path("/v2/domainnames/{domainName}/apimappings/{apiMappingId}")
+    public Response updateApiMapping(@Context HttpHeaders headers,
+                                     @PathParam("domainName") String domainName,
+                                     @PathParam("apiMappingId") String apiMappingId,
+                                     String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            ApiMapping mapping = v2Service.updateApiMapping(region, domainName, apiMappingId, request);
+            return Response.ok(toV2ApiMappingNode(mapping).toString()).type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    @DELETE
+    @Path("/v2/domainnames/{domainName}/apimappings/{apiMappingId}")
+    public Response deleteApiMapping(@Context HttpHeaders headers,
+                                     @PathParam("domainName") String domainName,
+                                     @PathParam("apiMappingId") String apiMappingId) {
+        String region = regionResolver.resolveRegion(headers);
+        v2Service.deleteApiMapping(region, domainName, apiMappingId);
+        return Response.noContent().build();
+    }
+
     @POST
     @Path("/v2/apis/{apiId}/routes")
     public Response createRoute(@Context HttpHeaders headers, @PathParam("apiId") String apiId, String body) {
@@ -1806,6 +1927,44 @@ public class ApiGatewayController {
         return node;
     }
 
+    private ObjectNode toV2DomainNameNode(DomainName domain) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("domainName", domain.getDomainName());
+        node.put("domainNameArn", domain.getDomainNameArn());
+        if (domain.getDomainNameConfigurations() != null) {
+            ArrayNode configurations = node.putArray("domainNameConfigurations");
+            domain.getDomainNameConfigurations().forEach(configuration ->
+                    configurations.add(objectMapper.valueToTree(configuration)));
+        }
+        if (domain.getMutualTlsAuthentication() != null) {
+            node.set("mutualTlsAuthentication", objectMapper.valueToTree(domain.getMutualTlsAuthentication()));
+        }
+        if (domain.getRoutingMode() != null) {
+            node.put("routingMode", domain.getRoutingMode());
+        }
+        if (domain.getApiMappingSelectionExpression() != null) {
+            node.put("apiMappingSelectionExpression", domain.getApiMappingSelectionExpression());
+        }
+        if (domain.getTags() != null && !domain.getTags().isEmpty()) {
+            ObjectNode tags = node.putObject("tags");
+            domain.getTags().forEach(tags::put);
+        }
+        return node;
+    }
+
+    private ObjectNode toV2ApiMappingNode(ApiMapping mapping) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("apiMappingId", mapping.getApiMappingId());
+        node.put("apiId", mapping.getApiId());
+        if (mapping.getApiMappingKey() != null) {
+            node.put("apiMappingKey", mapping.getApiMappingKey());
+        }
+        if (mapping.getStage() != null) {
+            node.put("stage", mapping.getStage());
+        }
+        return node;
+    }
+
     private ObjectNode toV2CorsNode(Api.Cors cors) {
         ObjectNode node = objectMapper.createObjectNode();
         if (cors.allowOrigins() != null) {
@@ -1905,6 +2064,10 @@ public class ApiGatewayController {
         if (s.getStageVariables() != null) {
             ObjectNode stageVariables = node.putObject("stageVariables");
             s.getStageVariables().forEach(stageVariables::put);
+        }
+        if (s.getTags() != null && !s.getTags().isEmpty()) {
+            ObjectNode tags = node.putObject("tags");
+            s.getTags().forEach(tags::put);
         }
         return node;
     }

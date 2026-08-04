@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.ApiKey;
 import io.github.hectorvent.floci.services.apigateway.model.Integration;
@@ -89,6 +90,7 @@ public class ApiGatewayExecuteController {
     private final WebSocketConnectionManager webSocketConnectionManager;
     private final ElbV2Service elbV2Service;
     private final SqsQueryHandler sqsQueryHandler;
+    private final RequestContext requestContext;
 
     @Inject
     public ApiGatewayExecuteController(ApiGatewayService apiGatewayService, ApiGatewayV2Service apiGatewayV2Service,
@@ -97,7 +99,8 @@ public class ApiGatewayExecuteController {
                                        AwsServiceRouter serviceRouter,
                                        WebSocketConnectionManager webSocketConnectionManager,
                                        ElbV2Service elbV2Service,
-                                       SqsQueryHandler sqsQueryHandler) {
+                                       SqsQueryHandler sqsQueryHandler,
+                                       RequestContext requestContext) {
         this.apiGatewayService = apiGatewayService;
         this.apiGatewayV2Service = apiGatewayV2Service;
         this.lambdaService = lambdaService;
@@ -108,6 +111,7 @@ public class ApiGatewayExecuteController {
         this.webSocketConnectionManager = webSocketConnectionManager;
         this.elbV2Service = elbV2Service;
         this.sqsQueryHandler = sqsQueryHandler;
+        this.requestContext = requestContext;
     }
 
     /** Matches an ELBv2 listener ARN (ALB {@code app/} or NLB {@code net/}); group 1 = region. */
@@ -246,16 +250,14 @@ public class ApiGatewayExecuteController {
                               String proxy, HttpHeaders headers, UriInfo uriInfo, byte[] body) {
         String region = regionResolver.resolveRegion(headers);
 
-        // Check if this is a v2 (HTTP API) or v1 (REST API)
-        boolean isV2 = false;
-        try {
-            apiGatewayV2Service.getApi(region, apiId);
-            isV2 = true;
-        } catch (AwsException ignored) {
-            // Not a v2 API — fall through to v1 handling
-        }
-
-        if (isV2) {
+        // Public API Gateway requests identify the resource owner through apiId. Their
+        // Authorization header belongs to the API or its authorizer, not Floci's control plane.
+        var v2Owner = apiGatewayV2Service.findApiOwner(apiId);
+        if (v2Owner.isPresent()) {
+            ApiGatewayV2Service.ApiOwner owner = v2Owner.get();
+            requestContext.setAccountId(owner.accountId());
+            requestContext.setRegion(owner.region());
+            region = owner.region();
             return dispatchV2(httpMethod, apiId, stageName, proxy, headers, uriInfo, body, region);
         }
 

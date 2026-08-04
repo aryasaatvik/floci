@@ -26,6 +26,7 @@ class ApiGatewayV2TaggingJson11Test {
             "AWS4-HMAC-SHA256 Credential=test/20260413/us-east-1/apigatewayv2/aws4_request";
 
     private static String apiId;
+    private static final String STAGE_NAME = "$default";
 
     @BeforeAll
     static void configureRestAssured() {
@@ -35,6 +36,10 @@ class ApiGatewayV2TaggingJson11Test {
     /** Builds the ARN for the given API ID. */
     private static String arn(String id) {
         return "arn:aws:apigateway:us-east-1::/apis/" + id;
+    }
+
+    private static String stageArn(String id, String stageName) {
+        return arn(id) + "/stages/" + stageName;
     }
 
     // ──────────────────────────── Setup: create shared API ────────────────────────────
@@ -55,6 +60,22 @@ class ApiGatewayV2TaggingJson11Test {
                 .body("ApiId", notNullValue())
                 .body("Name", equalTo("tagging-json11-test-api"))
                 .extract().path("ApiId");
+    }
+
+    @Test
+    @Order(2)
+    void createStage_preservesInitialTags() {
+        given()
+                .contentType(AMZ_JSON)
+                .header("X-Amz-Target", TARGET_PREFIX + "CreateStage")
+                .header("Authorization", AUTH_HEADER)
+                .body("""
+                        {"ApiId":"%s","StageName":"%s","AutoDeploy":true,"Tags":{"created":"yes"}}
+                        """.formatted(apiId, STAGE_NAME))
+                .when().post("/")
+                .then()
+                .statusCode(201)
+                .body("Tags.created", equalTo("yes"));
     }
 
     // ──────────────────────────── TagResource — HTTP 201 + empty body ────────────────────────────
@@ -100,6 +121,68 @@ class ApiGatewayV2TaggingJson11Test {
                 .statusCode(200)
                 .body("Tags.env", equalTo("production"))
                 .body("Tags.team", equalTo("platform"));
+    }
+
+    @Test
+    @Order(12)
+    void stageTagResource_usesTheStageArnShape() {
+        String resourceArn = stageArn(apiId, STAGE_NAME);
+
+        given()
+                .contentType(AMZ_JSON)
+                .header("X-Amz-Target", TARGET_PREFIX + "TagResource")
+                .header("Authorization", AUTH_HEADER)
+                .body("""
+                        {"ResourceArn":"%s","Tags":{"owner":"alchemy","worktree":"local"}}
+                        """.formatted(resourceArn))
+                .when().post("/")
+                .then()
+                .statusCode(200)
+                .body(equalTo("{}"));
+
+        given()
+                .contentType(AMZ_JSON)
+                .header("X-Amz-Target", TARGET_PREFIX + "GetTags")
+                .header("Authorization", AUTH_HEADER)
+                .body("""
+                        {"ResourceArn":"%s"}
+                        """.formatted(resourceArn))
+                .when().post("/")
+                .then()
+                .statusCode(200)
+                .body("Tags.created", equalTo("yes"))
+                .body("Tags.owner", equalTo("alchemy"))
+                .body("Tags.worktree", equalTo("local"));
+    }
+
+    @Test
+    @Order(13)
+    void stageUntagResource_removesOnlyRequestedKey() {
+        String resourceArn = stageArn(apiId, STAGE_NAME);
+
+        given()
+                .contentType(AMZ_JSON)
+                .header("X-Amz-Target", TARGET_PREFIX + "UntagResource")
+                .header("Authorization", AUTH_HEADER)
+                .body("""
+                        {"ResourceArn":"%s","TagKeys":["worktree"]}
+                        """.formatted(resourceArn))
+                .when().post("/")
+                .then()
+                .statusCode(204);
+
+        given()
+                .contentType(AMZ_JSON)
+                .header("X-Amz-Target", TARGET_PREFIX + "GetTags")
+                .header("Authorization", AUTH_HEADER)
+                .body("""
+                        {"ResourceArn":"%s"}
+                        """.formatted(resourceArn))
+                .when().post("/")
+                .then()
+                .statusCode(200)
+                .body("Tags", not(hasKey("worktree")))
+                .body("Tags.owner", equalTo("alchemy"));
     }
 
     // ──────────────────────────── TagResource merge semantics ────────────────────────────
