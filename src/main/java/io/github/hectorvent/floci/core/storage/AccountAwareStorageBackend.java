@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.RequestContext;
 import jakarta.enterprise.context.ContextNotActiveException;
 import jakarta.enterprise.inject.Instance;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,6 +29,8 @@ import java.util.stream.Collectors;
  * created before multi-account support was added.
  */
 public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> {
+
+    public record AccountEntry<T>(String accountId, String key, T value) {}
 
     private final StorageBackend<String, V> delegate;
     private final Instance<RequestContext> requestContextInstance;
@@ -102,6 +105,28 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     /** Scans all values across every account, without any account prefix filtering. */
     public List<V> scanAllAccounts() {
         return delegate.scan(k -> true);
+    }
+
+    /**
+     * Returns entries across every account while preserving the account prefix that owns
+     * each logical key. Legacy unprefixed entries are attributed to the configured default
+     * account, matching the migration behavior of {@link #get}.
+     */
+    public List<AccountEntry<V>> scanAllAccountEntries(Predicate<String> keyFilter) {
+        List<AccountEntry<V>> result = new ArrayList<>();
+        for (String rawKey : delegate.keys()) {
+            int slash = rawKey.indexOf('/');
+            boolean hasAccountPrefix = slash == 12
+                    && rawKey.substring(0, slash).chars().allMatch(Character::isDigit);
+            String accountId = hasAccountPrefix ? rawKey.substring(0, slash) : defaultAccountId;
+            String logicalKey = hasAccountPrefix ? rawKey.substring(slash + 1) : rawKey;
+            if (!keyFilter.test(logicalKey)) {
+                continue;
+            }
+            delegate.get(rawKey).ifPresent(value ->
+                    result.add(new AccountEntry<>(accountId, logicalKey, value)));
+        }
+        return result;
     }
 
     /**
