@@ -521,7 +521,7 @@ class LambdaIntegrationTest {
         org.junit.jupiter.api.Assertions.assertEquals(expectedSha256, downloadedSha256,
                 "downloaded package must be byte-identical to the uploaded zip");
 
-        // Redeploy overwrites in place (stable key), no stale package accumulates.
+        // Redeploy publishes a new immutable package location.
         ByteArrayOutputStream baos2 = new ByteArrayOutputStream();
         try (ZipOutputStream zos = new ZipOutputStream(baos2)) {
             zos.putNextEntry(new ZipEntry("index.js"));
@@ -535,9 +535,21 @@ class LambdaIntegrationTest {
             .put(BASE_PATH + "/functions/code-dl-fn/code")
         .then()
             .statusCode(200);
-        byte[] pkg2 = given().when().get(path).then().statusCode(200).extract().asByteArray();
+        String location2 = given()
+            .when()
+            .get(BASE_PATH + "/functions/code-dl-fn")
+        .then()
+            .statusCode(200)
+            .extract().path("Code.Location");
+        String path2 = java.net.URI.create(location2).getRawPath();
+        org.junit.jupiter.api.Assertions.assertNotEquals(path, path2,
+                "redeploy must publish a distinct immutable package location");
+        byte[] pkg2 = given().when().get(path2).then().statusCode(200).extract().asByteArray();
         org.junit.jupiter.api.Assertions.assertFalse(java.util.Arrays.equals(pkg, pkg2),
-                "redeploy must replace the stored package");
+                "redeploy must publish the new package bytes");
+        org.junit.jupiter.api.Assertions.assertArrayEquals(pkg,
+                given().when().get(path).then().statusCode(200).extract().asByteArray(),
+                "the previous immutable package must not be overwritten");
 
         // Deleting the function removes the stored package (Code.Location 404s).
         given()
@@ -548,6 +560,11 @@ class LambdaIntegrationTest {
         given()
             .when()
             .get(path)
+        .then()
+            .statusCode(404);
+        given()
+            .when()
+            .get(path2)
         .then()
             .statusCode(404);
     }

@@ -90,10 +90,15 @@ public class LambdaFunctionStore implements Resettable {
     }
 
     public Optional<LambdaFunction> getForAccount(String accountId, String region, String functionName) {
+        return getForAccount(accountId, region, functionName, "$LATEST");
+    }
+
+    public Optional<LambdaFunction> getForAccount(
+            String accountId, String region, String functionName, String version) {
         if (backend instanceof AccountAwareStorageBackend<LambdaFunction> aware) {
-            return aware.getForAccount(accountId, regionKey(region, functionName, "$LATEST"));
+            return aware.getForAccount(accountId, regionKey(region, functionName, version));
         }
-        return backend.get(regionKey(region, functionName, "$LATEST"));
+        return backend.get(regionKey(region, functionName, version));
     }
 
     public Optional<LambdaFunction> getByUrlId(String urlId) {
@@ -112,6 +117,13 @@ public class LambdaFunctionStore implements Resettable {
 
     public List<LambdaFunction> listAll() {
         return backend.scan(key -> true);
+    }
+
+    /** Returns every account's functions for process-wide Docker resource reconciliation. */
+    public List<LambdaFunction> listAllAccounts() {
+        return backend instanceof AccountAwareStorageBackend<LambdaFunction> aware
+                ? aware.scanAllAccounts()
+                : backend.scan(key -> true);
     }
 
     public void delete(String region, String functionName) {

@@ -29,6 +29,8 @@ class EsmIntegrationTest {
             "arn:aws:sqs:" + REGION + ":" + ACCOUNT_ID + ":" + QUEUE_NAME;
     private static final String FUNCTION_ARN =
             "arn:aws:lambda:" + REGION + ":" + ACCOUNT_ID + ":function:" + FUNCTION_NAME;
+    private static final String ESM_ARN_PREFIX =
+            "arn:aws:lambda:" + REGION + ":" + ACCOUNT_ID + ":event-source-mapping:";
     private static final String NON_DEFAULT_ACCOUNT = "000000000001";
     private static final String MULTI_ACCOUNT_QUEUE_NAME = "esm-multi-account-queue";
     private static final String MULTI_ACCOUNT_FUNCTION_NAME = "esm-multi-account-fn";
@@ -82,7 +84,11 @@ class EsmIntegrationTest {
                 {
                     "FunctionName": "%s",
                     "EventSourceArn": "%s",
-                    "BatchSize": 5
+                    "BatchSize": 5,
+                    "Tags": {
+                        "alchemy::id": "esm-test",
+                        "created-with": "request"
+                    }
                 }
                 """.formatted(FUNCTION_NAME, QUEUE_ARN))
         .when()
@@ -90,6 +96,7 @@ class EsmIntegrationTest {
         .then()
             .statusCode(202)
             .body("UUID", notNullValue())
+            .body("EventSourceMappingArn", startsWith(ESM_ARN_PREFIX))
             .body("FunctionArn", equalTo(FUNCTION_ARN))
             .body("EventSourceArn", equalTo(QUEUE_ARN))
             .body("BatchSize", equalTo(5))
@@ -257,6 +264,7 @@ class EsmIntegrationTest {
         .then()
             .statusCode(200)
             .body("UUID", equalTo(esmUuid))
+            .body("EventSourceMappingArn", equalTo(ESM_ARN_PREFIX + esmUuid))
             .body("FunctionArn", equalTo(FUNCTION_ARN))
             .body("BatchSize", equalTo(5))
             .body("State", equalTo("Enabled"));
@@ -271,7 +279,11 @@ class EsmIntegrationTest {
         .then()
             .statusCode(200)
             .body("EventSourceMappings", hasSize(greaterThanOrEqualTo(1)))
-            .body("EventSourceMappings[0].UUID", notNullValue());
+            .body("EventSourceMappings[0].UUID", notNullValue())
+            .body("EventSourceMappings.find { it.UUID == '" + esmUuid
+                    + "' }.EventSourceMappingArn", equalTo(ESM_ARN_PREFIX + esmUuid))
+            .body("EventSourceMappings.find { it.UUID == '" + esmUuid
+                    + "' }.FunctionArn", equalTo(FUNCTION_ARN));
     }
 
     @Test
@@ -287,6 +299,55 @@ class EsmIntegrationTest {
     }
 
     @Test
+    @Order(9)
+    void eventSourceMappingTagsRoundTripOnMappingArn() {
+        String mappingArn = ESM_ARN_PREFIX + esmUuid;
+
+        given()
+        .when()
+            .get("/2017-03-31/tags/" + mappingArn)
+        .then()
+            .statusCode(200)
+            .body("Tags.'alchemy::id'", equalTo("esm-test"))
+            .body("Tags.'created-with'", equalTo("request"));
+
+        given()
+            .contentType("application/json")
+            .body("""
+                {"Tags":{"owner":"alchemy","created-with":"tag-resource"}}
+                """)
+        .when()
+            .post("/2017-03-31/tags/" + mappingArn)
+        .then()
+            .statusCode(204);
+
+        given()
+        .when()
+            .get("/2017-03-31/tags/" + mappingArn)
+        .then()
+            .statusCode(200)
+            .body("Tags.'alchemy::id'", equalTo("esm-test"))
+            .body("Tags.owner", equalTo("alchemy"))
+            .body("Tags.'created-with'", equalTo("tag-resource"));
+
+        given()
+            .queryParam("tagKeys", "created-with")
+        .when()
+            .delete("/2017-03-31/tags/" + mappingArn)
+        .then()
+            .statusCode(204);
+
+        given()
+        .when()
+            .get("/2017-03-31/tags/" + mappingArn)
+        .then()
+            .statusCode(200)
+            .body("Tags.'alchemy::id'", equalTo("esm-test"))
+            .body("Tags.owner", equalTo("alchemy"))
+            .body("Tags.'created-with'", nullValue());
+    }
+
+    @Test
     @Order(10)
     void updateEventSourceMapping() {
         given()
@@ -296,8 +357,71 @@ class EsmIntegrationTest {
             .put(LAMBDA_BASE + "/event-source-mappings/" + esmUuid)
         .then()
             .statusCode(202)
+            .body("EventSourceMappingArn", equalTo(ESM_ARN_PREFIX + esmUuid))
+            .body("FunctionArn", equalTo(FUNCTION_ARN))
             .body("BatchSize", equalTo(20))
             .body("State", equalTo("Enabled"));
+    }
+
+    @Test
+    @Order(10)
+    void eventSourceMappingPreservesAliasAndVersionTargets() {
+        given()
+            .contentType("application/json")
+            .body("{}")
+        .when()
+            .post(LAMBDA_BASE + "/functions/" + FUNCTION_NAME + "/versions")
+        .then()
+            .statusCode(201)
+            .body("Version", equalTo("1"));
+
+        given()
+            .contentType("application/json")
+            .body("{\"Name\":\"live\",\"FunctionVersion\":\"1\"}")
+        .when()
+            .post(LAMBDA_BASE + "/functions/" + FUNCTION_NAME + "/aliases")
+        .then()
+            .statusCode(201);
+
+        String qualifiedUuid = given()
+            .contentType("application/json")
+            .body("""
+                {
+                    "FunctionName": "%s:live",
+                    "EventSourceArn": "%s"
+                }
+                """.formatted(FUNCTION_NAME, QUEUE_ARN))
+        .when()
+            .post(LAMBDA_BASE + "/event-source-mappings")
+        .then()
+            .statusCode(202)
+            .body("EventSourceMappingArn", startsWith(ESM_ARN_PREFIX))
+            .body("FunctionArn", equalTo(FUNCTION_ARN + ":live"))
+        .extract()
+            .path("UUID");
+
+        given()
+            .contentType("application/json")
+            .body("{\"FunctionName\":\"%s:1\",\"BatchSize\":6}".formatted(FUNCTION_NAME))
+        .when()
+            .put(LAMBDA_BASE + "/event-source-mappings/" + qualifiedUuid)
+        .then()
+            .statusCode(202)
+            .body("EventSourceMappingArn", equalTo(ESM_ARN_PREFIX + qualifiedUuid))
+            .body("FunctionArn", equalTo(FUNCTION_ARN + ":1"));
+
+        given()
+        .when()
+            .get(LAMBDA_BASE + "/event-source-mappings/" + qualifiedUuid)
+        .then()
+            .statusCode(200)
+            .body("EventSourceMappingArn", equalTo(ESM_ARN_PREFIX + qualifiedUuid))
+            .body("FunctionArn", equalTo(FUNCTION_ARN + ":1"));
+
+        given()
+            .delete(LAMBDA_BASE + "/event-source-mappings/" + qualifiedUuid)
+        .then()
+            .statusCode(202);
     }
 
     @Test

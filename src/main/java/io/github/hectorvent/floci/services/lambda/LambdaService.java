@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.LambdaUrlConfig;
 import io.github.hectorvent.floci.services.lambda.model.ScalingConfig;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionEnvironmentId;
 import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import io.github.hectorvent.floci.services.s3.S3Service;
@@ -35,6 +36,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -81,6 +83,8 @@ public class LambdaService {
      * emulator workload.
      */
     private final ConcurrentHashMap<String, Object> concurrencyOpLocks = new ConcurrentHashMap<>();
+    /** Serializes resource-policy reads and mutations for each canonical function ARN. */
+    private final ConcurrentHashMap<String, Object> policyMutationLocks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> versionCounterLocks = new ConcurrentHashMap<>();
 
     /**
@@ -368,6 +372,7 @@ public class LambdaService {
         }
 
         functionStore.save(region, fn);
+        warmPool.drainFunction(fn);
         LOG.infov("Created Lambda function: {0} in region {1}", functionName, region);
         return fn;
     }
@@ -377,6 +382,12 @@ public class LambdaService {
         return functionStore.get(region, canonical)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Function not found: " + functionName, 404));
+    }
+
+    /** Resolve an AWS FunctionName plus optional Qualifier to its immutable view. */
+    public LambdaFunction getFunction(String region, String functionName, String qualifier) {
+        LambdaArnUtils.ResolvedFunctionRef ref = resolveWithRegion(region, functionName, qualifier);
+        return resolveInvokeTarget(region, ref.name(), ref.qualifier());
     }
 
     /**
@@ -441,7 +452,7 @@ public class LambdaService {
         fn.setRevisionId(UUID.randomUUID().toString());
 
         // Drain warm containers — they have stale code mounted
-        warmPool.drainFunction(functionName);
+        warmPool.drainFunction(fn);
 
         functionStore.save(region, fn);
         LOG.infov("Updated code for function: {0}", functionName);
@@ -562,7 +573,7 @@ public class LambdaService {
         fn.setRevisionId(UUID.randomUUID().toString());
 
         // Drain warm containers so the next invocation picks up the new configuration
-        warmPool.drainFunction(functionName);
+        warmPool.drainFunction(fn);
 
         functionStore.save(region, fn);
         LOG.infov("Updated configuration for function: {0}", functionName);
@@ -573,7 +584,8 @@ public class LambdaService {
         LambdaFunction fn = getFunction(region, functionName); // throws 404 if not found
         functionName = fn.getFunctionName();
         String arn = fn.getFunctionArn();
-        warmPool.drainFunction(functionName);
+        List<LambdaFunction> versions = functionStore.listVersions(region, functionName);
+        versions.forEach(warmPool::retireFunction);
         // Take the same per-function lock used by Put/DeleteFunctionConcurrency
         // so a concurrent concurrency mutation cannot interleave with the
         // limiter reset and store delete and leave the two views out of sync.
@@ -585,7 +597,8 @@ public class LambdaService {
             if (concurrencyLimiter != null) {
                 concurrencyLimiter.reset(arn);
             }
-            codeStore.delete(functionName);
+            LambdaExecutionEnvironmentId environmentId = LambdaExecutionEnvironmentId.from(fn);
+            codeStore.delete(environmentId.accountId(), environmentId.region(), functionName);
             functionStore.delete(region, functionName);
             versionCounters.remove(region + "::" + functionName);
             if (aliasStore != null) {
@@ -594,12 +607,16 @@ public class LambdaService {
                 }
             }
         }
-        // Best-effort: drop the stored deployment package.
+        // Best-effort: drop every immutable deployment package for this function.
         if (s3Service != null) {
             try {
-                s3Service.deleteObject(tasksBucketName(region), codeObjectKey(fn));
+                String bucket = tasksBucketName(region);
+                for (S3Object object : s3Service.listObjects(
+                        bucket, codeObjectPrefix(fn), null, Integer.MAX_VALUE)) {
+                    s3Service.deleteObject(bucket, object.getKey());
+                }
             } catch (Exception e) {
-                LOG.warnv("Could not delete deployment package for {0}: {1}",
+                LOG.warnv("Could not delete deployment packages for {0}: {1}",
                         functionName, e.getMessage());
             }
         }
@@ -612,6 +629,17 @@ public class LambdaService {
         String name = ref.name();
         String qualifier = ref.qualifier();
         LambdaFunction fn = resolveInvokeTarget(region, name, qualifier);
+        InvokeResult result = executorService.invoke(fn, payload, type);
+        result.setExecutedVersion(fn.getVersion());
+        return result;
+    }
+
+    /** Invokes a Lambda target ARN using the account encoded in that ARN. */
+    public InvokeResult invokeArn(String functionArn, byte[] payload, InvocationType type) {
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(functionArn);
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionArn);
+        LambdaFunction fn = resolveInvokeTargetForAccount(
+                arn.accountId(), arn.region(), ref.name(), ref.qualifier());
         InvokeResult result = executorService.invoke(fn, payload, type);
         result.setExecutedVersion(fn.getVersion());
         return result;
@@ -635,6 +663,37 @@ public class LambdaService {
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Function not found: " + name, 404));
         }
         return functionStore.get(region, name, version)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Function version not found: " + name + ":" + version, 404));
+    }
+
+    private LambdaFunction resolveInvokeTargetForAccount(
+            String accountId, String region, String name, String qualifier) {
+        if (qualifier == null || qualifier.equals("$LATEST")) {
+            return functionStore.getForAccount(accountId, region, name)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Function not found: " + name, 404));
+        }
+        if (qualifier.chars().allMatch(Character::isDigit)) {
+            return functionStore.getForAccount(accountId, region, name, qualifier)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Function version not found: " + name + ":" + qualifier, 404));
+        }
+        LambdaAlias alias = aliasStore != null
+                ? aliasStore.getForAccount(accountId, region, name, qualifier)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Alias not found: " + qualifier, 404))
+                : null;
+        if (alias == null) {
+            throw new AwsException("ResourceNotFoundException", "Alias not found: " + qualifier, 404);
+        }
+        String version = pickAliasVersion(alias);
+        if (version == null || version.equals("$LATEST")) {
+            return functionStore.getForAccount(accountId, region, name)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Function not found: " + name, 404));
+        }
+        return functionStore.getForAccount(accountId, region, name, version)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Function version not found: " + name + ":" + version, 404));
     }
@@ -699,7 +758,8 @@ public class LambdaService {
                     "Function ARN region '" + fnRef.region() + "' does not match event source region '" + resolvedRegion + "'", 400);
         }
 
-        LambdaFunction fn = getFunction(resolvedRegion, resolvedName);
+        EventSourceMappingFunctionTarget functionTarget = resolveEventSourceMappingFunctionTarget(
+                resolvedRegion, fnRef);
 
         int batchSize = toInt(request.get("BatchSize"), 10);
         boolean enabled = !Boolean.FALSE.equals(request.get("Enabled"));
@@ -722,11 +782,18 @@ public class LambdaService {
         EventSourceMapping esm = new EventSourceMapping();
         esm.setUuid(UUID.randomUUID().toString());
         esm.setAccountId(regionResolver.getAccountId());
-        esm.setFunctionArn(fn.getFunctionArn());
-        esm.setFunctionName(resolvedName);
+        esm.setEventSourceMappingArn(eventSourceMappingArn(
+                esm.getAccountId(), resolvedRegion, esm.getUuid()));
+        esm.setFunctionArn(functionTarget.arn());
+        esm.setFunctionName(functionTarget.name());
         esm.setEventSourceArn(eventSourceArn);
         esm.setQueueUrl(queueUrl);
         esm.setRegion(resolvedRegion);
+        @SuppressWarnings("unchecked")
+        Map<String, String> tags = request.get("Tags") instanceof Map<?, ?>
+                ? new HashMap<>((Map<String, String>) request.get("Tags"))
+                : new HashMap<>();
+        esm.setTags(tags);
         esm.setBatchSize(batchSize);
         esm.setEnabled(enabled);
         esm.setState(enabled ? "Enabled" : "Disabled");
@@ -844,9 +911,10 @@ public class LambdaService {
     }
 
     public EventSourceMapping getEventSourceMapping(String uuid) {
-        return esmStore.get(uuid)
+        EventSourceMapping esm = esmStore.get(uuid)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "EventSourceMapping not found: " + uuid, 404));
+        return normalizeEventSourceMappingIdentity(esm);
     }
 
     public List<EventSourceMapping> listEventSourceMappings(String functionArn) {
@@ -854,15 +922,32 @@ public class LambdaService {
             // Accept bare name, partial ARN, or full ARN. The store matches
             // entries by their canonical short name, so normalize first.
             String shortName = LambdaArnUtils.resolve(functionArn).name();
-            return esmStore.listByFunction(shortName);
+            return esmStore.listByFunction(shortName).stream()
+                    .map(this::normalizeEventSourceMappingIdentity)
+                    .toList();
         }
-        return esmStore.list();
+        return esmStore.list().stream()
+                .map(this::normalizeEventSourceMappingIdentity)
+                .toList();
     }
 
     public EventSourceMapping updateEventSourceMapping(String uuid, Map<String, Object> request) {
         EventSourceMapping esm = getEventSourceMapping(uuid);
 
         boolean wasEnabled = esm.isEnabled();
+
+        if (request.get("FunctionName") instanceof String functionName && !functionName.isBlank()) {
+            LambdaArnUtils.ResolvedFunctionRef fnRef = LambdaArnUtils.resolve(functionName);
+            if (fnRef.region() != null && !fnRef.region().equals(esm.getRegion())) {
+                throw new AwsException("InvalidParameterValueException",
+                        "Function ARN region '" + fnRef.region()
+                                + "' does not match event source region '" + esm.getRegion() + "'", 400);
+            }
+            EventSourceMappingFunctionTarget functionTarget = resolveEventSourceMappingFunctionTarget(
+                    esm.getRegion(), fnRef);
+            esm.setFunctionName(functionTarget.name());
+            esm.setFunctionArn(functionTarget.arn());
+        }
 
         if (request.containsKey("BatchSize")) {
             esm.setBatchSize(toInt(request.get("BatchSize"), esm.getBatchSize()));
@@ -899,6 +984,91 @@ public class LambdaService {
 
         LOG.infov("Updated ESM {0}: batchSize={1} enabled={2}", uuid, esm.getBatchSize(), esm.isEnabled());
         return esm;
+    }
+
+    private record EventSourceMappingFunctionTarget(String name, String arn) {}
+
+    private EventSourceMappingFunctionTarget resolveEventSourceMappingFunctionTarget(
+            String region, LambdaArnUtils.ResolvedFunctionRef ref) {
+        LambdaFunction latest = getFunction(region, ref.name());
+        String qualifier = ref.qualifier();
+        if (qualifier == null) {
+            return new EventSourceMappingFunctionTarget(ref.name(), latest.getFunctionArn());
+        }
+        if (qualifier.chars().allMatch(Character::isDigit)) {
+            functionStore.get(region, ref.name(), qualifier)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Function version not found: " + ref.name() + ":" + qualifier, 404));
+        } else if (!"$LATEST".equals(qualifier)) {
+            getAlias(region, ref.name(), qualifier);
+        }
+        return new EventSourceMappingFunctionTarget(
+                ref.name(), latest.getFunctionArn() + ":" + qualifier);
+    }
+
+    private EventSourceMapping normalizeEventSourceMappingIdentity(EventSourceMapping esm) {
+        boolean changed = false;
+        AwsArnUtils.Arn functionArn = parseArnOrNull(esm.getFunctionArn());
+        if (esm.getRegion() == null || esm.getRegion().isBlank()) {
+            String recoveredRegion = functionArn != null && !functionArn.region().isBlank()
+                    ? functionArn.region()
+                    : regionResolver.resolveRegion(null);
+            esm.setRegion(recoveredRegion);
+            changed = true;
+        }
+        if (esm.getAccountId() == null || esm.getAccountId().isBlank()
+                || "null".equals(esm.getAccountId())) {
+            String recoveredAccountId = functionArn != null && !functionArn.accountId().isBlank()
+                    ? functionArn.accountId()
+                    : regionResolver.getAccountId();
+            esm.setAccountId(recoveredAccountId);
+            changed = true;
+        }
+
+        String expectedMappingArn = eventSourceMappingArn(
+                esm.getAccountId(), esm.getRegion(), esm.getUuid());
+        if (!expectedMappingArn.equals(esm.getEventSourceMappingArn())) {
+            if (esm.getEventSourceMappingArn() == null
+                    && esm.getFunctionArn() != null
+                    && esm.getFunctionArn().contains(":event-source-mapping:")) {
+                AwsArnUtils.Arn legacyMappingArn = parseArnOrNull(esm.getFunctionArn());
+                if (legacyMappingArn != null
+                        && legacyMappingArn.region().equals(esm.getRegion())
+                        && legacyMappingArn.accountId().equals(esm.getAccountId())) {
+                    expectedMappingArn = esm.getFunctionArn();
+                }
+            }
+            esm.setEventSourceMappingArn(expectedMappingArn);
+            changed = true;
+        }
+        if (esm.getFunctionArn() == null || esm.getFunctionArn().contains(":event-source-mapping:")) {
+            esm.setFunctionArn("arn:aws:lambda:" + esm.getRegion() + ":" + esm.getAccountId()
+                    + ":function:" + esm.getFunctionName());
+            changed = true;
+        }
+        if (esm.getTags() == null) {
+            esm.setTags(new HashMap<>());
+            changed = true;
+        }
+        if (changed) {
+            esmStore.save(esm);
+        }
+        return esm;
+    }
+
+    private static AwsArnUtils.Arn parseArnOrNull(String value) {
+        if (value == null || value.isBlank() || !value.startsWith("arn:")) {
+            return null;
+        }
+        try {
+            return AwsArnUtils.parse(value);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+    }
+
+    private static String eventSourceMappingArn(String accountId, String region, String uuid) {
+        return "arn:aws:lambda:" + region + ":" + accountId + ":event-source-mapping:" + uuid;
     }
 
     public void deleteEventSourceMapping(String uuid) {
@@ -943,11 +1113,31 @@ public class LambdaService {
         snapshot.setPackageType(fn.getPackageType());
         snapshot.setState(fn.getState());
         snapshot.setCodeSizeBytes(fn.getCodeSizeBytes());
-        snapshot.setEnvironment(fn.getEnvironment());
+        snapshot.setCodeSha256(fn.getCodeSha256());
+        snapshot.setCodeLocalPath(fn.getCodeLocalPath());
+        snapshot.setS3Bucket(fn.getS3Bucket());
+        snapshot.setS3Key(fn.getS3Key());
+        snapshot.setHotReloadHostPath(fn.getHotReloadHostPath());
+        snapshot.setImageUri(fn.getImageUri());
+        snapshot.setImageConfigCommand(fn.getImageConfigCommand() == null
+                ? null : new ArrayList<>(fn.getImageConfigCommand()));
+        snapshot.setImageConfigEntryPoint(fn.getImageConfigEntryPoint() == null
+                ? null : new ArrayList<>(fn.getImageConfigEntryPoint()));
+        snapshot.setImageConfigWorkingDirectory(fn.getImageConfigWorkingDirectory());
+        snapshot.setEnvironment(fn.getEnvironment() == null
+                ? null : new HashMap<>(fn.getEnvironment()));
+        snapshot.setArchitectures(fn.getArchitectures() == null ? null : new ArrayList<>(fn.getArchitectures()));
+        snapshot.setEphemeralStorageSize(fn.getEphemeralStorageSize());
+        snapshot.setTracingMode(fn.getTracingMode());
+        snapshot.setDeadLetterTargetArn(fn.getDeadLetterTargetArn());
+        snapshot.setLayers(fn.getLayers() == null ? null : new ArrayList<>(fn.getLayers()));
+        snapshot.setKmsKeyArn(fn.getKmsKeyArn());
+        snapshot.setVpcConfig(fn.getVpcConfig() == null ? null : new HashMap<>(fn.getVpcConfig()));
         snapshot.setLastModified(System.currentTimeMillis());
         snapshot.setRevisionId(UUID.randomUUID().toString());
 
         functionStore.save(region, snapshot);
+        warmPool.drainFunction(snapshot);
         LOG.infov("Published version {0} for function {1}", version, functionName);
         return snapshot;
     }
@@ -1031,7 +1221,12 @@ public class LambdaService {
             urlConfig.setInvokeMode((String) request.get("InvokeMode"));
         }
 
-        String urlId = UUID.nameUUIDFromBytes((region + functionName + (qualifier != null ? qualifier : "")).getBytes()).toString().replace("-", "").substring(0, 32);
+        String accountId = regionResolver.getAccountId();
+        String urlId = UUID.nameUUIDFromBytes(
+                        (accountId + region + functionName + (qualifier != null ? qualifier : "")).getBytes())
+                .toString()
+                .replace("-", "")
+                .substring(0, 32);
         String baseHost = config.effectiveBaseUrl().replaceFirst("https?://", "");
         String url = String.format("http://%s.lambda-url.%s.%s/", urlId, region, baseHost);
         urlConfig.setFunctionUrl(url);
@@ -1256,10 +1451,31 @@ public class LambdaService {
         return "awslambda-" + r + "-tasks";
     }
 
-    /** Stable, account-scoped S3 key for a function's current deployment package. */
+    /** Stable, immutable S3 key for an account/region/function deployment package. */
     public static String codeObjectKey(LambdaFunction fn) {
-        String account = fn.getAccountId() != null ? fn.getAccountId() : "000000000000";
-        return "snapshots/" + account + "/" + fn.getFunctionName();
+        String codeIdentity = fn.getCodeSha256();
+        if (codeIdentity == null || codeIdentity.isBlank()) {
+            codeIdentity = fn.getRevisionId();
+        }
+        if (codeIdentity == null || codeIdentity.isBlank()) {
+            codeIdentity = Long.toString(fn.getLastModified());
+        }
+        String artifactId;
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(codeIdentity.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            artifactId = java.util.HexFormat.of().formatHex(digest);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
+        return codeObjectPrefix(fn) + artifactId + ".zip";
+    }
+
+    private static String codeObjectPrefix(LambdaFunction fn) {
+        String account = fn.getAccountId() != null ? fn.getAccountId() :
+                AwsArnUtils.accountOrDefault(fn.getFunctionArn(), "000000000000");
+        String region = AwsArnUtils.regionOrDefault(fn.getFunctionArn(), "us-east-1");
+        return "snapshots/" + account + "/" + region + "/" + fn.getFunctionName() + "/";
     }
 
     private void extractZipCode(LambdaFunction fn, String zipFileBase64, String region) {
@@ -1267,15 +1483,22 @@ public class LambdaService {
     }
 
     private void extractZipCodeBytes(LambdaFunction fn, byte[] zipBytes, String region) {
-        Path codePath = codeStore.getCodePath(fn.getFunctionName());
+        byte[] digest;
+        try {
+            digest = java.security.MessageDigest.getInstance("SHA-256").digest(zipBytes);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
+        String codeSha256 = Base64.getEncoder().encodeToString(digest);
+        String codeArtifactId = java.util.HexFormat.of().formatHex(digest);
+        LambdaExecutionEnvironmentId environmentId = LambdaExecutionEnvironmentId.from(fn);
+        Path codePath = codeStore.getCodePath(
+                environmentId.accountId(), environmentId.region(), fn.getFunctionName(), codeArtifactId);
         try {
             zipExtractor.extractTo(zipBytes, codePath);
             fn.setCodeLocalPath(codePath.toAbsolutePath().normalize().toString());
             fn.setCodeSizeBytes(zipBytes.length);
-            try {
-                byte[] digest = java.security.MessageDigest.getInstance("SHA-256").digest(zipBytes);
-                fn.setCodeSha256(Base64.getEncoder().encodeToString(digest));
-            } catch (java.security.NoSuchAlgorithmException ignored) {}
+            fn.setCodeSha256(codeSha256);
 
             // For file-based runtimes, verify handler file exists (skip Java and .NET which use different handler formats)
             if (fn.getRuntime() != null && !fn.getRuntime().startsWith("java") && !fn.getRuntime().startsWith("dotnet")) {
@@ -1395,90 +1618,124 @@ public class LambdaService {
     // ──────────────────────────── Permissions (Policy) ────────────────────────────
 
     public Map<String, Object> addPermission(String region, String functionName, Map<String, Object> request) {
-        LambdaFunction fn = getFunction(region, functionName);
-        String statementId = (String) request.get("StatementId");
-        if (statementId == null || statementId.isBlank()) {
-            throw new AwsException("InvalidParameterValueException", "StatementId is required", 400);
-        }
-        fn.getPolicies().stream()
-                .filter(s -> statementId.equals(s.get("Sid")))
-                .findFirst()
-                .ifPresent(s -> {
-                    throw new AwsException("ResourceConflictException",
-                            "The statement id (" + statementId + ") already exists. Please try again with a new Statement Id.", 409);
-                });
+        LambdaFunction observed = getFunction(region, functionName);
+        synchronized (lockForPolicyMutation(observed.getFunctionArn())) {
+            LambdaFunction fn = getFunction(region, functionName);
+            String statementId = (String) request.get("StatementId");
+            if (statementId == null || statementId.isBlank()) {
+                throw new AwsException("InvalidParameterValueException", "StatementId is required", 400);
+            }
+            fn.getPolicies().stream()
+                    .filter(s -> statementId.equals(s.get("Sid")))
+                    .findFirst()
+                    .ifPresent(s -> {
+                        throw new AwsException("ResourceConflictException",
+                                "The statement id (" + statementId + ") already exists. Please try again with a new Statement Id.", 409);
+                    });
 
-        String principal = (String) request.get("Principal");
-        String action = (String) request.get("Action");
-        String sourceArn = (String) request.get("SourceArn");
-        String sourceAccount = (String) request.get("SourceAccount");
+            String principal = (String) request.get("Principal");
+            String action = (String) request.get("Action");
+            String sourceArn = (String) request.get("SourceArn");
+            String sourceAccount = (String) request.get("SourceAccount");
 
-        Map<String, Object> statement = new java.util.LinkedHashMap<>();
-        statement.put("Sid", statementId);
-        statement.put("Effect", "Allow");
-        if (principal != null && principal.contains(".")) {
-            statement.put("Principal", Map.of("Service", principal));
-        } else if (principal != null && principal.startsWith("arn:")) {
-            statement.put("Principal", Map.of("AWS", principal));
-        } else {
-            statement.put("Principal", principal);
-        }
-        statement.put("Action", action);
-        statement.put("Resource", fn.getFunctionArn());
-        if (sourceArn != null) {
-            statement.put("Condition", Map.of("ArnLike", Map.of("AWS:SourceArn", sourceArn)));
-        } else if (sourceAccount != null) {
-            statement.put("Condition", Map.of("StringEquals", Map.of("AWS:SourceAccount", sourceAccount)));
-        }
+            Map<String, Object> statement = new java.util.LinkedHashMap<>();
+            statement.put("Sid", statementId);
+            statement.put("Effect", "Allow");
+            if (principal != null && principal.contains(".")) {
+                statement.put("Principal", Map.of("Service", principal));
+            } else if (principal != null && principal.startsWith("arn:")) {
+                statement.put("Principal", Map.of("AWS", principal));
+            } else {
+                statement.put("Principal", principal);
+            }
+            statement.put("Action", action);
+            statement.put("Resource", fn.getFunctionArn());
+            if (sourceArn != null) {
+                statement.put("Condition", Map.of("ArnLike", Map.of("AWS:SourceArn", sourceArn)));
+            } else if (sourceAccount != null) {
+                statement.put("Condition", Map.of("StringEquals", Map.of("AWS:SourceAccount", sourceAccount)));
+            }
 
-        fn.getPolicies().add(statement);
-        functionStore.save(region, fn);
-        LOG.infov("Added permission {0} to function {1}", statementId, functionName);
-        return statement;
+            fn.getPolicies().add(statement);
+            functionStore.save(region, fn);
+            LOG.infov("Added permission {0} to function {1}", statementId, functionName);
+            return statement;
+        }
     }
 
     public Map<String, Object> getPolicy(String region, String functionName) {
-        LambdaFunction fn = getFunction(region, functionName);
-        if (fn.getPolicies().isEmpty()) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Function not found: " + functionName, 404);
+        LambdaFunction observed = getFunction(region, functionName);
+        synchronized (lockForPolicyMutation(observed.getFunctionArn())) {
+            LambdaFunction fn = getFunction(region, functionName);
+            if (fn.getPolicies().isEmpty()) {
+                throw new AwsException("ResourceNotFoundException",
+                        "Function not found: " + functionName, 404);
+            }
+            Map<String, Object> policy = new java.util.LinkedHashMap<>();
+            policy.put("Version", "2012-10-17");
+            policy.put("Id", "default");
+            policy.put("Statement", fn.getPolicies().stream()
+                    .map(java.util.LinkedHashMap::new)
+                    .toList());
+            return Map.of("policy", policy, "revisionId", fn.getRevisionId());
         }
-        Map<String, Object> policy = new java.util.LinkedHashMap<>();
-        policy.put("Version", "2012-10-17");
-        policy.put("Id", "default");
-        policy.put("Statement", fn.getPolicies());
-        return Map.of("policy", policy, "revisionId", fn.getRevisionId());
     }
 
     public void removePermission(String region, String functionName, String statementId) {
-        LambdaFunction fn = getFunction(region, functionName);
-        boolean removed = fn.getPolicies().removeIf(s -> statementId.equals(s.get("Sid")));
-        if (!removed) {
-            throw new AwsException("ResourceNotFoundException",
-                    "Statement " + statementId + " not found in function " + functionName, 404);
+        LambdaFunction observed = getFunction(region, functionName);
+        synchronized (lockForPolicyMutation(observed.getFunctionArn())) {
+            LambdaFunction fn = getFunction(region, functionName);
+            boolean removed = fn.getPolicies().removeIf(s -> statementId.equals(s.get("Sid")));
+            if (!removed) {
+                throw new AwsException("ResourceNotFoundException",
+                        "Statement " + statementId + " not found in function " + functionName, 404);
+            }
+            functionStore.save(region, fn);
+            LOG.infov("Removed permission {0} from function {1}", statementId, functionName);
         }
-        functionStore.save(region, fn);
-        LOG.infov("Removed permission {0} from function {1}", statementId, functionName);
+    }
+
+    private Object lockForPolicyMutation(String functionArn) {
+        return policyMutationLocks.computeIfAbsent(functionArn, k -> new Object());
     }
 
     // ──────────────────────────── Tags ────────────────────────────
 
-    public Map<String, String> listTags(String functionArn) {
-        TagTarget target = resolveTagTarget(functionArn);
+    public Map<String, String> listTags(String resourceArn) {
+        TagTarget target = resolveTagTarget(resourceArn);
+        if (target.type == TagTargetType.EVENT_SOURCE_MAPPING) {
+            EventSourceMapping esm = getEventSourceMappingByArn(resourceArn, target);
+            return esm.getTags() != null ? Map.copyOf(esm.getTags()) : Map.of();
+        }
         LambdaFunction fn = getFunction(target.region, target.name);
-        return fn.getTags() != null ? fn.getTags() : Map.of();
+        return fn.getTags() != null ? Map.copyOf(fn.getTags()) : Map.of();
     }
 
-    public void tagResource(String functionArn, Map<String, String> tags) {
-        TagTarget target = resolveTagTarget(functionArn);
+    public void tagResource(String resourceArn, Map<String, String> tags) {
+        TagTarget target = resolveTagTarget(resourceArn);
+        if (target.type == TagTargetType.EVENT_SOURCE_MAPPING) {
+            EventSourceMapping esm = getEventSourceMappingByArn(resourceArn, target);
+            if (esm.getTags() == null) esm.setTags(new HashMap<>());
+            esm.getTags().putAll(tags);
+            esmStore.save(esm);
+            return;
+        }
         LambdaFunction fn = getFunction(target.region, target.name);
         if (fn.getTags() == null) fn.setTags(new java.util.HashMap<>());
         fn.getTags().putAll(tags);
         functionStore.save(target.region, fn);
     }
 
-    public void untagResource(String functionArn, List<String> tagKeys) {
-        TagTarget target = resolveTagTarget(functionArn);
+    public void untagResource(String resourceArn, List<String> tagKeys) {
+        TagTarget target = resolveTagTarget(resourceArn);
+        if (target.type == TagTargetType.EVENT_SOURCE_MAPPING) {
+            EventSourceMapping esm = getEventSourceMappingByArn(resourceArn, target);
+            if (esm.getTags() != null) {
+                tagKeys.forEach(esm.getTags()::remove);
+            }
+            esmStore.save(esm);
+            return;
+        }
         LambdaFunction fn = getFunction(target.region, target.name);
         if (fn.getTags() != null) {
             tagKeys.forEach(fn.getTags()::remove);
@@ -1486,27 +1743,55 @@ public class LambdaService {
         functionStore.save(target.region, fn);
     }
 
-    private record TagTarget(String region, String name) {}
+    private enum TagTargetType { FUNCTION, EVENT_SOURCE_MAPPING }
+
+    private record TagTarget(TagTargetType type, String region, String accountId, String name) {}
 
     /**
      * Resolves a tag-endpoint ARN to a (region, shortName) pair. The Lambda
      * tag APIs only accept an unqualified full function ARN; reject partial
      * ARNs, bare names, and qualified ARNs.
      */
-    private TagTarget resolveTagTarget(String functionArn) {
-        if (functionArn == null || functionArn.isBlank()) {
+    private TagTarget resolveTagTarget(String resourceArn) {
+        if (resourceArn == null || resourceArn.isBlank()) {
             throw new AwsException("InvalidParameterValueException", "Resource ARN is required", 400);
         }
-        if (!functionArn.startsWith("arn:")) {
+        if (!resourceArn.startsWith("arn:")) {
             throw new AwsException("InvalidParameterValueException",
-                    "Resource ARN must be a full Lambda function ARN: " + functionArn, 400);
+                    "Resource ARN must be a full Lambda resource ARN: " + resourceArn, 400);
         }
-        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionArn);
+        AwsArnUtils.Arn arn;
+        try {
+            arn = AwsArnUtils.parse(resourceArn);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Invalid Lambda resource ARN: " + resourceArn, 400);
+        }
+        if (!"lambda".equals(arn.service()) || arn.region().isBlank() || arn.accountId().isBlank()) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Invalid Lambda resource ARN: " + resourceArn, 400);
+        }
+        String[] resourceParts = arn.resource().split(":", -1);
+        if (resourceParts.length == 2 && "event-source-mapping".equals(resourceParts[0])
+                && !resourceParts[1].isBlank()) {
+            return new TagTarget(TagTargetType.EVENT_SOURCE_MAPPING,
+                    arn.region(), arn.accountId(), resourceParts[1]);
+        }
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(resourceArn);
         if (ref.qualifier() != null) {
             throw new AwsException("InvalidParameterValueException",
-                    "Tag operations require an unqualified function ARN: " + functionArn, 400);
+                    "Tag operations require an unqualified function ARN: " + resourceArn, 400);
         }
-        return new TagTarget(ref.region(), ref.name());
+        return new TagTarget(TagTargetType.FUNCTION, ref.region(), arn.accountId(), ref.name());
+    }
+
+    private EventSourceMapping getEventSourceMappingByArn(String resourceArn, TagTarget target) {
+        EventSourceMapping esm = getEventSourceMapping(target.name);
+        if (!resourceArn.equals(esm.getEventSourceMappingArn())) {
+            throw new AwsException("ResourceNotFoundException",
+                    "Event source mapping not found: " + resourceArn, 404);
+        }
+        return esm;
     }
 
     private int toInt(Object value, int defaultValue) {

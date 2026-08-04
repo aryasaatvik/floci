@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerLauncher;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionEnvironmentId;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import jakarta.annotation.PostConstruct;
@@ -41,7 +42,7 @@ public class WarmPool implements ContainerTeardown {
     private final ContainerLauncher containerLauncher;
     private final EmulatorConfig config;
     private final int maxPoolSizePerFunction;
-    private final ConcurrentHashMap<String, ArrayDeque<ContainerHandle>> pool = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<FunctionIdentity, FunctionPool> pool = new ConcurrentHashMap<>();
     private final ScheduledExecutorService evictionScheduler = Executors.newSingleThreadScheduledExecutor(
             r -> { Thread t = new Thread(r, "warm-pool-evictor"); t.setDaemon(true); return t; });
 
@@ -104,15 +105,29 @@ public class WarmPool implements ContainerTeardown {
     public ContainerHandle acquire(LambdaFunction fn) {
         boolean ephemeral = config != null && config.services().lambda().ephemeral();
         ContainerHandle handle = null;
+        LambdaExecutionEnvironmentId environmentId = LambdaExecutionEnvironmentId.from(fn);
+        FunctionPool functionPool = pool.computeIfAbsent(
+                FunctionIdentity.from(environmentId), ignored -> new FunctionPool());
+        long generation;
 
-        if (!ephemeral) {
-            ArrayDeque<ContainerHandle> queue = pool.computeIfAbsent(fn.getFunctionName(), k -> new ArrayDeque<>());
+        synchronized (functionPool) {
+            if (functionPool.environmentId == null && !functionPool.retired) {
+                functionPool.environmentId = environmentId;
+            }
+            // Management-plane create/update/delete owns which revision is current. A delayed
+            // invocation that still carries an older function snapshot may run, but it must not
+            // roll the pool back or become reusable after it completes.
+            generation = environmentId.equals(functionPool.environmentId)
+                    ? functionPool.generation : -1;
+        }
+
+        if (!ephemeral && generation >= 0) {
             // Skip pooled handles whose container died out-of-band — otherwise the
             // caller would wait the full Lambda function timeout.
             while (true) {
                 ContainerHandle candidate;
-                synchronized (queue) {
-                    candidate = queue.pollFirst();
+                synchronized (functionPool) {
+                    candidate = functionPool.queue.pollFirst();
                 }
                 if (candidate == null) {
                     break;
@@ -139,7 +154,7 @@ public class WarmPool implements ContainerTeardown {
         if (handle == null) {
             LOG.debugv(ephemeral ? "Ephemeral start for function: {0}" : "Cold start for function: {0}",
                     fn.getFunctionName());
-            handle = containerLauncher.launch(fn);
+            handle = containerLauncher.launch(fn, environmentId, generation);
         } else {
             LOG.debugv("Reusing warm container for function: {0}", fn.getFunctionName());
         }
@@ -171,20 +186,28 @@ public class WarmPool implements ContainerTeardown {
             return;
         }
 
-        handle.setState(ContainerState.WARM);
-        handle.touchLastUsed();
-        ArrayDeque<ContainerHandle> queue = pool.computeIfAbsent(handle.getFunctionName(), k -> new ArrayDeque<>());
+        FunctionIdentity functionIdentity = FunctionIdentity.from(handle.getExecutionEnvironmentId());
+        FunctionPool functionPool = pool.get(functionIdentity);
+        if (functionPool == null) {
+            stopQuietly(handle);
+            return;
+        }
         boolean returned;
-        synchronized (queue) {
-            returned = queue.size() < maxPoolSizePerFunction;
+        synchronized (functionPool) {
+            returned = handle.getPoolGeneration() == functionPool.generation
+                    && handle.getExecutionEnvironmentId().equals(functionPool.environmentId)
+                    && functionPool.queue.size() < maxPoolSizePerFunction;
             if (returned) {
-                queue.addFirst(handle);
+                handle.setState(ContainerState.WARM);
+                handle.touchLastUsed();
+                functionPool.queue.addFirst(handle);
             }
         }
         if (returned) {
             LOG.debugv("Released container back to pool for function: {0}", handle.getFunctionName());
         } else {
-            LOG.debugv("Pool full for function {0}, stopping excess container", handle.getFunctionName());
+            LOG.debugv("Container for function {0} belongs to a retired or full pool; stopping it",
+                    handle.getFunctionName());
             stopQuietly(handle);
         }
     }
@@ -196,7 +219,7 @@ public class WarmPool implements ContainerTeardown {
     public void pushCodeUpdate(LambdaFunction fn) {
         LOG.infov("Reactive S3 Sync: invalidating warm pool for function {0} to pick up new code",
                 fn.getFunctionName());
-        drainFunction(fn.getFunctionName());
+        drainFunction(fn);
     }
 
     /**
@@ -214,17 +237,36 @@ public class WarmPool implements ContainerTeardown {
      * Stops and removes all warm containers for the given function.
      * Called on function delete or code update.
      */
-    public void drainFunction(String functionName) {
-        ArrayDeque<ContainerHandle> queue = pool.remove(functionName);
-        if (queue == null) {
-            return;
-        }
+    public void drainFunction(LambdaFunction fn) {
+        LambdaExecutionEnvironmentId environmentId = LambdaExecutionEnvironmentId.from(fn);
+        FunctionIdentity identity = FunctionIdentity.from(environmentId);
+        FunctionPool functionPool = pool.computeIfAbsent(identity, ignored -> new FunctionPool());
         List<ContainerHandle> toStop;
-        synchronized (queue) {
-            toStop = new ArrayList<>(queue);
-            queue.clear();
+        synchronized (functionPool) {
+            functionPool.generation++;
+            functionPool.environmentId = environmentId;
+            functionPool.retired = false;
+            toStop = new ArrayList<>(functionPool.queue);
+            functionPool.queue.clear();
         }
-        LOG.infov("Draining {0} container(s) for function: {1}", toStop.size(), functionName);
+        LOG.infov("Draining {0} container(s) for function: {1}", toStop.size(),
+                environmentId.qualifiedFunctionArn());
+        stopInParallel(toStop);
+    }
+
+    /** Retires a deleted function identity without allowing a delayed invocation to reactivate it. */
+    public void retireFunction(LambdaFunction fn) {
+        LambdaExecutionEnvironmentId environmentId = LambdaExecutionEnvironmentId.from(fn);
+        FunctionPool functionPool = pool.computeIfAbsent(
+                FunctionIdentity.from(environmentId), ignored -> new FunctionPool());
+        List<ContainerHandle> toStop;
+        synchronized (functionPool) {
+            functionPool.generation++;
+            functionPool.environmentId = null;
+            functionPool.retired = true;
+            toStop = new ArrayList<>(functionPool.queue);
+            functionPool.queue.clear();
+        }
         stopInParallel(toStop);
     }
 
@@ -251,8 +293,14 @@ public class WarmPool implements ContainerTeardown {
     }
 
     private void drainAll() {
-        for (String functionName : new ArrayList<>(pool.keySet())) {
-            drainFunction(functionName);
+        for (FunctionPool functionPool : new ArrayList<>(pool.values())) {
+            List<ContainerHandle> toStop;
+            synchronized (functionPool) {
+                functionPool.generation++;
+                toStop = new ArrayList<>(functionPool.queue);
+                functionPool.queue.clear();
+            }
+            stopInParallel(toStop);
         }
     }
 
@@ -262,12 +310,12 @@ public class WarmPool implements ContainerTeardown {
         long now = System.currentTimeMillis();
 
         for (var entry : pool.entrySet()) {
-            String functionName = entry.getKey();
-            ArrayDeque<ContainerHandle> queue = entry.getValue();
+            FunctionIdentity functionIdentity = entry.getKey();
+            FunctionPool functionPool = entry.getValue();
             List<ContainerHandle> toEvict = new ArrayList<>();
 
-            synchronized (queue) {
-                queue.removeIf(handle -> {
+            synchronized (functionPool) {
+                functionPool.queue.removeIf(handle -> {
                     if (handle.getState() == ContainerState.WARM
                             && (now - handle.getLastUsedMs()) >= idleTimeoutMs) {
                         toEvict.add(handle);
@@ -277,9 +325,9 @@ public class WarmPool implements ContainerTeardown {
                 });
             }
 
-            // Re-check that the queue is still registered to avoid double-stop with drainFunction.
-            if (!toEvict.isEmpty() && pool.get(functionName) == queue) {
-                LOG.infov("Evicting {0} idle container(s) for function: {1}", toEvict.size(), functionName);
+            if (!toEvict.isEmpty()) {
+                LOG.infov("Evicting {0} idle container(s) for function: {1}",
+                        toEvict.size(), functionIdentity);
                 for (ContainerHandle handle : toEvict) {
                     stopQuietly(handle);
                 }
@@ -293,5 +341,22 @@ public class WarmPool implements ContainerTeardown {
         } catch (Exception e) {
             LOG.warnv("Error stopping container {0}: {1}", handle.getContainerId(), e.getMessage());
         }
+    }
+
+    private record FunctionIdentity(String accountId, String region, String functionName, String version) {
+        private static FunctionIdentity from(LambdaExecutionEnvironmentId environmentId) {
+            return new FunctionIdentity(
+                    environmentId.accountId(),
+                    environmentId.region(),
+                    environmentId.functionName(),
+                    environmentId.version());
+        }
+    }
+
+    private static final class FunctionPool {
+        private final ArrayDeque<ContainerHandle> queue = new ArrayDeque<>();
+        private LambdaExecutionEnvironmentId environmentId;
+        private long generation;
+        private boolean retired;
     }
 }

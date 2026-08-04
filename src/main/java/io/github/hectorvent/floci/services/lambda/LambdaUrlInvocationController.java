@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaAlias;
@@ -49,13 +50,15 @@ public class LambdaUrlInvocationController {
     private final LambdaService lambdaService;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
+    private final RequestContext requestContext;
 
     @Inject
     public LambdaUrlInvocationController(LambdaService lambdaService, RegionResolver regionResolver,
-                                         ObjectMapper objectMapper) {
+                                         ObjectMapper objectMapper, RequestContext requestContext) {
         this.lambdaService = lambdaService;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
+        this.requestContext = requestContext;
     }
 
     @GET
@@ -97,16 +100,24 @@ public class LambdaUrlInvocationController {
         Object target = lambdaService.getTargetByUrlId(urlId);
         String functionName;
         String region;
+        String accountId;
 
         if (target instanceof LambdaAlias alias) {
             functionName = alias.getFunctionName();
-            region = AwsArnUtils.parse(alias.getAliasArn()).region();
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(alias.getAliasArn());
+            region = arn.region();
+            accountId = arn.accountId();
         } else if (target instanceof LambdaFunction fn) {
             functionName = fn.getFunctionName();
-            region = AwsArnUtils.parse(fn.getFunctionArn()).region();
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(fn.getFunctionArn());
+            region = arn.region();
+            accountId = fn.getAccountId() != null ? fn.getAccountId() : arn.accountId();
         } else {
             return Response.status(404).entity(jsonMessage("Function URL not found")).type(MediaType.APPLICATION_JSON).build();
         }
+
+        requestContext.setAccountId(accountId);
+        requestContext.setRegion(region);
 
         String requestId = UUID.randomUUID().toString();
         String event = buildEvent(method, urlId, proxy, headers, uriInfo, body, requestId, region);

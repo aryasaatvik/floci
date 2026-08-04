@@ -126,6 +126,7 @@ public class ContainerBuilder {
         private String user;
         private final List<String> groupAdd = new ArrayList<>();
         private final List<String> dnsServers = new ArrayList<>();
+        private final Map<String, String> labels = new HashMap<>();
 
         Builder(String image, EmulatorConfig config, DockerHostResolver dockerHostResolver,
                 EmbeddedDnsServer embeddedDnsServer,
@@ -386,6 +387,18 @@ public class ContainerBuilder {
             return this;
         }
 
+        /** Adds a Docker label to the created container. */
+        public Builder withLabel(String key, String value) {
+            this.labels.put(key, value);
+            return this;
+        }
+
+        /** Adds Docker labels to the created container. */
+        public Builder withLabels(Map<String, String> labels) {
+            this.labels.putAll(labels);
+            return this;
+        }
+
         /**
          * Injects Floci's embedded DNS server into the container so virtual-hosted
          * S3 hostnames (my-bucket.localhost.floci.io) resolve to Floci's Docker
@@ -432,7 +445,8 @@ public class ContainerBuilder {
                     List.copyOf(dnsServers),
                     workingDir,
                     user,
-                    List.copyOf(groupAdd)
+                    List.copyOf(groupAdd),
+                    Map.copyOf(labels)
             );
         }
     }

@@ -257,6 +257,18 @@ class LambdaServiceTest {
     }
 
     @Test
+    void publishVersionCarriesDeploymentPackageHashes() {
+        LambdaFunction latest = service.createFunction(REGION, baseRequest("versioned-package-fn"));
+        latest.setCodeSizeBytes(123L);
+        latest.setCodeSha256("package-sha-256");
+
+        LambdaFunction version = service.publishVersion(REGION, "versioned-package-fn", null);
+
+        assertEquals(123L, version.getCodeSizeBytes());
+        assertEquals("package-sha-256", version.getCodeSha256());
+    }
+
+    @Test
     void createFunctionWithSubdirectoryHandler() throws Exception {
         Map<String, Object> req = new java.util.HashMap<>(Map.of(
                 "FunctionName", "subdir-handler-fn",

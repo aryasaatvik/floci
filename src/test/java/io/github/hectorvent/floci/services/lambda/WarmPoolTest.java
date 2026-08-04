@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerLauncher;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionEnvironmentId;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
@@ -15,12 +16,15 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+
+import java.util.concurrent.atomic.AtomicInteger;
 
 @ExtendWith(MockitoExtension.class)
 class WarmPoolTest {
@@ -38,6 +42,17 @@ class WarmPoolTest {
         return new WarmPool(containerLauncher, config);
     }
 
+    private static LambdaFunction function(
+            String accountId, String region, String name, String revisionId) {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setAccountId(accountId);
+        fn.setFunctionName(name);
+        fn.setFunctionArn("arn:aws:lambda:" + region + ":" + accountId + ":function:" + name);
+        fn.setVersion("$LATEST");
+        fn.setRevisionId(revisionId);
+        return fn;
+    }
+
     @Test
     void stopManagedContainersDrainsPool() {
         // Lifecycle-driven teardown replaces the old raw JVM shutdown hook: the pool
@@ -48,7 +63,7 @@ class WarmPoolTest {
         LambdaFunction fn = mock(LambdaFunction.class);
         when(fn.getFunctionName()).thenReturn("drain-fn");
         ContainerHandle handle = new ContainerHandle("cid-drain", "drain-fn", null, ContainerState.WARM);
-        when(containerLauncher.launch(any())).thenReturn(handle);
+        when(containerLauncher.launch(any(), any(), anyLong())).thenReturn(handle);
 
         pool.release(pool.acquire(fn));
         pool.stopManagedContainers();
@@ -78,7 +93,7 @@ class WarmPoolTest {
         ContainerHandle handle = new ContainerHandle("cid-123", "my-fn", null, ContainerState.BUSY);
         LambdaFunction fn = mock(LambdaFunction.class);
         when(fn.getFunctionName()).thenReturn("my-fn");
-        when(containerLauncher.launch(any())).thenReturn(handle);
+        when(containerLauncher.launch(any(), any(), anyLong())).thenReturn(handle);
 
         ContainerHandle acquired = pool.acquire(fn);
         assertEquals(handle, acquired);
@@ -88,7 +103,7 @@ class WarmPoolTest {
 
         // Pool must be empty — next acquire must cold-start
         ContainerHandle handle2 = new ContainerHandle("cid-456", "my-fn", null, ContainerState.WARM);
-        when(containerLauncher.launch(any())).thenReturn(handle2);
+        when(containerLauncher.launch(any(), any(), anyLong())).thenReturn(handle2);
         ContainerHandle secondAcquired = pool.acquire(fn);
         assertEquals(handle2, secondAcquired);
 
@@ -106,7 +121,7 @@ class WarmPoolTest {
         ContainerHandle h1 = new ContainerHandle("cid-a", "multi-fn", null, ContainerState.WARM);
         ContainerHandle h2 = new ContainerHandle("cid-b", "multi-fn", null, ContainerState.WARM);
 
-        when(containerLauncher.launch(any())).thenReturn(h1, h2);
+        when(containerLauncher.launch(any(), any(), anyLong())).thenReturn(h1, h2);
         when(containerLauncher.isAlive(any())).thenReturn(true);
 
         ContainerHandle acquired1 = pool.acquire(fn);
@@ -140,7 +155,7 @@ class WarmPoolTest {
         when(fn.getFunctionName()).thenReturn("reuse-fn");
 
         ContainerHandle handle = new ContainerHandle("cid-reuse", "reuse-fn", null, ContainerState.WARM);
-        when(containerLauncher.launch(any())).thenReturn(handle);
+        when(containerLauncher.launch(any(), any(), anyLong())).thenReturn(handle);
         when(containerLauncher.isAlive(any())).thenReturn(true);
 
         ContainerHandle first = pool.acquire(fn);
@@ -154,7 +169,7 @@ class WarmPoolTest {
         assertSame(handle, second);
 
         // containerLauncher.launch should only have been called once (cold start)
-        verify(containerLauncher, times(1)).launch(any());
+        verify(containerLauncher, times(1)).launch(any(), any(), anyLong());
 
         pool.shutdown();
     }
@@ -178,7 +193,7 @@ class WarmPoolTest {
 
         // Both acquires below cold-start (the pool is empty, then the faulted handle is discarded
         // before any liveness check), so no isAlive stubbing is needed.
-        when(containerLauncher.launch(any())).thenReturn(faulted, fresh);
+        when(containerLauncher.launch(any(), any(), anyLong())).thenReturn(faulted, fresh);
 
         ContainerHandle first = pool.acquire(fn);
         assertSame(faulted, first);
@@ -191,7 +206,7 @@ class WarmPoolTest {
         ContainerHandle second = pool.acquire(fn);
         assertSame(fresh, second);
         assertNotSame(faulted, second);
-        verify(containerLauncher, times(2)).launch(any());
+        verify(containerLauncher, times(2)).launch(any(), any(), anyLong());
 
         pool.shutdown();
     }
@@ -212,7 +227,7 @@ class WarmPoolTest {
         ContainerHandle pooled = new ContainerHandle("cid-pooled", "pooled-fault-fn", server, ContainerState.WARM);
         ContainerHandle fresh = new ContainerHandle("cid-fresh", "pooled-fault-fn", null, ContainerState.WARM);
 
-        when(containerLauncher.launch(any())).thenReturn(pooled, fresh);
+        when(containerLauncher.launch(any(), any(), anyLong())).thenReturn(pooled, fresh);
         // Healthy at release time, so it goes into the pool as normal.
         when(server.isFaulted()).thenReturn(false);
         ContainerHandle seeded = pool.acquire(fn);
@@ -246,7 +261,7 @@ class WarmPoolTest {
 
         // Seed the pool with the dead handle by acquiring + releasing it once.
         // The seed acquire is a cold start (empty pool), so isAlive isn't called.
-        when(containerLauncher.launch(any())).thenReturn(dead, fresh);
+        when(containerLauncher.launch(any(), any(), anyLong())).thenReturn(dead, fresh);
         ContainerHandle seeded = pool.acquire(fn);
         assertSame(dead, seeded);
         pool.release(seeded);
@@ -258,7 +273,7 @@ class WarmPoolTest {
         assertSame(fresh, acquired);
         assertNotSame(dead, acquired);
         verify(containerLauncher, times(1)).stop(dead);
-        verify(containerLauncher, times(2)).launch(any());
+        verify(containerLauncher, times(2)).launch(any(), any(), anyLong());
 
         pool.shutdown();
     }
@@ -277,7 +292,7 @@ class WarmPoolTest {
         // Seed deque with [dead, alive]: release(alive) first, then release(dead),
         // so dead ends up at the front (release uses addFirst). Both acquires
         // here are cold starts (empty pool) so no isAlive stub is needed yet.
-        when(containerLauncher.launch(any())).thenReturn(alive, dead);
+        when(containerLauncher.launch(any(), any(), anyLong())).thenReturn(alive, dead);
         ContainerHandle a1 = pool.acquire(fn);
         ContainerHandle a2 = pool.acquire(fn);
         assertSame(alive, a1);
@@ -294,8 +309,111 @@ class WarmPoolTest {
         verify(containerLauncher, times(1)).stop(dead);
         verify(containerLauncher, never()).stop(alive);
         // Only the original two cold starts; no extra launch was needed.
-        verify(containerLauncher, times(2)).launch(any());
+        verify(containerLauncher, times(2)).launch(any(), any(), anyLong());
 
+        pool.shutdown();
+    }
+
+    @Test
+    void accountRegionAndVersionIdentitiesNeverShareWarmContainers() {
+        WarmPool pool = buildPool();
+        pool.init();
+        LambdaFunction accountA = function("111111111111", "us-east-1", "shared-name", "rev-a");
+        LambdaFunction accountB = function("222222222222", "us-east-1", "shared-name", "rev-b");
+        LambdaFunction otherRegion = function("111111111111", "eu-west-1", "shared-name", "rev-r");
+        LambdaFunction versionOne = function("111111111111", "us-east-1", "shared-name", "rev-v1");
+        versionOne.setVersion("1");
+        versionOne.setFunctionArn(versionOne.getFunctionArn() + ":1");
+
+        when(containerLauncher.launch(any(), any(), anyLong())).thenAnswer(invocation -> {
+            var environmentId = invocation.getArgument(1, LambdaExecutionEnvironmentId.class);
+            long generation = invocation.getArgument(2, Long.class);
+            return new ContainerHandle(
+                    "cid-" + environmentId.accountId(), environmentId, generation,
+                    null, ContainerState.WARM, false);
+        });
+        when(containerLauncher.isAlive(any())).thenReturn(true);
+
+        ContainerHandle firstA = pool.acquire(accountA);
+        ContainerHandle firstB = pool.acquire(accountB);
+        ContainerHandle firstRegion = pool.acquire(otherRegion);
+        ContainerHandle firstVersion = pool.acquire(versionOne);
+        pool.release(firstA);
+        pool.release(firstB);
+        pool.release(firstRegion);
+        pool.release(firstVersion);
+
+        assertSame(firstA, pool.acquire(accountA));
+        assertSame(firstB, pool.acquire(accountB));
+        assertSame(firstRegion, pool.acquire(otherRegion));
+        assertSame(firstVersion, pool.acquire(versionOne));
+        assertNotSame(firstA, firstB);
+        assertNotSame(firstA, firstRegion);
+        assertNotSame(firstA, firstVersion);
+        verify(containerLauncher, times(4)).launch(any(), any(), anyLong());
+        pool.shutdown();
+    }
+
+    @Test
+    void lateReleaseAfterTargetedDrainIsRetiredInsteadOfReinserted() {
+        WarmPool pool = buildPool();
+        pool.init();
+        LambdaFunction before = function("111111111111", "us-east-1", "updated-fn", "rev-before");
+        LambdaFunction after = function("111111111111", "us-east-1", "updated-fn", "rev-after");
+
+        when(containerLauncher.launch(any(), any(), anyLong())).thenAnswer(invocation -> {
+            var environmentId = invocation.getArgument(1, LambdaExecutionEnvironmentId.class);
+            long generation = invocation.getArgument(2, Long.class);
+            return new ContainerHandle(
+                    "cid-" + environmentId.revisionId(), environmentId, generation,
+                    null, ContainerState.WARM, false);
+        });
+        when(containerLauncher.isAlive(any())).thenReturn(true);
+
+        ContainerHandle staleBusy = pool.acquire(before);
+        pool.drainFunction(after);
+        pool.release(staleBusy);
+        verify(containerLauncher).stop(staleBusy);
+
+        ContainerHandle current = pool.acquire(after);
+        assertNotSame(staleBusy, current);
+        pool.release(current);
+        assertSame(current, pool.acquire(after));
+        verify(containerLauncher, times(2)).launch(any(), any(), anyLong());
+        pool.shutdown();
+    }
+
+    @Test
+    void deleteRecreateKeepsNewRevisionWarmAndDelayedOldRevisionTransient() {
+        WarmPool pool = buildPool();
+        pool.init();
+        LambdaFunction deleted = function("111111111111", "us-east-1", "recreated-fn", "rev-deleted");
+        LambdaFunction recreated = function("111111111111", "us-east-1", "recreated-fn", "rev-new");
+        AtomicInteger launches = new AtomicInteger();
+
+        when(containerLauncher.launch(any(), any(), anyLong())).thenAnswer(invocation -> {
+            var environmentId = invocation.getArgument(1, LambdaExecutionEnvironmentId.class);
+            long generation = invocation.getArgument(2, Long.class);
+            return new ContainerHandle(
+                    "cid-" + launches.incrementAndGet(), environmentId, generation,
+                    null, ContainerState.WARM, false);
+        });
+        when(containerLauncher.isAlive(any())).thenReturn(true);
+
+        ContainerHandle oldBusy = pool.acquire(deleted);
+        pool.retireFunction(deleted);
+        pool.drainFunction(recreated);
+        pool.release(oldBusy);
+        verify(containerLauncher).stop(oldBusy);
+
+        ContainerHandle delayedOld = pool.acquire(deleted);
+        pool.release(delayedOld);
+        verify(containerLauncher).stop(delayedOld);
+
+        ContainerHandle firstNew = pool.acquire(recreated);
+        pool.release(firstNew);
+        assertSame(firstNew, pool.acquire(recreated));
+        verify(containerLauncher, times(3)).launch(any(), any(), anyLong());
         pool.shutdown();
     }
 }

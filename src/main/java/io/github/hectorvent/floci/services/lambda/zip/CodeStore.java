@@ -11,8 +11,7 @@ import java.nio.file.Path;
 import java.util.Comparator;
 
 /**
- * Manages on-disk locations of extracted Lambda function code.
- * Each function gets its own directory under the configured code path.
+ * Manages immutable, account-scoped locations of extracted Lambda function code.
  */
 @ApplicationScoped
 public class CodeStore {
@@ -30,12 +29,12 @@ public class CodeStore {
         this.baseDir = baseDir;
     }
 
-    public Path getCodePath(String functionName) {
-        return baseDir.resolve(sanitizeName(functionName));
+    public Path getCodePath(String accountId, String region, String functionName, String codeSha256) {
+        return functionPath(accountId, region, functionName).resolve(sanitizeName(codeSha256));
     }
 
-    public void delete(String functionName) {
-        Path codePath = getCodePath(functionName);
+    public void delete(String accountId, String region, String functionName) {
+        Path codePath = functionPath(accountId, region, functionName);
         if (!Files.exists(codePath)) {
             return;
         }
@@ -55,13 +54,23 @@ public class CodeStore {
         }
     }
 
-    public boolean exists(String functionName) {
-        Path codePath = getCodePath(functionName);
-        try {
-            return Files.exists(codePath) && Files.list(codePath).findAny().isPresent();
+    public boolean exists(String accountId, String region, String functionName, String codeSha256) {
+        Path codePath = getCodePath(accountId, region, functionName, codeSha256);
+        if (!Files.exists(codePath)) {
+            return false;
+        }
+        try (var entries = Files.list(codePath)) {
+            return entries.findAny().isPresent();
         } catch (IOException e) {
             return false;
         }
+    }
+
+    private Path functionPath(String accountId, String region, String functionName) {
+        return baseDir
+                .resolve(sanitizeName(accountId))
+                .resolve(sanitizeName(region))
+                .resolve(sanitizeName(functionName));
     }
 
     private String sanitizeName(String name) {

@@ -30,6 +30,8 @@ class ContainerLauncherVolumeNamingTest {
     private static LambdaFunction fnWithSha(String name, String sha) {
         LambdaFunction fn = new LambdaFunction();
         fn.setFunctionName(name);
+        fn.setAccountId("111111111111");
+        fn.setFunctionArn("arn:aws:lambda:us-east-1:111111111111:function:" + name);
         fn.setCodeSha256(sha);
         return fn;
     }
@@ -88,8 +90,6 @@ class ContainerLauncherVolumeNamingTest {
 
         assertTrue(DOCKER_VOLUME_NAME.matcher(nullName).matches(),
                 "must be docker-safe even when falling back to lastModified, was: " + nullName);
-        assertTrue(nullName.contains("1700000000000"),
-                "null sha should key off lastModified, was: " + nullName);
         assertEquals(nullName, blankName, "null and blank sha should both fall back to lastModified");
 
         // A different lastModified (new deploy) must yield a different name.
@@ -98,6 +98,29 @@ class ContainerLauncherVolumeNamingTest {
         newer.setLastModified(1700000009999L);
         assertNotEquals(nullName, ContainerLauncher.codeVolumeName(newer),
                 "a later lastModified must produce a different volume name");
+    }
+
+    @Test
+    void differsAcrossAccountsAndRegionsForTheSameFunctionAndCode() {
+        LambdaFunction accountA = fnWithSha("shared-fn", "same-full-code-sha");
+        LambdaFunction accountB = fnWithSha("shared-fn", "same-full-code-sha");
+        accountB.setAccountId("222222222222");
+        accountB.setFunctionArn("arn:aws:lambda:eu-west-1:222222222222:function:shared-fn");
+
+        assertNotEquals(
+                ContainerLauncher.codeVolumeName(accountA),
+                ContainerLauncher.codeVolumeName(accountB),
+                "account and region must participate in the immutable artifact identity");
+    }
+
+    @Test
+    void differsAcrossFlociInstancesSharingOneDockerDaemon() {
+        LambdaFunction function = fnWithSha("shared-fn", "same-full-code-sha");
+
+        assertNotEquals(
+                ContainerLauncher.codeVolumeName(function, "instance-a"),
+                ContainerLauncher.codeVolumeName(function, "instance-b"),
+                "separate Floci instances must never adopt each other's code volume");
     }
 
     @TempDir

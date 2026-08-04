@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -122,6 +123,20 @@ class ContainerBuilderTest {
 
         assertNull(spec.user());
         assertEquals(List.of(), spec.groupAdd());
+    }
+
+    @Test
+    void labelsRoundTripIntoSpec() {
+        TestFixture fixture = new TestFixture();
+
+        ContainerSpec spec = fixture.builder.newContainer("alpine")
+                .withLabel("io.floci.kind", "execution")
+                .withLabels(Map.of("io.floci.instance", "samva-local"))
+                .build();
+
+        assertEquals(Map.of(
+                "io.floci.kind", "execution",
+                "io.floci.instance", "samva-local"), spec.labels());
     }
 
     @Test

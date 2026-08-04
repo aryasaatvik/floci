@@ -82,12 +82,18 @@ public class LambdaController {
     @Path("/functions/{functionName}")
     public Response getFunction(@Context HttpHeaders headers,
                                 @Context UriInfo uriInfo,
-                                @PathParam("functionName") String functionName) {
+                                @PathParam("functionName") String functionName,
+                                @QueryParam("Qualifier") String qualifier) {
         String region = regionResolver.resolveRegion(headers);
-        LambdaFunction fn = lambdaService.getFunction(region, functionName);
+        LambdaFunction fn = lambdaService.getFunction(region, functionName, qualifier);
 
         ObjectNode root = objectMapper.createObjectNode();
         root.set("Configuration", objectMapper.valueToTree(buildFunctionConfiguration(fn)));
+        ObjectNode tags = root.putObject("Tags");
+        LambdaFunction latest = lambdaService.getFunction(region, fn.getFunctionName());
+        if (latest.getTags() != null) {
+            latest.getTags().forEach(tags::put);
+        }
         ObjectNode code = root.putObject("Code");
         if ("Image".equals(fn.getPackageType()) && fn.getImageUri() != null) {
             code.put("RepositoryType", "ECR");
@@ -128,9 +134,10 @@ public class LambdaController {
     @GET
     @Path("/functions/{functionName}/configuration")
     public Response getFunctionConfiguration(@Context HttpHeaders headers,
-                                              @PathParam("functionName") String functionName) {
+                                              @PathParam("functionName") String functionName,
+                                              @QueryParam("Qualifier") String qualifier) {
         String region = regionResolver.resolveRegion(headers);
-        LambdaFunction fn = lambdaService.getFunction(region, functionName);
+        LambdaFunction fn = lambdaService.getFunction(region, functionName, qualifier);
         return Response.ok(buildFunctionConfiguration(fn)).build();
     }
 
@@ -324,6 +331,7 @@ public class LambdaController {
     private Map<String, Object> buildEsmResponse(EventSourceMapping esm) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("UUID", esm.getUuid());
+        node.put("EventSourceMappingArn", esm.getEventSourceMappingArn());
         node.put("FunctionArn", esm.getFunctionArn());
         node.put("EventSourceArn", esm.getEventSourceArn());
         node.put("BatchSize", esm.getBatchSize());

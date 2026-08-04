@@ -11,7 +11,8 @@ import java.io.Closeable;
 public class ContainerHandle {
 
     private final String containerId;
-    private final String functionName;
+    private final LambdaExecutionEnvironmentId executionEnvironmentId;
+    private final long poolGeneration;
     private final RuntimeApiServer runtimeApiServer;
     private final long createdAt;
     private final boolean hotReload;
@@ -21,13 +22,25 @@ public class ContainerHandle {
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
-        this(containerId, functionName, runtimeApiServer, state, false);
+        this(containerId, LambdaExecutionEnvironmentId.legacy(functionName), 0,
+                runtimeApiServer, state, false);
     }
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state, boolean hotReload) {
+        this(containerId, LambdaExecutionEnvironmentId.legacy(functionName), 0,
+                runtimeApiServer, state, hotReload);
+    }
+
+    public ContainerHandle(String containerId,
+                           LambdaExecutionEnvironmentId executionEnvironmentId,
+                           long poolGeneration,
+                           RuntimeApiServer runtimeApiServer,
+                           ContainerState state,
+                           boolean hotReload) {
         this.containerId = containerId;
-        this.functionName = functionName;
+        this.executionEnvironmentId = executionEnvironmentId;
+        this.poolGeneration = poolGeneration;
         this.runtimeApiServer = runtimeApiServer;
         this.state = state;
         this.hotReload = hotReload;
@@ -36,7 +49,9 @@ public class ContainerHandle {
     }
 
     public String getContainerId() { return containerId; }
-    public String getFunctionName() { return functionName; }
+    public String getFunctionName() { return executionEnvironmentId.functionName(); }
+    public LambdaExecutionEnvironmentId getExecutionEnvironmentId() { return executionEnvironmentId; }
+    public long getPoolGeneration() { return poolGeneration; }
     public boolean isHotReload() { return hotReload; }
     public RuntimeApiServer getRuntimeApiServer() { return runtimeApiServer; }
     public long getCreatedAt() { return createdAt; }

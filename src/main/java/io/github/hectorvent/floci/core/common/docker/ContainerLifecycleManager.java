@@ -5,6 +5,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Bind;
@@ -120,6 +121,9 @@ public class ContainerLifecycleManager {
                     .toArray(ExposedPort[]::new);
             createCmd.withExposedPorts(exposed);
         }
+        if (spec.labels() != null && !spec.labels().isEmpty()) {
+            createCmd.withLabels(spec.labels());
+        }
 
         CreateContainerResponse response = createCmd.exec();
         String containerId = response.getId();
@@ -212,13 +216,64 @@ public class ContainerLifecycleManager {
      * {@code docker volume prune --filter label=floci} works.
      */
     public void ensureVolume(String volumeName) {
+        ensureVolume(volumeName, Map.of());
+    }
+
+    /**
+     * Creates a named volume with the supplied ownership labels if it does not already exist.
+     * Existing volume labels are immutable in Docker and are therefore never broadened here.
+     */
+    public void ensureVolume(String volumeName, Map<String, String> labels) {
         if (!volumeExists(volumeName)) {
+            Map<String, String> managedLabels = new HashMap<>(labels);
+            managedLabels.put("floci", "true");
             dockerClient.createVolumeCmd()
                     .withName(volumeName)
-                    .withLabels(Map.of("floci", "true"))
+                    .withLabels(Map.copyOf(managedLabels))
                     .exec();
             LOG.debugv("Created volume {0}", volumeName);
         }
+    }
+
+    /** Returns containers carrying every required label, including stopped containers. */
+    public List<Container> listContainersByLabels(Map<String, String> requiredLabels) {
+        try {
+            return dockerClient.listContainersCmd()
+                    .withShowAll(true)
+                    .withLabelFilter(requiredLabels)
+                    .exec().stream()
+                    .filter(container -> hasAllLabels(container.getLabels(), requiredLabels))
+                    .toList();
+        } catch (Exception e) {
+            LOG.warnv("Could not list managed Docker containers: {0}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /** Returns volumes carrying every required label. */
+    public List<InspectVolumeResponse> listVolumesByLabels(Map<String, String> requiredLabels) {
+        try {
+            List<String> filters = requiredLabels.entrySet().stream()
+                    .map(entry -> entry.getKey() + "=" + entry.getValue())
+                    .toList();
+            var response = dockerClient.listVolumesCmd()
+                    .withFilter("label", filters)
+                    .exec();
+            if (response.getVolumes() == null) {
+                return List.of();
+            }
+            return response.getVolumes().stream()
+                    .filter(volume -> hasAllLabels(volume.getLabels(), requiredLabels))
+                    .toList();
+        } catch (Exception e) {
+            LOG.warnv("Could not list managed Docker volumes: {0}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    static boolean hasAllLabels(Map<String, String> actual, Map<String, String> required) {
+        return actual != null && required.entrySet().stream()
+                .allMatch(entry -> entry.getValue().equals(actual.get(entry.getKey())));
     }
 
     /**
