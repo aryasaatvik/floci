@@ -14,10 +14,6 @@ RUN mvn clean package -DskipTests -q
 FROM eclipse-temurin:25-jre-noble
 
 ARG VERSION=latest
-ARG SOURCE_REVISION=unknown
-ARG SOURCE_PATCH_SHA256=clean
-ARG SOURCE_DIRTY=false
-ARG BUILD_CREATED=unknown
 ENV FLOCI_VERSION=${VERSION}
 ENV FLOCI_STORAGE_PERSISTENT_PATH=/app/data
 
@@ -27,12 +23,7 @@ LABEL org.opencontainers.image.title="Floci" \
       org.opencontainers.image.source="https://github.com/floci-io/floci" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.vendor="Floci" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${SOURCE_REVISION}" \
-      org.opencontainers.image.created="${BUILD_CREATED}" \
-      io.floci.source.base-revision="${SOURCE_REVISION}" \
-      io.floci.source.patch-sha256="${SOURCE_PATCH_SHA256}" \
-      io.floci.source.dirty="${SOURCE_DIRTY}"
+      org.opencontainers.image.version="${VERSION}"
 
 ENV AWS_DEFAULT_REGION=us-east-1
 ENV AWS_ACCESS_KEY_ID=test
