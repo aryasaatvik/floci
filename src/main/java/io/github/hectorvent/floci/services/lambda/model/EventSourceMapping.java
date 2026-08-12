@@ -14,12 +14,14 @@ import java.util.Map;
 public class EventSourceMapping {
 
     private String uuid;
+    private String eventSourceMappingArn;
     private String functionArn;
     private String functionName;
     private String accountId;
     private String eventSourceArn;
     private String queueUrl;
     private String region;
+    private Map<String, String> tags = new HashMap<>();
     private boolean enabled = true;
     private int batchSize = 10;
     private String state = "Enabled";
@@ -38,6 +40,11 @@ public class EventSourceMapping {
     public String getUuid() { return uuid; }
     public void setUuid(String uuid) { this.uuid = uuid; }
 
+    public String getEventSourceMappingArn() { return eventSourceMappingArn; }
+    public void setEventSourceMappingArn(String eventSourceMappingArn) {
+        this.eventSourceMappingArn = eventSourceMappingArn;
+    }
+
     public String getFunctionArn() { return functionArn; }
     public void setFunctionArn(String functionArn) { this.functionArn = functionArn; }
 
@@ -55,6 +62,11 @@ public class EventSourceMapping {
 
     public String getRegion() { return region; }
     public void setRegion(String region) { this.region = region; }
+
+    public Map<String, String> getTags() { return tags; }
+    public void setTags(Map<String, String> tags) {
+        this.tags = tags != null ? tags : new HashMap<>();
+    }
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }

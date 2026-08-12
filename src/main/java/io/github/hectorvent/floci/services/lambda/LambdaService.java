@@ -831,11 +831,18 @@ public class LambdaService {
         EventSourceMapping esm = new EventSourceMapping();
         esm.setUuid(UUID.randomUUID().toString());
         esm.setAccountId(regionResolver.getAccountId());
+        esm.setEventSourceMappingArn(eventSourceMappingArn(
+                esm.getAccountId(), resolvedRegion, esm.getUuid()));
         esm.setFunctionArn(fn.getFunctionArn());
         esm.setFunctionName(resolvedName);
         esm.setEventSourceArn(eventSourceArn);
         esm.setQueueUrl(queueUrl);
         esm.setRegion(resolvedRegion);
+        Map<String, String> tags = new java.util.HashMap<>();
+        if (request.get("Tags") instanceof Map<?, ?> rawTags) {
+            rawTags.forEach((key, value) -> tags.put(String.valueOf(key), String.valueOf(value)));
+        }
+        esm.setTags(tags);
         esm.setBatchSize(batchSize);
         esm.setEnabled(enabled);
         esm.setState(enabled ? "Enabled" : "Disabled");
@@ -1004,9 +1011,10 @@ public class LambdaService {
     }
 
     public EventSourceMapping getEventSourceMapping(String uuid) {
-        return esmStore.get(uuid)
+        EventSourceMapping esm = esmStore.get(uuid)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "EventSourceMapping not found: " + uuid, 404));
+        return ensureEventSourceMappingIdentity(esm);
     }
 
     public List<EventSourceMapping> listEventSourceMappings(String functionArn) {
@@ -1014,9 +1022,13 @@ public class LambdaService {
             // Accept bare name, partial ARN, or full ARN. The store matches
             // entries by their canonical short name, so normalize first.
             String shortName = LambdaArnUtils.resolve(functionArn).name();
-            return esmStore.listByFunction(shortName);
+            return esmStore.listByFunction(shortName).stream()
+                    .map(this::ensureEventSourceMappingIdentity)
+                    .toList();
         }
-        return esmStore.list();
+        return esmStore.list().stream()
+                .map(this::ensureEventSourceMappingIdentity)
+                .toList();
     }
 
     public EventSourceMapping updateEventSourceMapping(String uuid, Map<String, Object> request) {
@@ -1059,6 +1071,19 @@ public class LambdaService {
 
         LOG.infov("Updated ESM {0}: batchSize={1} enabled={2}", uuid, esm.getBatchSize(), esm.isEnabled());
         return esm;
+    }
+
+    private EventSourceMapping ensureEventSourceMappingIdentity(EventSourceMapping esm) {
+        if (esm.getEventSourceMappingArn() == null || esm.getEventSourceMappingArn().isBlank()) {
+            esm.setEventSourceMappingArn(eventSourceMappingArn(
+                    esm.getAccountId(), esm.getRegion(), esm.getUuid()));
+            esmStore.save(esm);
+        }
+        return esm;
+    }
+
+    private static String eventSourceMappingArn(String accountId, String region, String uuid) {
+        return "arn:aws:lambda:" + region + ":" + accountId + ":event-source-mapping:" + uuid;
     }
 
     public void deleteEventSourceMapping(String uuid) {
@@ -1840,22 +1865,43 @@ public class LambdaService {
 
     // ──────────────────────────── Tags ────────────────────────────
 
-    public Map<String, String> listTags(String functionArn) {
-        TagTarget target = resolveTagTarget(functionArn);
+    public Map<String, String> listTags(String resourceArn) {
+        TagTarget target = resolveTagTarget(resourceArn);
+        if (target.type == TagTargetType.EVENT_SOURCE_MAPPING) {
+            EventSourceMapping esm = getEventSourceMappingByArn(resourceArn, target);
+            return esm.getTags() != null ? Map.copyOf(esm.getTags()) : Map.of();
+        }
         LambdaFunction fn = getFunction(target.region, target.name);
         return fn.getTags() != null ? fn.getTags() : Map.of();
     }
 
-    public void tagResource(String functionArn, Map<String, String> tags) {
-        TagTarget target = resolveTagTarget(functionArn);
+    public void tagResource(String resourceArn, Map<String, String> tags) {
+        TagTarget target = resolveTagTarget(resourceArn);
+        if (target.type == TagTargetType.EVENT_SOURCE_MAPPING) {
+            EventSourceMapping esm = getEventSourceMappingByArn(resourceArn, target);
+            if (esm.getTags() == null) {
+                esm.setTags(new java.util.HashMap<>());
+            }
+            esm.getTags().putAll(tags);
+            esmStore.save(esm);
+            return;
+        }
         LambdaFunction fn = getFunction(target.region, target.name);
         if (fn.getTags() == null) fn.setTags(new java.util.HashMap<>());
         fn.getTags().putAll(tags);
         functionStore.save(target.region, fn);
     }
 
-    public void untagResource(String functionArn, List<String> tagKeys) {
-        TagTarget target = resolveTagTarget(functionArn);
+    public void untagResource(String resourceArn, List<String> tagKeys) {
+        TagTarget target = resolveTagTarget(resourceArn);
+        if (target.type == TagTargetType.EVENT_SOURCE_MAPPING) {
+            EventSourceMapping esm = getEventSourceMappingByArn(resourceArn, target);
+            if (esm.getTags() != null) {
+                tagKeys.forEach(esm.getTags()::remove);
+            }
+            esmStore.save(esm);
+            return;
+        }
         LambdaFunction fn = getFunction(target.region, target.name);
         if (fn.getTags() != null) {
             tagKeys.forEach(fn.getTags()::remove);
@@ -1863,27 +1909,54 @@ public class LambdaService {
         functionStore.save(target.region, fn);
     }
 
-    private record TagTarget(String region, String name) {}
+    private enum TagTargetType { FUNCTION, EVENT_SOURCE_MAPPING }
+
+    private record TagTarget(TagTargetType type, String region, String name) {}
 
     /**
-     * Resolves a tag-endpoint ARN to a (region, shortName) pair. The Lambda
-     * tag APIs only accept an unqualified full function ARN; reject partial
-     * ARNs, bare names, and qualified ARNs.
+     * Resolves a tag-endpoint ARN to a function or event source mapping. The
+     * Lambda tag APIs reject partial ARNs, bare names, qualified function ARNs,
+     * and other resource types.
      */
-    private TagTarget resolveTagTarget(String functionArn) {
-        if (functionArn == null || functionArn.isBlank()) {
+    private TagTarget resolveTagTarget(String resourceArn) {
+        if (resourceArn == null || resourceArn.isBlank()) {
             throw new AwsException("InvalidParameterValueException", "Resource ARN is required", 400);
         }
-        if (!functionArn.startsWith("arn:")) {
+        if (!resourceArn.startsWith("arn:")) {
             throw new AwsException("InvalidParameterValueException",
-                    "Resource ARN must be a full Lambda function ARN: " + functionArn, 400);
+                    "Resource ARN must be a full Lambda resource ARN: " + resourceArn, 400);
         }
-        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionArn);
+        AwsArnUtils.Arn arn;
+        try {
+            arn = AwsArnUtils.parse(resourceArn);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Invalid Lambda resource ARN: " + resourceArn, 400);
+        }
+        if (!"lambda".equals(arn.service()) || arn.region().isBlank() || arn.accountId().isBlank()) {
+            throw new AwsException("InvalidParameterValueException",
+                    "Invalid Lambda resource ARN: " + resourceArn, 400);
+        }
+        String[] resourceParts = arn.resource().split(":", -1);
+        if (resourceParts.length == 2 && "event-source-mapping".equals(resourceParts[0])
+                && !resourceParts[1].isBlank()) {
+            return new TagTarget(TagTargetType.EVENT_SOURCE_MAPPING, arn.region(), resourceParts[1]);
+        }
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(resourceArn);
         if (ref.qualifier() != null) {
             throw new AwsException("InvalidParameterValueException",
-                    "Tag operations require an unqualified function ARN: " + functionArn, 400);
+                    "Tag operations require an unqualified function ARN: " + resourceArn, 400);
         }
-        return new TagTarget(ref.region(), ref.name());
+        return new TagTarget(TagTargetType.FUNCTION, ref.region(), ref.name());
+    }
+
+    private EventSourceMapping getEventSourceMappingByArn(String resourceArn, TagTarget target) {
+        EventSourceMapping esm = getEventSourceMapping(target.name);
+        if (!resourceArn.equals(esm.getEventSourceMappingArn())) {
+            throw new AwsException("ResourceNotFoundException",
+                    "Event source mapping not found: " + resourceArn, 404);
+        }
+        return esm;
     }
 
     private int toInt(Object value, int defaultValue) {
