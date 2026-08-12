@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerResourceIdentity;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
@@ -87,6 +88,7 @@ public class ContainerLauncher {
     private final EcrRegistryManager ecrRegistryManager;
     private final LambdaLayerService layerService;
     private final LaunchedContainerAwsEnv awsEnv;
+    private final DockerResourceIdentity resourceIdentity;
 
     /** Matches an AWS-shaped ECR image URI: {@code <account>.dkr.ecr.<region>.amazonaws.com/<repo>[:tag]}. */
     private static final java.util.regex.Pattern AWS_ECR_URI =
@@ -102,7 +104,8 @@ public class ContainerLauncher {
                              EmulatorConfig config,
                              EcrRegistryManager ecrRegistryManager,
                              LambdaLayerService layerService,
-                             LaunchedContainerAwsEnv awsEnv) {
+                             LaunchedContainerAwsEnv awsEnv,
+                             DockerResourceIdentity resourceIdentity) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -113,6 +116,7 @@ public class ContainerLauncher {
         this.ecrRegistryManager = ecrRegistryManager;
         this.layerService = layerService;
         this.awsEnv = awsEnv;
+        this.resourceIdentity = resourceIdentity;
     }
 
     @PostConstruct
@@ -237,6 +241,8 @@ public class ContainerLauncher {
         ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(image)
                 .withName(containerName)
                 .withEnv(env)
+                .withLabels(LambdaDockerResourceLabels.forFunction(
+                        resourceIdentity.instanceId(), fn, LambdaDockerResourceLabels.EXECUTION))
                 .withMemoryMb(fn.getMemorySize())
                 .withDockerNetwork(config.services().lambda().dockerNetwork())
                 .withHostDockerInternalOnLinux()
@@ -564,7 +570,8 @@ public class ContainerLauncher {
      * just mounts the volume read-only, turning a ~95s per-container copy into a ~0.2s mount.
      */
     private String ensureCodeVolume(LambdaFunction fn, String image) {
-        String volName = codeVolumeName(fn);
+        String instanceId = resourceIdentity.instanceId();
+        String volName = codeVolumeName(fn, instanceId);
         // Held for the whole resolve-and-reconcile, not just the populate branch: this is the same
         // lock cleanupSupersededVolumes acquires before claiming a volume for deletion, so a launch
         // that resolves a volume can never race a sweep that's about to delete that exact volume out
@@ -584,7 +591,7 @@ public class ContainerLauncher {
                 long t0 = System.currentTimeMillis();
                 LOG.infov("Populating code volume {0} for function {1} (one-time per code version)",
                         volName, fn.getFunctionName());
-                populateCodeVolume(volName, fn, image);
+                populateCodeVolume(volName, fn, image, instanceId);
                 populatedCodeVolumes.add(volName);
                 LOG.infov("Populated code volume {0} in {1}ms; future cold starts mount it instead of copying",
                         volName, System.currentTimeMillis() - t0);
@@ -704,14 +711,18 @@ public class ContainerLauncher {
         return count == null ? 0 : count.get();
     }
 
-    private void populateCodeVolume(String volName, LambdaFunction fn, String image) {
-        lifecycleManager.ensureVolume(volName);
+    private void populateCodeVolume(String volName, LambdaFunction fn, String image, String instanceId) {
+        lifecycleManager.ensureVolume(volName, LambdaDockerResourceLabels.forFunction(
+                instanceId, fn, LambdaDockerResourceLabels.CODE_VOLUME));
         String shortId = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         // A minimal helper container (sleep) with the volume mounted read-write at /var/task; we
         // tar-copy the code into it, then discard it — the data persists in the volume.
         ContainerSpec helperSpec = containerBuilder.newContainer(image)
-                .withName("floci-codevol-" + fn.getFunctionName() + "-" + shortId)
+                .withName(ContainerStorageHelper.dockerName(
+                        config, "floci-codevol-" + fn.getFunctionName() + "-" + shortId))
                 .withEnv(java.util.List.of())
+                .withLabels(LambdaDockerResourceLabels.forFunction(
+                        instanceId, fn, LambdaDockerResourceLabels.CODE_POPULATOR))
                 .withEntrypoint(java.util.List.of("sleep"))
                 .withCmd(java.util.List.of("3600"))
                 .withNamedVolume(volName, TASK_DIR, false)
@@ -770,14 +781,12 @@ public class ContainerLauncher {
     }
 
     /**
-     * Docker-volume-safe name keyed by function + code version, so a redeploy yields a new volume.
+     * Docker-volume-safe name keyed by Floci instance, function, and code version, so separate
+     * emulator instances cannot adopt each other's cache and a redeploy yields a new volume.
      * Prefers the code SHA-256; falls back to last-modified when the SHA is unavailable.
      */
-    static String codeVolumeName(LambdaFunction fn) {
-        String key = fn.getCodeSha256();
-        if (key == null || key.isBlank()) {
-            key = Long.toString(fn.getLastModified());
-        }
+    static String codeVolumeName(LambdaFunction fn, String instanceId) {
+        String key = codeIdentity(fn);
         String h = key.replaceAll("[^a-zA-Z0-9]", "");
         if (h.length() > 20) {
             h = h.substring(0, 20);
@@ -786,7 +795,24 @@ public class ContainerLauncher {
             h = "0";
         }
         String fname = fn.getFunctionName().replaceAll("[^a-zA-Z0-9_.-]", "-");
-        return "floci-code-" + fname + "-" + h;
+        return "floci-code-" + fname + "-" + h + "-" + shortIdentityHash(instanceId);
+    }
+
+    static String codeIdentity(LambdaFunction fn) {
+        String codeIdentity = fn.getCodeSha256();
+        return codeIdentity == null || codeIdentity.isBlank()
+                ? Long.toString(fn.getLastModified())
+                : codeIdentity;
+    }
+
+    private static String shortIdentityHash(String instanceId) {
+        try {
+            byte[] digest = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(instanceId.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(digest, 0, 6);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is unavailable", e);
+        }
     }
 
     static String efsVolumeName(String accessPointArn) {

@@ -57,7 +57,7 @@ public final class ContainerStorageHelper {
         return base.resolve(namespace).resolve(service).resolve(resourceId);
     }
 
-    private static String resourceNamespace(EmulatorConfig config) {
+    static String resourceNamespace(EmulatorConfig config) {
         if (config == null || config.docker() == null || config.docker().resourceNamespace() == null) {
             return "";
         }

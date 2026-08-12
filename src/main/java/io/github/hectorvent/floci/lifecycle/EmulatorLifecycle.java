@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager
 import io.github.hectorvent.floci.services.lambda.DynamoDbStreamsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.KinesisEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.SqsEventSourcePoller;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaDockerResourceReconciler;
 import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerManager;
 import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
 import io.github.hectorvent.floci.services.pipes.PipesService;
@@ -91,6 +92,7 @@ public class EmulatorLifecycle {
     private final SchemaCreationWorker schemaCreationWorker;
     private final jakarta.enterprise.inject.Instance<ContainerTeardown> containerTeardowns;
     private final PersistentPathValidator persistentPathValidator;
+    private final LambdaDockerResourceReconciler lambdaDockerResourceReconciler;
 
     @Inject
     public EmulatorLifecycle(StorageFactory storageFactory, ServiceRegistry serviceRegistry,
@@ -120,7 +122,8 @@ public class EmulatorLifecycle {
                              InitLifecycleState initLifecycleState,
                              SchemaCreationWorker schemaCreationWorker,
                              jakarta.enterprise.inject.Instance<ContainerTeardown> containerTeardowns,
-                             PersistentPathValidator persistentPathValidator) {
+                             PersistentPathValidator persistentPathValidator,
+                             LambdaDockerResourceReconciler lambdaDockerResourceReconciler) {
         this.storageFactory = storageFactory;
         this.serviceRegistry = serviceRegistry;
         this.config = config;
@@ -150,6 +153,7 @@ public class EmulatorLifecycle {
         this.schemaCreationWorker = schemaCreationWorker;
         this.containerTeardowns = containerTeardowns;
         this.persistentPathValidator = persistentPathValidator;
+        this.lambdaDockerResourceReconciler = lambdaDockerResourceReconciler;
     }
 
     void onStart(@Observes StartupEvent ignored) {
@@ -174,6 +178,7 @@ public class EmulatorLifecycle {
 
         serviceRegistry.logEnabledServices();
         storageFactory.loadAll();
+        lambdaDockerResourceReconciler.reconcileAtStartup();
         schemaCreationWorker.recoverOrphans();
         schemaCreationWorker.rehydrateSchemas();
 

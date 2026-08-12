@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerResourceIdentity;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFileSystemConfig;
@@ -74,6 +75,7 @@ class ContainerLauncherTest {
     @Mock EmbeddedDnsServer embeddedDnsServer;
     @Mock RuntimeApiServer runtimeApiServer;
     @Mock DockerClient dockerClient;
+    @Mock DockerResourceIdentity resourceIdentity;
 
     @TempDir
     Path tempDir;
@@ -114,6 +116,7 @@ class ContainerLauncherTest {
         lenient().when(efs.mountGroupAdd()).thenReturn(OptionalInt.empty());
 
         when(embeddedDnsServer.getServerIp()).thenReturn(Optional.empty());
+        when(resourceIdentity.instanceId()).thenReturn("test-instance");
 
         ContainerBuilder containerBuilder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
         ContainerReachableEndpoint reachableEndpoint =
@@ -121,7 +124,8 @@ class ContainerLauncherTest {
         LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(reachableEndpoint);
         launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
                 runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
-                mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class), awsEnv);
+                mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class), awsEnv,
+                resourceIdentity);
 
         when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
         when(runtimeApiServer.getPort()).thenReturn(9000);
@@ -219,6 +223,11 @@ class ContainerLauncherTest {
         // The code is tar-copied straight into /var/task on the real container.
         assertTrue(capturedRemotePaths.contains("/var/task"),
                 "small code should be copied directly into /var/task");
+        assertEquals("test-instance", spec.labels().get(LambdaDockerResourceLabels.INSTANCE));
+        assertEquals("lambda", spec.labels().get(LambdaDockerResourceLabels.SERVICE));
+        assertEquals(LambdaDockerResourceLabels.EXECUTION,
+                spec.labels().get(LambdaDockerResourceLabels.KIND));
+        assertEquals("standard-fn", spec.labels().get(LambdaDockerResourceLabels.FUNCTION));
     }
 
     @Test
@@ -631,8 +640,22 @@ class ContainerLauncherTest {
         assertEquals(1, capturedRemotePaths.stream().filter("/var/task"::equals).count(),
                 "/var/task should be copied exactly once (into the populate helper)");
         // Two creates: the helper + the real container. The helper is discarded.
-        verify(lifecycleManager, times(2)).create(any());
-        verify(lifecycleManager, atLeastOnce()).ensureVolume(any());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, String>> volumeLabels = ArgumentCaptor.forClass(Map.class);
+        verify(lifecycleManager).ensureVolume(
+                eq(ContainerLauncher.codeVolumeName(fn, "test-instance")), volumeLabels.capture());
+        assertEquals("test-instance", volumeLabels.getValue().get(LambdaDockerResourceLabels.INSTANCE));
+        assertEquals(LambdaDockerResourceLabels.CODE_VOLUME,
+                volumeLabels.getValue().get(LambdaDockerResourceLabels.KIND));
+
+        ArgumentCaptor<ContainerSpec> createdSpecs = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(lifecycleManager, times(2)).create(createdSpecs.capture());
+        ContainerSpec helper = createdSpecs.getAllValues().stream()
+                .filter(candidate -> LambdaDockerResourceLabels.CODE_POPULATOR.equals(
+                        candidate.labels().get(LambdaDockerResourceLabels.KIND)))
+                .findFirst()
+                .orElseThrow();
+        assertEquals("test-instance", helper.labels().get(LambdaDockerResourceLabels.INSTANCE));
         verify(lifecycleManager, times(1)).stopAndRemove(any(), any()); // the helper only
         // A superseded code-version volume is never deleted synchronously within a single launch
         // (see the cleanupSupersededVolumes tests below for the deferred sweep; this fn has no
@@ -658,7 +681,8 @@ class ContainerLauncherTest {
         fn.setCodeSha256("leak-fn-sha-v1");
 
         // The code-volume populate fails (daemon under load), before any container is created.
-        doThrow(new RuntimeException("docker daemon busy")).when(lifecycleManager).ensureVolume(any());
+        doThrow(new RuntimeException("docker daemon busy"))
+                .when(lifecycleManager).ensureVolume(any(), any());
 
         long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
         try {
@@ -722,7 +746,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("cleanup-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("cleanup-fn");
@@ -730,7 +754,7 @@ class ContainerLauncherTest {
         v2.setHandler("index.handler");
         v2.setCodeLocalPath(codePath.toString());
         v2.setCodeSha256("cleanup-fn-sha-v2");
-        String volumeV2 = ContainerLauncher.codeVolumeName(v2);
+        String volumeV2 = ContainerLauncher.codeVolumeName(v2, "test-instance");
 
         long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
         long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
@@ -771,7 +795,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("rollback-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("rollback-fn");
@@ -779,7 +803,7 @@ class ContainerLauncherTest {
         v2.setHandler("index.handler");
         v2.setCodeLocalPath(codePath.toString());
         v2.setCodeSha256("rollback-fn-sha-v2");
-        String volumeV2 = ContainerLauncher.codeVolumeName(v2);
+        String volumeV2 = ContainerLauncher.codeVolumeName(v2, "test-instance");
 
         // Needed for the rollback launch below: v1's volume is already populated by then, so its
         // fast path actually evaluates volumeExists instead of short-circuiting past it.
@@ -818,7 +842,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("retry-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("retry-fn");
@@ -869,7 +893,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("race-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("race-fn");
@@ -945,7 +969,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("inflight-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("inflight-fn");
@@ -1101,7 +1125,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("lock-persist-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("lock-persist-fn");
@@ -1280,7 +1304,8 @@ class ContainerLauncherTest {
                 imageResolver, runtimeApiServerFactory, dockerHostResolver, config,
                 ecrRegistryManager,
                 mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class),
-                new LaunchedContainerAwsEnv(reachableEndpoint));
+                new LaunchedContainerAwsEnv(reachableEndpoint),
+                resourceIdentity);
 
         stubExtensionDiscovery("otel-collector");
         // Feed a real stdout frame through whatever callback the launcher hands to execStartCmd.

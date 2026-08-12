@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerResourceIdentity;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
@@ -223,6 +224,7 @@ class LambdaImageConfigTest {
         @Mock EmbeddedDnsServer embeddedDnsServer;
         @Mock RuntimeApiServer runtimeApiServer;
         @Mock DockerClient dockerClient;
+        @Mock DockerResourceIdentity resourceIdentity;
 
         ContainerLauncher launcher;
 
@@ -244,6 +246,7 @@ class LambdaImageConfigTest {
             lenient().when(tls.enabled()).thenReturn(false);
             lenient().when(config.hostname()).thenReturn(Optional.empty());
             when(embeddedDnsServer.getServerIp()).thenReturn(Optional.empty());
+            when(resourceIdentity.instanceId()).thenReturn("test-instance");
 
             ContainerBuilder containerBuilder = new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer);
             ContainerReachableEndpoint reachableEndpoint =
@@ -251,7 +254,8 @@ class LambdaImageConfigTest {
             LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(reachableEndpoint);
             launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
                     runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
-                    mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class), awsEnv);
+                    mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class), awsEnv,
+                    resourceIdentity);
 
             when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
             when(runtimeApiServer.getPort()).thenReturn(9000);

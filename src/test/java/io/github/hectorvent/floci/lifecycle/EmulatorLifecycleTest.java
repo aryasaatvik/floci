@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
 import io.github.hectorvent.floci.services.lambda.DynamoDbStreamsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.KinesisEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.SqsEventSourcePoller;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaDockerResourceReconciler;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.pipes.PipesService;
@@ -85,6 +86,7 @@ class EmulatorLifecycleTest {
     @Mock private EmulatorConfig.TlsConfig tlsConfig;
     @Mock private io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker schemaCreationWorker;
     @Mock private jakarta.enterprise.inject.Instance<io.github.hectorvent.floci.core.common.ContainerTeardown> containerTeardowns;
+    @Mock private LambdaDockerResourceReconciler lambdaDockerResourceReconciler;
 
     private EmulatorLifecycle emulatorLifecycle;
 
@@ -107,7 +109,8 @@ class EmulatorLifecycleTest {
                 rabbitMqManager, flinkContainerManager, rdsService, elbV2Service,
                 initializationHooksRunner, sqsPoller, kinesisPoller, dynamodbStreamsPoller,
                 pipesService, ec2MetadataServer, ecrRegistryManager, flociUiManager, initLifecycleState,
-                schemaCreationWorker, containerTeardowns, persistentPathValidator);
+                schemaCreationWorker, containerTeardowns, persistentPathValidator,
+                lambdaDockerResourceReconciler);
         Mockito.lenient().when(containerTeardowns.iterator())
                 .thenReturn(java.util.Collections.emptyIterator());
     }
@@ -127,10 +130,12 @@ class EmulatorLifecycleTest {
 
         emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
 
-        var inOrder = Mockito.inOrder(initializationHooksRunner, storageFactory, initLifecycleState, rdsService);
+        var inOrder = Mockito.inOrder(initializationHooksRunner, storageFactory, initLifecycleState,
+                lambdaDockerResourceReconciler, rdsService);
         inOrder.verify(initializationHooksRunner).run(InitializationHook.BOOT);
         inOrder.verify(initLifecycleState).markBootCompleted();
         inOrder.verify(storageFactory).loadAll();
+        inOrder.verify(lambdaDockerResourceReconciler).reconcileAtStartup();
         inOrder.verify(rdsService).restorePersistedRuntime();
     }
 

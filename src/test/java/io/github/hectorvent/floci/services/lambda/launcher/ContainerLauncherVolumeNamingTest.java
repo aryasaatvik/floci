@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Unit tests for {@link ContainerLauncher#codeVolumeName(LambdaFunction)}, the naming logic for
+ * Unit tests for {@link ContainerLauncher#codeVolumeName(LambdaFunction, String)}, the naming logic for
  * the per-function-version code volume. The name must be stable for a given code version (so all
  * of a function's containers share one volume), distinct across code versions (so a redeploy gets
  * a fresh volume), and always a legal Docker volume name.
@@ -37,7 +37,7 @@ class ContainerLauncherVolumeNamingTest {
     @Test
     void isFlociCodeShapedAndDockerSafe() {
         String name = ContainerLauncher.codeVolumeName(
-                fnWithSha("my-fn", "AbC123+/xyz=deadbeefcafebabe0123456789"));
+                fnWithSha("my-fn", "AbC123+/xyz=deadbeefcafebabe0123456789"), "test-instance");
 
         assertTrue(name.startsWith("floci-code-my-fn-"),
                 "should be floci-code-<functionName>-<hash> shaped, was: " + name);
@@ -49,24 +49,39 @@ class ContainerLauncherVolumeNamingTest {
     void sanitizesUnsafeFunctionNameChars() {
         // Real function names are constrained, but be defensive: any unsafe char must not leak
         // into the volume name (which would make `docker volume create` reject it).
-        String name = ContainerLauncher.codeVolumeName(fnWithSha("weird name/v2:1", "abc123"));
+        String name = ContainerLauncher.codeVolumeName(
+                fnWithSha("weird name/v2:1", "abc123"), "test-instance");
         assertTrue(DOCKER_VOLUME_NAME.matcher(name).matches(),
                 "unsafe function-name chars must be sanitized, was: " + name);
     }
 
     @Test
     void differsAcrossCodeVersions() {
-        String v1 = ContainerLauncher.codeVolumeName(fnWithSha("same-fn", "sha-version-one"));
-        String v2 = ContainerLauncher.codeVolumeName(fnWithSha("same-fn", "sha-version-two"));
+        String v1 = ContainerLauncher.codeVolumeName(
+                fnWithSha("same-fn", "sha-version-one"), "test-instance");
+        String v2 = ContainerLauncher.codeVolumeName(
+                fnWithSha("same-fn", "sha-version-two"), "test-instance");
 
         assertNotEquals(v1, v2,
                 "different codeSha256 must yield different volume names so a redeploy gets a fresh volume");
     }
 
     @Test
+    void differsAcrossFlociInstancesSharingOneDockerDaemon() {
+        LambdaFunction function = fnWithSha("shared-fn", "same-code-sha");
+
+        assertNotEquals(
+                ContainerLauncher.codeVolumeName(function, "instance-a"),
+                ContainerLauncher.codeVolumeName(function, "instance-b"),
+                "separate Floci instances must never adopt each other's code volume");
+    }
+
+    @Test
     void isStableForSameFunctionAndSha() {
-        String a = ContainerLauncher.codeVolumeName(fnWithSha("stable-fn", "stable-sha-abc"));
-        String b = ContainerLauncher.codeVolumeName(fnWithSha("stable-fn", "stable-sha-abc"));
+        String a = ContainerLauncher.codeVolumeName(
+                fnWithSha("stable-fn", "stable-sha-abc"), "test-instance");
+        String b = ContainerLauncher.codeVolumeName(
+                fnWithSha("stable-fn", "stable-sha-abc"), "test-instance");
 
         assertEquals(a, b, "same function + same sha must produce a stable volume name");
     }
@@ -83,8 +98,8 @@ class ContainerLauncherVolumeNamingTest {
         blankSha.setCodeSha256("   ");
         blankSha.setLastModified(1700000000000L);
 
-        String nullName = ContainerLauncher.codeVolumeName(nullSha);
-        String blankName = ContainerLauncher.codeVolumeName(blankSha);
+        String nullName = ContainerLauncher.codeVolumeName(nullSha, "test-instance");
+        String blankName = ContainerLauncher.codeVolumeName(blankSha, "test-instance");
 
         assertTrue(DOCKER_VOLUME_NAME.matcher(nullName).matches(),
                 "must be docker-safe even when falling back to lastModified, was: " + nullName);
@@ -96,7 +111,7 @@ class ContainerLauncherVolumeNamingTest {
         LambdaFunction newer = new LambdaFunction();
         newer.setFunctionName("no-sha-fn");
         newer.setLastModified(1700000009999L);
-        assertNotEquals(nullName, ContainerLauncher.codeVolumeName(newer),
+        assertNotEquals(nullName, ContainerLauncher.codeVolumeName(newer, "test-instance"),
                 "a later lastModified must produce a different volume name");
     }
 
