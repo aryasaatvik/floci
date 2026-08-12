@@ -196,7 +196,7 @@ setups, and `floci:override-id` wins when both are present. Every other tag is p
 ## API Gateway v2 (HTTP and WebSocket APIs) {#v2}
 
 **Protocol:** REST JSON
-**Endpoint:** `http://localhost:4566/v2/apis/...`
+**Endpoints:** `http://localhost:4566/v2/apis/...`, `http://localhost:4566/v2/domainnames/...`
 
 Both HTTP and WebSocket protocol types are fully supported, including the WebSocket data-plane (real connection handling, message routing, and the `@connections` management API).
 
@@ -230,6 +230,8 @@ this default hostname with `404 Not Found`, matching AWS HTTP API behavior.
 | **Stages** | CreateStage, GetStage, GetStages, UpdateStage, DeleteStage |
 | **Deployments** | CreateDeployment, GetDeployment, GetDeployments, UpdateDeployment, DeleteDeployment |
 | **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
+| **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
+| **API Mappings** | CreateApiMapping, GetApiMapping, GetApiMappings, UpdateApiMapping, DeleteApiMapping |
 | **Tags** | TagResource, UntagResource, GetTags |
 
 ### WebSocket Data-Plane {#websocket-data-plane}
@@ -286,8 +288,7 @@ DELETE /execute-api/{apiId}/{stageName}/@connections/{connectionId}  — Disconn
 
 ### Not Implemented
 
-- `ReimportApi`, `ExportApi`, `GetApiMapping`, `CreateApiMapping`, `DeleteApiMapping`
-- `GetDomainName`, `CreateDomainName`, `DeleteDomainName`
+- `ReimportApi`, `ExportApi`
 - `CreateVpcLink`, `GetVpcLink`, `GetVpcLinks`, `UpdateVpcLink`, `DeleteVpcLink`
 
 ### Examples

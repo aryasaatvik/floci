@@ -13,6 +13,8 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -33,6 +35,8 @@ public class ApiGatewayV2Service {
     private final StorageBackend<String, IntegrationResponse> integrationResponseStore;
     private final StorageBackend<String, Model> modelStore;
     private final StorageBackend<String, VpcLink> vpcLinkStore;
+    private final StorageBackend<String, DomainName> domainNameStore;
+    private final StorageBackend<String, ApiMapping> apiMappingStore;
     private final RegionResolver regionResolver;
 
     @Inject
@@ -56,6 +60,10 @@ public class ApiGatewayV2Service {
         this.modelStore = storageFactory.create("apigatewayv2", "apigatewayv2-models.json",
                 new TypeReference<>() {});
         this.vpcLinkStore = storageFactory.create("apigatewayv2", "apigatewayv2-vpclinks.json",
+                new TypeReference<>() {});
+        this.domainNameStore = storageFactory.create("apigatewayv2", "apigatewayv2-domainnames.json",
+                new TypeReference<>() {});
+        this.apiMappingStore = storageFactory.create("apigatewayv2", "apigatewayv2-apimappings.json",
                 new TypeReference<>() {});
         this.regionResolver = regionResolver;
     }
@@ -883,15 +891,170 @@ public class ApiGatewayV2Service {
         vpcLinkStore.delete(vpcLinkKey(region, vpcLinkId));
     }
 
+    // ──────────────────────────── Custom Domains & API Mappings ────────────────────────────
+
+    public DomainName createDomainName(String region, Map<String, Object> request) {
+        String name = requireNonBlank(request.get("domainName"), "DomainName");
+        String key = domainNameKey(region, name);
+        if (domainNameStore.get(key).isPresent()) {
+            throw new AwsException("ConflictException", "Domain name already exists", 409);
+        }
+
+        DomainName domain = new DomainName();
+        domain.setDomainName(name);
+        domain.setDomainNameArn("arn:aws:apigateway:" + region + "::/domainnames/" + name);
+        domain.setDomainNameConfigurations(domainConfigurations(name, request.get("domainNameConfigurations")));
+        domain.setMutualTlsAuthentication(objectMap(request.get("mutualTlsAuthentication")));
+        domain.setRoutingMode((String) request.getOrDefault("routingMode", "API_MAPPING_ONLY"));
+        domain.setApiMappingSelectionExpression("$request.basepath");
+        domain.setTags(stringMap(request.get("tags")));
+        domainNameStore.put(key, domain);
+        return domain;
+    }
+
+    public DomainName getDomainName(String region, String name) {
+        return domainNameStore.get(domainNameKey(region, name))
+                .orElseThrow(() -> new AwsException("NotFoundException", "Domain name not found", 404));
+    }
+
+    public List<DomainName> getDomainNames(String region) {
+        return domainNameStore.scan(key -> key.startsWith(region + "::"));
+    }
+
+    public DomainName updateDomainName(String region, String name, Map<String, Object> request) {
+        DomainName domain = getDomainName(region, name);
+        if (request.containsKey("domainNameConfigurations") && request.get("domainNameConfigurations") != null) {
+            domain.setDomainNameConfigurations(domainConfigurations(name, request.get("domainNameConfigurations")));
+        }
+        if (request.containsKey("mutualTlsAuthentication")) {
+            domain.setMutualTlsAuthentication(objectMap(request.get("mutualTlsAuthentication")));
+        }
+        if (request.containsKey("routingMode") && request.get("routingMode") != null) {
+            domain.setRoutingMode((String) request.get("routingMode"));
+        }
+        domainNameStore.put(domainNameKey(region, name), domain);
+        return domain;
+    }
+
+    public void deleteDomainName(String region, String name) {
+        getDomainName(region, name);
+        domainNameStore.delete(domainNameKey(region, name));
+        deleteByPrefix(apiMappingStore, region + "::" + name + "::");
+    }
+
+    public ApiMapping createApiMapping(String region, String domainName, Map<String, Object> request) {
+        getDomainName(region, domainName);
+        String apiId = requireNonBlank(request.get("apiId"), "ApiId");
+        String stage = requireNonBlank(request.get("stage"), "Stage");
+        getApi(region, apiId);
+        getStage(region, apiId, stage);
+
+        String mappingKey = (String) request.get("apiMappingKey");
+        ensureMappingKeyAvailable(region, domainName, null, mappingKey);
+
+        ApiMapping mapping = new ApiMapping();
+        mapping.setApiMappingId(shortId(8));
+        mapping.setApiId(apiId);
+        mapping.setApiMappingKey(mappingKey);
+        mapping.setStage(stage);
+        apiMappingStore.put(apiMappingKey(region, domainName, mapping.getApiMappingId()), mapping);
+        return mapping;
+    }
+
+    public ApiMapping getApiMapping(String region, String domainName, String mappingId) {
+        getDomainName(region, domainName);
+        return apiMappingStore.get(apiMappingKey(region, domainName, mappingId))
+                .orElseThrow(() -> new AwsException("NotFoundException", "API mapping not found", 404));
+    }
+
+    public List<ApiMapping> getApiMappings(String region, String domainName) {
+        getDomainName(region, domainName);
+        return apiMappingStore.scan(key -> key.startsWith(region + "::" + domainName + "::"));
+    }
+
+    public ApiMapping updateApiMapping(String region, String domainName, String mappingId, Map<String, Object> request) {
+        ApiMapping mapping = getApiMapping(region, domainName, mappingId);
+        String apiId = requireNonBlank(request.get("apiId"), "ApiId");
+        String stage = request.containsKey("stage")
+                ? requireNonBlank(request.get("stage"), "Stage")
+                : mapping.getStage();
+        getApi(region, apiId);
+        getStage(region, apiId, stage);
+
+        if (request.containsKey("apiMappingKey")) {
+            String mappingKey = (String) request.get("apiMappingKey");
+            ensureMappingKeyAvailable(region, domainName, mappingId, mappingKey);
+            mapping.setApiMappingKey(mappingKey);
+        }
+        mapping.setApiId(apiId);
+        mapping.setStage(stage);
+        apiMappingStore.put(apiMappingKey(region, domainName, mappingId), mapping);
+        return mapping;
+    }
+
+    public void deleteApiMapping(String region, String domainName, String mappingId) {
+        getApiMapping(region, domainName, mappingId);
+        apiMappingStore.delete(apiMappingKey(region, domainName, mappingId));
+    }
+
+    private void ensureMappingKeyAvailable(String region, String domainName, String mappingId, String mappingKey) {
+        String normalizedMappingKey = mappingKey == null ? "" : mappingKey;
+        boolean duplicate = getApiMappings(region, domainName).stream()
+                .filter(candidate -> !candidate.getApiMappingId().equals(mappingId))
+                .anyMatch(candidate -> normalizedMappingKey.equals(
+                        candidate.getApiMappingKey() == null ? "" : candidate.getApiMappingKey()));
+        if (duplicate) {
+            throw new AwsException("ConflictException", "API mapping key already exists", 409);
+        }
+    }
+
+    private static String requireNonBlank(Object value, String fieldName) {
+        if (!(value instanceof String text) || text.isBlank()) {
+            throw new AwsException("BadRequestException", fieldName + " must not be blank", 400);
+        }
+        return text;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> objectMap(Object value) {
+        return value instanceof Map<?, ?> map ? new HashMap<>((Map<String, Object>) map) : null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, String> stringMap(Object value) {
+        return value instanceof Map<?, ?> map ? new HashMap<>((Map<String, String>) map) : null;
+    }
+
+    private static List<Map<String, Object>> domainConfigurations(String name, Object value) {
+        if (!(value instanceof List<?> configurations)) {
+            return new ArrayList<>();
+        }
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object configuration : configurations) {
+            if (!(configuration instanceof Map<?, ?> map)) {
+                throw new AwsException("BadRequestException", "DomainNameConfigurations must contain objects", 400);
+            }
+            Map<String, Object> normalized = new HashMap<>();
+            map.forEach((key, entryValue) -> normalized.put(String.valueOf(key), entryValue));
+            if ("REGIONAL".equals(normalized.get("endpointType"))) {
+                normalized.putIfAbsent("apiGatewayDomainName", name + ".regional.local");
+                normalized.putIfAbsent("hostedZoneId", "Z2FDTNDATAQYL2");
+                normalized.putIfAbsent("domainNameStatus", "AVAILABLE");
+            }
+            result.add(normalized);
+        }
+        return result;
+    }
+
     // ──────────────────────────── Standalone Tagging ────────────────────────────
 
-    /**
-     * Parses an API Gateway v2 resource ARN and returns a two-element array
-     * [region, apiId]. Throws BadRequestException if the ARN is malformed.
-     *
-     * Expected format: arn:aws:apigateway:{region}::/apis/{apiId}
-     */
-    private String[] parseArn(String resourceArn) {
+    private sealed interface TaggableResource permits ApiResource, DomainNameResource {}
+
+    private record ApiResource(String region, String apiId) implements TaggableResource {}
+
+    private record DomainNameResource(String region, String domainName) implements TaggableResource {}
+
+    private TaggableResource parseTaggableResource(String resourceArn) {
         if (resourceArn == null || resourceArn.isBlank()) {
             throw new AwsException("BadRequestException", "ResourceArn must not be blank", 400);
         }
@@ -902,50 +1065,72 @@ public class ApiGatewayV2Service {
             throw new AwsException("BadRequestException",
                     "Invalid ResourceArn format: " + resourceArn, 400);
         }
-        String region = arn.region();
-        String resource = arn.resource(); // e.g. "/apis/abc1234567"
-        int lastSlash = resource.lastIndexOf('/');
-        if (lastSlash < 0 || lastSlash == resource.length() - 1) {
-            throw new AwsException("BadRequestException",
-                    "Cannot extract apiId from ResourceArn: " + resourceArn, 400);
+        if (!"apigateway".equals(arn.service()) || !arn.accountId().isEmpty()) {
+            throw invalidTaggableResourceArn(resourceArn);
         }
-        String apiId = resource.substring(lastSlash + 1);
-        return new String[]{region, apiId};
+
+        String[] segments = arn.resource().split("/", -1);
+        if (segments.length == 3 && segments[0].isEmpty() && !segments[2].isEmpty()) {
+            return switch (segments[1]) {
+                case "apis" -> new ApiResource(arn.region(), segments[2]);
+                case "domainnames" -> new DomainNameResource(arn.region(), segments[2]);
+                default -> throw invalidTaggableResourceArn(resourceArn);
+            };
+        }
+        throw invalidTaggableResourceArn(resourceArn);
+    }
+
+    private AwsException invalidTaggableResourceArn(String resourceArn) {
+        return new AwsException("BadRequestException",
+                "Unsupported API Gateway v2 ResourceArn: " + resourceArn, 400);
+    }
+
+    private Map<String, String> readTags(TaggableResource resource) {
+        Map<String, String> tags = switch (resource) {
+            case ApiResource api -> getApi(api.region(), api.apiId()).getTags();
+            case DomainNameResource domain -> getDomainName(domain.region(), domain.domainName()).getTags();
+        };
+        return tags == null ? new HashMap<>() : new HashMap<>(tags);
+    }
+
+    private void writeTags(TaggableResource resource, Map<String, String> tags) {
+        switch (resource) {
+            case ApiResource ref -> {
+                Api api = getApi(ref.region(), ref.apiId());
+                api.setTags(tags);
+                apiStore.put(apiKey(ref.region(), ref.apiId()), api);
+            }
+            case DomainNameResource ref -> {
+                DomainName domain = getDomainName(ref.region(), ref.domainName());
+                domain.setTags(tags);
+                domainNameStore.put(domainNameKey(ref.region(), ref.domainName()), domain);
+            }
+        }
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags) {
         ReservedTags.rejectApiGatewayReservedTagsOnUpdate(tags);
-        String[] parsed = parseArn(resourceArn);
-        String region = parsed[0];
-        String apiId  = parsed[1];
-        Api api = getApi(region, apiId);
+        TaggableResource resource = parseTaggableResource(resourceArn);
         if (tags != null && !tags.isEmpty()) {
-            if (api.getTags() == null) {
-                api.setTags(new java.util.HashMap<>());
-            }
-            api.getTags().putAll(tags);
+            Map<String, String> updated = readTags(resource);
+            updated.putAll(tags);
+            writeTags(resource, updated);
+        } else {
+            readTags(resource);
         }
-        apiStore.put(apiKey(region, apiId), api);
     }
 
     public void untagResource(String resourceArn, List<String> tagKeys) {
-        String[] parsed = parseArn(resourceArn);
-        String region = parsed[0];
-        String apiId  = parsed[1];
-        Api api = getApi(region, apiId);
-        if (tagKeys != null && api.getTags() != null) {
-            tagKeys.forEach(k -> api.getTags().remove(k));
+        TaggableResource resource = parseTaggableResource(resourceArn);
+        Map<String, String> updated = readTags(resource);
+        if (tagKeys != null) {
+            tagKeys.forEach(updated::remove);
         }
-        apiStore.put(apiKey(region, apiId), api);
+        writeTags(resource, updated);
     }
 
     public Map<String, String> getTags(String resourceArn) {
-        String[] parsed = parseArn(resourceArn);
-        String region = parsed[0];
-        String apiId  = parsed[1];
-        Api api = getApi(region, apiId);
-        Map<String, String> tags = api.getTags();
-        return (tags != null) ? new java.util.HashMap<>(tags) : java.util.Collections.emptyMap();
+        return readTags(parseTaggableResource(resourceArn));
     }
 
     // ──────────────────────────── Key helpers ────────────────────────────
@@ -988,6 +1173,14 @@ public class ApiGatewayV2Service {
 
     private String vpcLinkKey(String region, String vpcLinkId) {
         return region + "::" + vpcLinkId;
+    }
+
+    private String domainNameKey(String region, String domainName) {
+        return region + "::" + domainName;
+    }
+
+    private String apiMappingKey(String region, String domainName, String apiMappingId) {
+        return region + "::" + domainName + "::" + apiMappingId;
     }
 
     private static String shortId(int length) {
