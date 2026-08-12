@@ -1,15 +1,20 @@
 package io.github.hectorvent.floci.services.sns;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.services.sns.model.Subscription;
 import io.github.hectorvent.floci.services.sns.model.Topic;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
@@ -22,6 +27,9 @@ class SnsServiceTest {
     private static final String BASE_URL = "http://localhost:4566";
 
     private SnsService snsService;
+
+    @TempDir
+    Path tempDir;
 
     @BeforeEach
     void setUp() {
@@ -459,9 +467,9 @@ class SnsServiceTest {
     }
 
     @Test
-    void getDataProtectionPolicy_returnsEmptyStringWhenUnset() {
+    void getDataProtectionPolicy_returnsNullWhenUnset() {
         Topic topic = snsService.createTopic("dpp-topic", null, null, REGION);
-        assertEquals("", snsService.getDataProtectionPolicy(topic.getTopicArn(), REGION));
+        assertNull(snsService.getDataProtectionPolicy(topic.getTopicArn(), REGION));
     }
 
     @Test
@@ -477,25 +485,84 @@ class SnsServiceTest {
         Topic topic = snsService.createTopic("dpp-topic", null, null, REGION);
         snsService.putDataProtectionPolicy(topic.getTopicArn(), "{\"Statement\":[]}", REGION);
         snsService.putDataProtectionPolicy(topic.getTopicArn(), "", REGION);
-        assertEquals("", snsService.getDataProtectionPolicy(topic.getTopicArn(), REGION));
+        assertNull(snsService.getDataProtectionPolicy(topic.getTopicArn(), REGION));
     }
 
     @Test
-    void dataProtectionPolicy_missingTopicThrowsResourceNotFound() {
+    void dataProtectionPolicy_missingTopicThrowsNotFound() {
         String arn = "arn:aws:sns:us-east-1:000000000000:no-such-topic";
         AwsException get = assertThrows(AwsException.class,
                 () -> snsService.getDataProtectionPolicy(arn, REGION));
-        assertEquals("ResourceNotFoundException", get.getErrorCode());
+        assertEquals("NotFound", get.getErrorCode());
+        assertEquals(404, get.getHttpStatus());
         AwsException put = assertThrows(AwsException.class,
                 () -> snsService.putDataProtectionPolicy(arn, "{}", REGION));
-        assertEquals("ResourceNotFoundException", put.getErrorCode());
+        assertEquals("NotFound", put.getErrorCode());
+        assertEquals(404, put.getHttpStatus());
     }
 
     @Test
     void putDataProtectionPolicy_requiresPolicy() {
         Topic topic = snsService.createTopic("dpp-topic", null, null, REGION);
-        assertThrows(AwsException.class,
+        AwsException error = assertThrows(AwsException.class,
                 () -> snsService.putDataProtectionPolicy(topic.getTopicArn(), null, REGION));
+        assertEquals("InvalidParameter", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+    }
+
+    @Test
+    void dataProtectionPolicy_requiresResourceArn() {
+        AwsException get = assertThrows(AwsException.class,
+                () -> snsService.getDataProtectionPolicy(null, REGION));
+        assertEquals("InvalidParameter", get.getErrorCode());
+        AwsException put = assertThrows(AwsException.class,
+                () -> snsService.putDataProtectionPolicy("", "{}", REGION));
+        assertEquals("InvalidParameter", put.getErrorCode());
+    }
+
+    @Test
+    void putDataProtectionPolicy_requiresJsonObject() {
+        Topic topic = snsService.createTopic("dpp-topic", null, null, REGION);
+        AwsException malformed = assertThrows(AwsException.class,
+                () -> snsService.putDataProtectionPolicy(topic.getTopicArn(), "not-json", REGION));
+        assertEquals("InvalidParameter", malformed.getErrorCode());
+        AwsException scalar = assertThrows(AwsException.class,
+                () -> snsService.putDataProtectionPolicy(topic.getTopicArn(), "[]", REGION));
+        assertEquals("InvalidParameter", scalar.getErrorCode());
+    }
+
+    @Test
+    void putDataProtectionPolicy_enforcesUtf8ByteLimit() {
+        Topic topic = snsService.createTopic("dpp-topic", null, null, REGION);
+        String maximumPolicy = "{\"p\":\"" + "é".repeat(15_356) + "\"}";
+        assertEquals(30_720, maximumPolicy.getBytes(StandardCharsets.UTF_8).length);
+        snsService.putDataProtectionPolicy(topic.getTopicArn(), maximumPolicy, REGION);
+        assertEquals(maximumPolicy, snsService.getDataProtectionPolicy(topic.getTopicArn(), REGION));
+
+        String oversizedPolicy = "{\"p\":\"" + "é".repeat(15_357) + "\"}";
+        AwsException error = assertThrows(AwsException.class,
+                () -> snsService.putDataProtectionPolicy(topic.getTopicArn(), oversizedPolicy, REGION));
+        assertEquals("InvalidParameter", error.getErrorCode());
+        assertEquals(400, error.getHttpStatus());
+    }
+
+    @Test
+    void dataProtectionPolicy_persistsAcrossServiceInstances() {
+        Path storePath = tempDir.resolve("sns-topics.json");
+        var writerStore = new PersistentStorage<String, Topic>(storePath,
+                new TypeReference<Map<String, Topic>>() {});
+        var writer = new SnsService(writerStore, new InMemoryStorage<>(),
+                new RegionResolver(REGION, ACCOUNT), null, null);
+        Topic topic = writer.createTopic("dpp-persistent-topic", null, null, REGION);
+        String policy = "{\"Name\":\"persistent\",\"Version\":\"2021-06-01\",\"Statement\":[]}";
+        writer.putDataProtectionPolicy(topic.getTopicArn(), policy, REGION);
+
+        var readerStore = new PersistentStorage<String, Topic>(storePath,
+                new TypeReference<Map<String, Topic>>() {});
+        readerStore.load();
+        var reader = new SnsService(readerStore, new InMemoryStorage<>(),
+                new RegionResolver(REGION, ACCOUNT), null, null);
+        assertEquals(policy, reader.getDataProtectionPolicy(topic.getTopicArn(), REGION));
     }
 
     @Test

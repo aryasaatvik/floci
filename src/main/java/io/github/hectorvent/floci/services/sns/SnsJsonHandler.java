@@ -131,7 +131,9 @@ public class SnsJsonHandler {
         String resourceArn = request.path("ResourceArn").asText(null);
         String policy = snsService.getDataProtectionPolicy(resourceArn, region);
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("DataProtectionPolicy", policy);
+        if (policy != null) {
+            response.put("DataProtectionPolicy", policy);
+        }
         return Response.ok(response).build();
     }
 

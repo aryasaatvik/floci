@@ -18,7 +18,9 @@ import io.github.hectorvent.floci.services.sns.model.Subscription;
 import io.github.hectorvent.floci.services.sns.model.Topic;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -56,6 +58,7 @@ public class SnsService implements Resettable {
     private static final Logger LOG = Logger.getLogger(SnsService.class);
     private static final Duration FIFO_DEDUP_WINDOW = Duration.ofMinutes(5);
     private static final int MAX_PUBLISH_SIZE = 262_144;
+    private static final int MAX_DATA_PROTECTION_POLICY_SIZE = 30_720;
     private static final int PUSH_CAPTURE_LIMIT = 1000;
     private static final List<String> PENDING_CONFIRMATION_PROTOCOLS =
             List.of("http", "https", "email", "email-json", "sms");
@@ -878,23 +881,49 @@ public class SnsService implements Resettable {
     }
 
     public String getDataProtectionPolicy(String resourceArn, String region) {
-        String key = topicKey(region, resourceArn);
-        Topic topic = topicStore.get(key)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "Resource does not exist.", 404));
-        return topic.getDataProtectionPolicy() != null ? topic.getDataProtectionPolicy() : "";
+        return requireDataProtectionPolicyTopic(resourceArn, region).getDataProtectionPolicy();
     }
 
     public void putDataProtectionPolicy(String resourceArn, String dataProtectionPolicy, String region) {
         if (dataProtectionPolicy == null) {
             throw new AwsException("InvalidParameter", "DataProtectionPolicy is required.", 400);
         }
+        Topic topic = requireDataProtectionPolicyTopic(resourceArn, region);
+        String storedPolicy = validateDataProtectionPolicy(dataProtectionPolicy);
         String key = topicKey(region, resourceArn);
-        Topic topic = topicStore.get(key)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "Resource does not exist.", 404));
-        topic.setDataProtectionPolicy(dataProtectionPolicy);
+        topic.setDataProtectionPolicy(storedPolicy);
         topicStore.put(key, topic);
+    }
+
+    private Topic requireDataProtectionPolicyTopic(String resourceArn, String region) {
+        if (resourceArn == null || resourceArn.isBlank()) {
+            throw new AwsException("InvalidParameter", "ResourceArn is required.", 400);
+        }
+        return topicStore.get(topicKey(region, resourceArn))
+                .orElseThrow(() -> new AwsException("NotFound", "Topic does not exist.", 404));
+    }
+
+    private String validateDataProtectionPolicy(String dataProtectionPolicy) {
+        if (dataProtectionPolicy.isEmpty()) {
+            return null;
+        }
+        if (dataProtectionPolicy.getBytes(StandardCharsets.UTF_8).length > MAX_DATA_PROTECTION_POLICY_SIZE) {
+            throw new AwsException("InvalidParameter",
+                    "DataProtectionPolicy must not exceed 30720 bytes.", 400);
+        }
+        try {
+            JsonNode policy = objectMapper.reader()
+                    .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .readTree(dataProtectionPolicy);
+            if (!policy.isObject()) {
+                throw new AwsException("InvalidParameter",
+                        "DataProtectionPolicy must be a JSON object.", 400);
+            }
+        } catch (JsonProcessingException e) {
+            throw new AwsException("InvalidParameter",
+                    "DataProtectionPolicy must be valid JSON.", 400);
+        }
+        return dataProtectionPolicy;
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags, String region) {
