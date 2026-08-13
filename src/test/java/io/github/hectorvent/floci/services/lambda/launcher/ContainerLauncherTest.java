@@ -664,6 +664,38 @@ class ContainerLauncherTest {
     }
 
     @Test
+    void launchFunction_reusesExistingUpstreamCodeVolumeWithoutCreatingScopedDuplicate() throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("existing-upstream-volume"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]);
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("upgrade-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setCodeSha256("upgrade-code-sha");
+
+        String upstreamName = ContainerLauncher.codeVolumeName(fn);
+        String ownedName = ContainerLauncher.codeVolumeName(fn, "test-instance");
+        when(lifecycleManager.volumeExists(ownedName)).thenReturn(false);
+        when(lifecycleManager.volumeExists(upstreamName)).thenReturn(true);
+
+        long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = original;
+        }
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, String>> labels = ArgumentCaptor.forClass(Map.class);
+        verify(lifecycleManager).ensureVolume(eq(upstreamName), labels.capture());
+        assertEquals("test-instance", labels.getValue().get(LambdaDockerResourceLabels.INSTANCE));
+        verify(lifecycleManager, never()).ensureVolume(eq(ownedName), any());
+    }
+
+    @Test
     void launchFunction_releasesRuntimeApiServer_whenCodeVolumePopulateFails() throws Exception {
         // Regression for the runtime-api port leak: the volume path allocates a runtime-api server
         // up front (before the code-volume populate). If the populate then fails — the exact

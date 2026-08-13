@@ -14,10 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Unit tests for {@link ContainerLauncher#codeVolumeName(LambdaFunction, String)}, the naming logic for
- * the per-function-version code volume. The name must be stable for a given code version (so all
- * of a function's containers share one volume), distinct across code versions (so a redeploy gets
- * a fresh volume), and always a legal Docker volume name.
+ * Unit tests for the upstream and instance-owned per-function-version code-volume names.
  *
  * <p>Kept separate from {@link ContainerLauncherTest} because these are pure static-method tests
  * that need none of that test's Mockito mocks; mixing them in would trip strict-stubbing.
@@ -74,6 +71,15 @@ class ContainerLauncherVolumeNamingTest {
                 ContainerLauncher.codeVolumeName(function, "instance-a"),
                 ContainerLauncher.codeVolumeName(function, "instance-b"),
                 "separate Floci instances must never adopt each other's code volume");
+    }
+
+    @Test
+    void preservesTheUpstreamNameForPreOwnershipVolumes() {
+        LambdaFunction function = fnWithSha("shared-fn", "same-code-sha");
+
+        assertEquals("floci-code-shared-fn-samecodesha", ContainerLauncher.codeVolumeName(function));
+        assertTrue(ContainerLauncher.codeVolumeName(function, "instance-a")
+                .startsWith(ContainerLauncher.codeVolumeName(function) + "-"));
     }
 
     @Test

@@ -571,7 +571,7 @@ public class ContainerLauncher {
      */
     private String ensureCodeVolume(LambdaFunction fn, String image) {
         String instanceId = resourceIdentity.instanceId();
-        String volName = codeVolumeName(fn, instanceId);
+        String volName = resolveCodeVolumeName(fn, instanceId);
         // Held for the whole resolve-and-reconcile, not just the populate branch: this is the same
         // lock cleanupSupersededVolumes acquires before claiming a volume for deletion, so a launch
         // that resolves a volume can never race a sweep that's about to delete that exact volume out
@@ -624,6 +624,20 @@ public class ContainerLauncher {
                     .incrementAndGet();
         }
         return volName;
+    }
+
+    private String resolveCodeVolumeName(LambdaFunction fn, String instanceId) {
+        String ownedName = codeVolumeName(fn, instanceId);
+        if (lifecycleManager.volumeExists(ownedName)) {
+            return ownedName;
+        }
+
+        String upstreamName = codeVolumeName(fn);
+        if (lifecycleManager.volumeExists(upstreamName)) {
+            LOG.infov("Reusing existing Lambda code volume {0} without adopting ownership", upstreamName);
+            return upstreamName;
+        }
+        return ownedName;
     }
 
     /**
@@ -781,11 +795,10 @@ public class ContainerLauncher {
     }
 
     /**
-     * Docker-volume-safe name keyed by Floci instance, function, and code version, so separate
-     * emulator instances cannot adopt each other's cache and a redeploy yields a new volume.
-     * Prefers the code SHA-256; falls back to last-modified when the SHA is unavailable.
+     * The upstream Docker-volume-safe name keyed by function and code version. Existing volumes
+     * with this name predate instance ownership and remain reusable but unowned.
      */
-    static String codeVolumeName(LambdaFunction fn, String instanceId) {
+    static String codeVolumeName(LambdaFunction fn) {
         String key = codeIdentity(fn);
         String h = key.replaceAll("[^a-zA-Z0-9]", "");
         if (h.length() > 20) {
@@ -795,7 +808,12 @@ public class ContainerLauncher {
             h = "0";
         }
         String fname = fn.getFunctionName().replaceAll("[^a-zA-Z0-9_.-]", "-");
-        return "floci-code-" + fname + "-" + h + "-" + shortIdentityHash(instanceId);
+        return "floci-code-" + fname + "-" + h;
+    }
+
+    /** Instance-owned code-volume name used when no pre-ownership upstream volume exists. */
+    static String codeVolumeName(LambdaFunction fn, String instanceId) {
+        return codeVolumeName(fn) + "-" + shortIdentityHash(instanceId);
     }
 
     static String codeIdentity(LambdaFunction fn) {

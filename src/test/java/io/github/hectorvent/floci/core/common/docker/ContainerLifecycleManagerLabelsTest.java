@@ -85,21 +85,25 @@ class ContainerLifecycleManagerLabelsTest {
 
         Container matchingContainer = mock(Container.class);
         Container otherContainer = mock(Container.class);
+        Container unlabeledContainer = mock(Container.class);
         when(matchingContainer.getLabels()).thenReturn(required);
         when(otherContainer.getLabels()).thenReturn(Map.of("io.floci.instance", "instance-b"));
+        when(unlabeledContainer.getLabels()).thenReturn(null);
         ListContainersCmd containers = mock(ListContainersCmd.class, RETURNS_SELF);
         when(dockerClient.listContainersCmd()).thenReturn(containers);
-        when(containers.exec()).thenReturn(List.of(matchingContainer, otherContainer));
+        when(containers.exec()).thenReturn(List.of(matchingContainer, otherContainer, unlabeledContainer));
 
         InspectVolumeResponse matchingVolume = mock(InspectVolumeResponse.class);
         InspectVolumeResponse otherVolume = mock(InspectVolumeResponse.class);
+        InspectVolumeResponse unlabeledVolume = mock(InspectVolumeResponse.class);
         when(matchingVolume.getLabels()).thenReturn(required);
         when(otherVolume.getLabels()).thenReturn(Map.of("io.floci.service", "lambda"));
+        when(unlabeledVolume.getLabels()).thenReturn(null);
         ListVolumesCmd volumes = mock(ListVolumesCmd.class, RETURNS_SELF);
         ListVolumesResponse response = mock(ListVolumesResponse.class);
         when(dockerClient.listVolumesCmd()).thenReturn(volumes);
         when(volumes.exec()).thenReturn(response);
-        when(response.getVolumes()).thenReturn(List.of(matchingVolume, otherVolume));
+        when(response.getVolumes()).thenReturn(List.of(matchingVolume, otherVolume, unlabeledVolume));
 
         assertEquals(List.of(matchingContainer), manager.listContainersByLabels(required));
         assertEquals(List.of(matchingVolume), manager.listVolumesByLabels(required));
