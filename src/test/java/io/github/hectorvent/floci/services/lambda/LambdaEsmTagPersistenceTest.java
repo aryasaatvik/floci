@@ -105,6 +105,7 @@ class LambdaEsmTagPersistenceTest {
                 null,
                 null,
                 null,
+                null,
                 null);
     }
 }
