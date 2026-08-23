@@ -147,7 +147,7 @@ class LambdaEsmTaggingTest {
 
         lambda.tagResource(TagResourceRequest.builder()
                 .resource(created.eventSourceMappingArn())
-                .tags(Map.of("env", "prod", "owner", "alchemy"))
+                .tags(Map.of("env", "prod", "owner", "platform"))
                 .build());
         lambda.untagResource(UntagResourceRequest.builder()
                 .resource(created.eventSourceMappingArn())

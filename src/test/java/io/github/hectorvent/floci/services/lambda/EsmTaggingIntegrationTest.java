@@ -106,7 +106,7 @@ class EsmTaggingIntegrationTest {
     void tagAndUntagEventSourceMapping() {
         given()
                 .contentType("application/json")
-                .body("{\"Tags\": {\"owner\": \"alchemy\", \"env\": \"prod\"}}")
+                .body("{\"Tags\": {\"owner\": \"platform\", \"env\": \"prod\"}}")
                 .when()
                 .post(TAG_BASE + "/tags/" + esmArn)
                 .then()
