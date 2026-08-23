@@ -34,19 +34,19 @@ class LambdaEsmTagPersistenceTest {
         EsmStore store = new EsmStore(backend);
         EventSourceMapping mapping = mapping();
         mapping.setEventSourceMappingArn(MAPPING_ARN);
-        mapping.setTags(new HashMap<>(Map.of("alchemy::id", "persisted-esm")));
+        mapping.setTags(new HashMap<>(Map.of("project", "billing")));
         store.save(mapping);
 
         LambdaService first = service(store);
-        assertEquals(Map.of("alchemy::id", "persisted-esm"), first.listTags(MAPPING_ARN));
+        assertEquals(Map.of("project", "billing"), first.listTags(MAPPING_ARN));
 
         first.tagResource(MAPPING_ARN, Map.of("owner", "platform"));
 
         LambdaService reloaded = service(new EsmStore(backend));
-        assertEquals(Map.of("alchemy::id", "persisted-esm", "owner", "platform"),
+        assertEquals(Map.of("project", "billing", "owner", "platform"),
                 reloaded.listTags(MAPPING_ARN));
 
-        reloaded.untagResource(MAPPING_ARN, List.of("alchemy::id"));
+        reloaded.untagResource(MAPPING_ARN, List.of("project"));
         assertEquals(Map.of("owner", "platform"),
                 service(new EsmStore(backend)).listTags(MAPPING_ARN));
     }
