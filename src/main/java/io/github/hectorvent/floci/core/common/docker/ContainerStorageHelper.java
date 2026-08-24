@@ -69,11 +69,14 @@ public final class ContainerStorageHelper {
      * Label keys reserved for the emulator itself. {@code floci} and {@code floci_emulator}
      * drive container/volume discovery and pruning (e.g.
      * {@code docker volume prune --filter label=floci=true}); {@code floci_namespace} scopes
-     * resources when multiple Floci processes share one daemon. Extra labels using these keys
-     * are ignored so user configuration can never break cleanup.
+     * resources when multiple Floci processes share one daemon. The {@code io.floci.*} entries
+     * are exact ownership guards for targeted lifecycle cleanup. Extra labels using these keys
+     * are ignored so user configuration can never break or spoof cleanup.
      */
     private static final java.util.Set<String> RESERVED_LABEL_KEYS =
-            java.util.Set.of("floci", "floci_emulator", "floci_namespace");
+            java.util.Set.of(
+                    "floci", "floci_emulator", "floci_namespace",
+                    "io.floci.managed", "io.floci.instance", "io.floci.service", "io.floci.kind");
 
     /**
      * Labels applied to every emulator-created container and volume:
@@ -139,7 +142,7 @@ public final class ContainerStorageHelper {
         return base.resolve(namespace).resolve(service).resolve(resourceId);
     }
 
-    private static String resourceNamespace(EmulatorConfig config) {
+    static String resourceNamespace(EmulatorConfig config) {
         if (config == null || config.docker() == null || config.docker().resourceNamespace() == null) {
             return "";
         }

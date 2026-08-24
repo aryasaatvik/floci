@@ -95,6 +95,10 @@ class ContainerStorageHelperTest {
                 label("floci", "false"),
                 label("floci_emulator", "spoofed"),
                 label("floci_namespace", "spoofed"),
+                label("io.floci.managed", "true"),
+                label("io.floci.instance", "spoofed"),
+                label("io.floci.service", "lambda"),
+                label("io.floci.kind", "execution"),
                 label("kept", "yes")));
 
         assertEquals(

@@ -165,6 +165,13 @@ public class LambdaFunctionStore implements Resettable {
                 : backend.scan(key -> true);
     }
 
+    /** Returns every account's functions for process-wide Docker resource reconciliation. */
+    public List<LambdaFunction> listAllAccounts() {
+        return backend instanceof AccountAwareStorageBackend<LambdaFunction> aware
+                ? aware.scanAllAccounts()
+                : backend.scan(key -> true);
+    }
+
     public void delete(String region, String functionName) {
         // Delete all versions
         listVersions(region, functionName).forEach(fn -> {
