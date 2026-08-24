@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerResourceIdentity;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
@@ -78,6 +79,7 @@ class ContainerLauncherTest {
     @Mock RuntimeApiServer runtimeApiServer;
     @Mock DockerClient dockerClient;
     @Mock LambdaExecutionRoleCredentials executionRoleCredentials;
+    @Mock DockerResourceIdentity resourceIdentity;
 
     @TempDir
     Path tempDir;
@@ -133,7 +135,7 @@ class ContainerLauncherTest {
         launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
                 runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
                 mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class), awsEnv,
-                executionRoleCredentials);
+                executionRoleCredentials, resourceIdentity);
 
         when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
         when(runtimeApiServer.getPort()).thenReturn(9000);
@@ -142,6 +144,9 @@ class ContainerLauncherTest {
         lenient().when(runtimeApiServer.close()).thenReturn(CompletableFuture.completedFuture(null));
         when(dockerHostResolver.resolve()).thenReturn("127.0.0.1");
         lenient().when(executionRoleCredentials.forFunction(any())).thenReturn(Optional.empty());
+        lenient().when(resourceIdentity.instanceId()).thenReturn("test-instance");
+        lenient().when(lifecycleManager.tryVolumeHasAllLabels(anyString(), any()))
+                .thenReturn(Optional.of(true));
 
         // lenient: the failure-path test (populate fails before any container is created) never
         // reaches these, but every success-path test does — they must not trip strict-stubs.
@@ -234,7 +239,12 @@ class ContainerLauncherTest {
                 "io.floci.service", "lambda",
                 "io.floci.resource-id", "standard-fn",
                 "io.floci.account", "222222222222",
-                "io.floci.region", "us-west-2"),
+                "io.floci.region", "us-west-2",
+                "io.floci.managed", "true",
+                "io.floci.instance", "test-instance",
+                "io.floci.kind", "execution",
+                "io.floci.lambda.function", "standard-fn",
+                "io.floci.lambda.code", "0"),
                 spec.labels());
     }
 
@@ -773,7 +783,7 @@ class ContainerLauncherTest {
                 "/var/task should be copied exactly once (into the populate helper)");
         // Two creates: the helper + the real container. The helper is discarded.
         verify(lifecycleManager, times(2)).create(any());
-        verify(lifecycleManager, atLeastOnce()).ensureVolume(any());
+        verify(lifecycleManager, atLeastOnce()).ensureVolume(anyString(), any());
         verify(lifecycleManager, times(1)).stopAndRemove(any(), any()); // the helper only
         // A superseded code-version volume is never deleted synchronously within a single launch
         // (see the cleanupSupersededVolumes tests below for the deferred sweep; this fn has no
@@ -799,7 +809,8 @@ class ContainerLauncherTest {
         fn.setCodeSha256("leak-fn-sha-v1");
 
         // The code-volume populate fails (daemon under load), before any container is created.
-        doThrow(new RuntimeException("docker daemon busy")).when(lifecycleManager).ensureVolume(any());
+        doThrow(new RuntimeException("docker daemon busy"))
+                .when(lifecycleManager).ensureVolume(anyString(), any());
 
         long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
         try {
@@ -863,7 +874,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("cleanup-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.ownedCodeVolumeName("floci", v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("cleanup-fn");
@@ -871,7 +882,7 @@ class ContainerLauncherTest {
         v2.setHandler("index.handler");
         v2.setCodeLocalPath(codePath.toString());
         v2.setCodeSha256("cleanup-fn-sha-v2");
-        String volumeV2 = ContainerLauncher.codeVolumeName(v2);
+        String volumeV2 = ContainerLauncher.ownedCodeVolumeName("floci", v2, "test-instance");
 
         long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
         long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
@@ -897,6 +908,45 @@ class ContainerLauncherTest {
     }
 
     @Test
+    void cleanupSupersededVolumesRetainsVolumeWithoutExactOwnershipLabels() throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("foreign-cleanup-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]);
+
+        LambdaFunction v1 = new LambdaFunction();
+        v1.setFunctionName("foreign-cleanup-fn");
+        v1.setRuntime("nodejs20.x");
+        v1.setHandler("index.handler");
+        v1.setCodeLocalPath(codePath.toString());
+        v1.setCodeSha256("foreign-cleanup-v1");
+        String volumeV1 = ContainerLauncher.ownedCodeVolumeName("floci", v1, "test-instance");
+
+        LambdaFunction v2 = new LambdaFunction();
+        v2.setFunctionName("foreign-cleanup-fn");
+        v2.setRuntime("nodejs20.x");
+        v2.setHandler("index.handler");
+        v2.setCodeLocalPath(codePath.toString());
+        v2.setCodeSha256("foreign-cleanup-v2");
+
+        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(v1);
+            launcher.launch(v2);
+            when(lifecycleManager.tryVolumeHasAllLabels(eq(volumeV1), any()))
+                    .thenReturn(Optional.of(false));
+
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+            launcher.cleanupSupersededVolumes();
+
+            verify(lifecycleManager, never()).removeVolume(volumeV1);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+        }
+    }
+
+    @Test
     void rollingBackToAPreviousCodeVersion_rescuesItsVolumeFromCleanup() throws Exception {
         // Regression: v1 -> v2 -> back to v1 (e.g. a CloudFormation rollback) resolves v1's volume
         // name again, which is already populated - a fast-path hit in ensureCodeVolume. Without
@@ -912,7 +962,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("rollback-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.ownedCodeVolumeName("floci", v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("rollback-fn");
@@ -920,7 +970,7 @@ class ContainerLauncherTest {
         v2.setHandler("index.handler");
         v2.setCodeLocalPath(codePath.toString());
         v2.setCodeSha256("rollback-fn-sha-v2");
-        String volumeV2 = ContainerLauncher.codeVolumeName(v2);
+        String volumeV2 = ContainerLauncher.ownedCodeVolumeName("floci", v2, "test-instance");
 
         // Needed for the rollback launch below: v1's volume is already populated by then, so its
         // fast path actually evaluates volumeExists instead of short-circuiting past it.
@@ -959,7 +1009,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("retry-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.ownedCodeVolumeName("floci", v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("retry-fn");
@@ -1010,7 +1060,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("race-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.ownedCodeVolumeName("floci", v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("race-fn");
@@ -1086,7 +1136,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("inflight-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.ownedCodeVolumeName("floci", v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("inflight-fn");
@@ -1242,7 +1292,7 @@ class ContainerLauncherTest {
         v1.setHandler("index.handler");
         v1.setCodeLocalPath(codePath.toString());
         v1.setCodeSha256("lock-persist-fn-sha-v1");
-        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+        String volumeV1 = ContainerLauncher.ownedCodeVolumeName("floci", v1, "test-instance");
 
         LambdaFunction v2 = new LambdaFunction();
         v2.setFunctionName("lock-persist-fn");
@@ -1422,7 +1472,7 @@ class ContainerLauncherTest {
                 ecrRegistryManager,
                 mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class),
                 new LaunchedContainerAwsEnv(reachableEndpoint),
-                executionRoleCredentials);
+                executionRoleCredentials, resourceIdentity);
 
         stubExtensionDiscovery("otel-collector");
         // Feed a real stdout frame through whatever callback the launcher hands to execStartCmd.

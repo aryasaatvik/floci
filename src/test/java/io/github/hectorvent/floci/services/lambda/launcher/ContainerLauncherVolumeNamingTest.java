@@ -72,6 +72,19 @@ class ContainerLauncherVolumeNamingTest {
     }
 
     @Test
+    void ownedNameIsStablePerInstanceAndDistinctAcrossInstances() {
+        LambdaFunction fn = fnWithSha("stable-fn", "stable-sha-abc");
+
+        String first = ContainerLauncher.ownedCodeVolumeName("floci", fn, "instance-one");
+
+        assertEquals(first,
+                ContainerLauncher.ownedCodeVolumeName("floci", fn, "instance-one"));
+        assertNotEquals(first,
+                ContainerLauncher.ownedCodeVolumeName("floci", fn, "instance-two"));
+        assertTrue(DOCKER_VOLUME_NAME.matcher(first).matches());
+    }
+
+    @Test
     void fallsBackToLastModifiedWhenShaMissing() {
         LambdaFunction nullSha = new LambdaFunction();
         nullSha.setFunctionName("no-sha-fn");

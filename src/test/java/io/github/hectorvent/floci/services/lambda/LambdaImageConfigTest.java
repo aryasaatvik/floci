@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerResourceIdentity;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
@@ -250,10 +251,13 @@ class LambdaImageConfigTest {
             ContainerReachableEndpoint reachableEndpoint =
                     new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer);
             LaunchedContainerAwsEnv awsEnv = new LaunchedContainerAwsEnv(reachableEndpoint);
+            DockerResourceIdentity resourceIdentity = mock(DockerResourceIdentity.class);
+            when(resourceIdentity.instanceId()).thenReturn("test-instance");
             launcher = new ContainerLauncher(containerBuilder, lifecycleManager, logStreamer, imageResolver,
                     runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
                     mock(io.github.hectorvent.floci.services.lambda.LambdaLayerService.class), awsEnv,
-                    mock(io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionRoleCredentials.class));
+                    mock(io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionRoleCredentials.class),
+                    resourceIdentity);
 
             when(runtimeApiServerFactory.create()).thenReturn(runtimeApiServer);
             when(runtimeApiServer.getPort()).thenReturn(9000);

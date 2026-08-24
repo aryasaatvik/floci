@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
 import io.github.hectorvent.floci.services.lambda.DynamoDbStreamsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.KinesisEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.SqsEventSourcePoller;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaDockerResourceReconciler;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -60,6 +61,7 @@ class EmulatorLifecycleTest {
     @Mock private EmulatorConfig.ServicesConfig servicesConfig;
     @Mock private EmulatorConfig.Ec2ServiceConfig ec2ServiceConfig;
     @Mock private EmulatorConfig.ElbV2ServiceConfig elbv2ServiceConfig;
+    @Mock private EmulatorConfig.LambdaServiceConfig lambdaServiceConfig;
     @Mock private IamService iamService;
     @Mock private EmulatorConfig.ElastiCacheServiceConfig elastiCacheServiceConfig;
     @Mock private ElastiCacheService elastiCacheService;
@@ -90,6 +92,8 @@ class EmulatorLifecycleTest {
     @Mock private EmulatorConfig.TlsConfig tlsConfig;
     @Mock private io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker schemaCreationWorker;
     @Mock private jakarta.enterprise.inject.Instance<io.github.hectorvent.floci.core.common.ContainerTeardown> containerTeardowns;
+    @Mock private jakarta.enterprise.inject.Instance<LambdaDockerResourceReconciler> lambdaDockerResourceReconcilers;
+    @Mock private LambdaDockerResourceReconciler lambdaDockerResourceReconciler;
 
     private EmulatorLifecycle emulatorLifecycle;
 
@@ -102,6 +106,11 @@ class EmulatorLifecycleTest {
         Mockito.lenient().when(elbv2ServiceConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(servicesConfig.elasticache()).thenReturn(elastiCacheServiceConfig);
         Mockito.lenient().when(elastiCacheServiceConfig.enabled()).thenReturn(false);
+        Mockito.lenient().when(servicesConfig.lambda()).thenReturn(lambdaServiceConfig);
+        Mockito.lenient().when(lambdaServiceConfig.enabled()).thenReturn(true);
+        Mockito.lenient().when(lambdaServiceConfig.executor()).thenReturn("docker");
+        Mockito.lenient().when(lambdaDockerResourceReconcilers.get())
+                .thenReturn(lambdaDockerResourceReconciler);
         Mockito.lenient().when(config.tls()).thenReturn(tlsConfig);
         Mockito.lenient().when(tlsConfig.enabled()).thenReturn(false);
         Mockito.lenient().when(config.port()).thenReturn(4566);
@@ -116,7 +125,8 @@ class EmulatorLifecycleTest {
                 rabbitMqManager, flinkContainerManager, rdsService, elbV2Service,
                 initializationHooksRunner, sqsPoller, kinesisPoller, dynamodbStreamsPoller,
                 pipesService, ec2MetadataServer, ecrRegistryManager, flociUiManager, initLifecycleState,
-                schemaCreationWorker, containerTeardowns, persistentPathValidator);
+                schemaCreationWorker, containerTeardowns, persistentPathValidator,
+                lambdaDockerResourceReconcilers);
         Mockito.lenient().when(containerTeardowns.iterator())
                 .thenReturn(java.util.Collections.emptyIterator());
     }
@@ -217,6 +227,35 @@ class EmulatorLifecycleTest {
         inOrder.verify(storageFactory).loadAll();
         inOrder.verify(schemaCreationWorker).recoverOrphans();
         inOrder.verify(schemaCreationWorker).rehydrateSchemas();
+    }
+
+    @Test
+    @DisplayName("Should reconcile Lambda Docker resources after storage load")
+    void shouldReconcileLambdaDockerResourcesAfterStorageLoad() {
+        stubStorageConfig();
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        var inOrder = Mockito.inOrder(storageFactory, lambdaDockerResourceReconciler, sqsPoller);
+        inOrder.verify(storageFactory).loadAll();
+        inOrder.verify(lambdaDockerResourceReconciler).reconcileAtStartup();
+        inOrder.verify(sqsPoller).startPersistedPollers();
+    }
+
+    @Test
+    @DisplayName("Should not instantiate Docker reconciliation for the Kubernetes executor")
+    void shouldNotReconcileDockerResourcesForKubernetesExecutor() {
+        stubStorageConfig();
+        when(lambdaServiceConfig.executor()).thenReturn("kubernetes");
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        verify(lambdaDockerResourceReconcilers, never()).get();
+        verify(lambdaDockerResourceReconciler, never()).reconcileAtStartup();
     }
 
     @Test

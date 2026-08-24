@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerResourceIdentity;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
@@ -59,7 +60,13 @@ class ContainerLauncherCodeVolumeReuseTest {
                     mock(ImageResolver.class), mock(RuntimeApiServerFactory.class),
                     mock(DockerHostResolver.class), config, mock(EcrRegistryManager.class),
                     mock(LambdaLayerService.class), mock(LaunchedContainerAwsEnv.class),
-                    mock(LambdaExecutionRoleCredentials.class));
+                    mock(LambdaExecutionRoleCredentials.class), resourceIdentity());
+        }
+
+        private static DockerResourceIdentity resourceIdentity() {
+            DockerResourceIdentity resourceIdentity = mock(DockerResourceIdentity.class);
+            when(resourceIdentity.instanceId()).thenReturn("test-instance");
+            return resourceIdentity;
         }
 
         @Override
@@ -95,6 +102,10 @@ class ContainerLauncherCodeVolumeReuseTest {
         return fn;
     }
 
+    private static String ownedVolume(LambdaFunction fn) {
+        return ContainerLauncher.ownedCodeVolumeName("floci", fn, "test-instance");
+    }
+
     private void writeMarker(String vol) throws Exception {
         Path dir = tempDir.resolve("lambda-codevol-markers");
         Files.createDirectories(dir);
@@ -104,7 +115,7 @@ class ContainerLauncherCodeVolumeReuseTest {
     @Test
     void reusesExistingVolumeWhenMarkerPresentAndVolumeExists() throws Exception {
         LambdaFunction fn = fn("sha-v1-abcdef0123456789");
-        String vol = ContainerLauncher.codeVolumeName(fn);
+        String vol = ownedVolume(fn);
         writeMarker(vol);
         when(lifecycleManager.tryListVolumeNames()).thenReturn(Optional.of(Set.of(vol)));
 
@@ -116,9 +127,27 @@ class ContainerLauncherCodeVolumeReuseTest {
     }
 
     @Test
+    void reusesPreOwnershipVolumeWithoutRelabellingIt() throws Exception {
+        LambdaFunction fn = fn("sha-v1-abcdef0123456789");
+        String legacyVolume = ContainerLauncher.codeVolumeName(fn);
+        writeMarker(legacyVolume);
+        when(lifecycleManager.volumeExists(legacyVolume)).thenReturn(true);
+        when(lifecycleManager.tryListVolumeNames())
+                .thenReturn(Optional.of(Set.of(legacyVolume)));
+
+        String result = launcher.ensureCodeVolume(fn, "img");
+
+        assertEquals(legacyVolume, result);
+        assertTrue(launcher.populated.isEmpty());
+        org.mockito.Mockito.verify(lifecycleManager, org.mockito.Mockito.never())
+                .ensureVolume(org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.anyMap());
+    }
+
+    @Test
     void populatesAndWritesMarkerWhenMarkerAbsent() throws Exception {
         LambdaFunction fn = fn("sha-v1-abcdef0123456789");
-        String vol = ContainerLauncher.codeVolumeName(fn);
+        String vol = ownedVolume(fn);
         // Volume exists but no completion marker (e.g. a prior populate crashed mid-copy): re-populate.
 
         String result = launcher.ensureCodeVolume(fn, "img");
@@ -132,7 +161,7 @@ class ContainerLauncherCodeVolumeReuseTest {
     @Test
     void deletesStaleMarkerBeforeRepopulatingMissingVolume() throws Exception {
         LambdaFunction fn = fn("sha-v1-abcdef0123456789");
-        String vol = ContainerLauncher.codeVolumeName(fn);
+        String vol = ownedVolume(fn);
         Path marker = tempDir.resolve("lambda-codevol-markers").resolve(vol);
         writeMarker(vol);
         // The marker lingers but the volume was pruned; reusing it would mount an empty /var/task.
@@ -151,7 +180,7 @@ class ContainerLauncherCodeVolumeReuseTest {
     @Test
     void failedRepopulateCannotLeaveOldCompletionMarker() throws Exception {
         LambdaFunction fn = fn("sha-v1-abcdef0123456789");
-        String vol = ContainerLauncher.codeVolumeName(fn);
+        String vol = ownedVolume(fn);
         Path marker = tempDir.resolve("lambda-codevol-markers").resolve(vol);
         writeMarker(vol);
         when(lifecycleManager.tryListVolumeNames()).thenReturn(Optional.of(Set.of()));
@@ -166,7 +195,7 @@ class ContainerLauncherCodeVolumeReuseTest {
     @Test
     void volumeInventoryFailureRepopulatesAfterInvalidatingMarker() throws Exception {
         LambdaFunction fn = fn("sha-v1-abcdef0123456789");
-        String vol = ContainerLauncher.codeVolumeName(fn);
+        String vol = ownedVolume(fn);
         Path marker = tempDir.resolve("lambda-codevol-markers").resolve(vol);
         writeMarker(vol);
         when(lifecycleManager.tryListVolumeNames()).thenReturn(Optional.empty());
@@ -185,7 +214,7 @@ class ContainerLauncherCodeVolumeReuseTest {
     @Test
     void failedInventoryFallbackCannotLeaveOldCompletionMarker() throws Exception {
         LambdaFunction fn = fn("sha-v1-abcdef0123456789");
-        String vol = ContainerLauncher.codeVolumeName(fn);
+        String vol = ownedVolume(fn);
         Path marker = tempDir.resolve("lambda-codevol-markers").resolve(vol);
         writeMarker(vol);
         when(lifecycleManager.tryListVolumeNames()).thenReturn(Optional.empty());
@@ -201,7 +230,7 @@ class ContainerLauncherCodeVolumeReuseTest {
     @Test
     void successfulPopulationPrunesOnlyOrphanInternalMarkers() throws Exception {
         LambdaFunction fn = fn("sha-v1-abcdef0123456789");
-        String vol = ContainerLauncher.codeVolumeName(fn);
+        String vol = ownedVolume(fn);
         String live = "floci-code-live";
         String orphan = "floci-code-orphan";
         writeMarker(live);
@@ -222,7 +251,7 @@ class ContainerLauncherCodeVolumeReuseTest {
     @Test
     void successfulPopulationReplacesSymlinkMarkerWithoutFollowingIt() throws Exception {
         LambdaFunction fn = fn("sha-v1-abcdef0123456789");
-        String vol = ContainerLauncher.codeVolumeName(fn);
+        String vol = ownedVolume(fn);
         Path markerDir = tempDir.resolve("lambda-codevol-markers");
         Path marker = markerDir.resolve(vol);
         Path symlinkTarget = tempDir.resolve("outside-marker-target");

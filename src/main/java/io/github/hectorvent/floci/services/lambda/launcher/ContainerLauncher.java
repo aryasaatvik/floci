@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerResourceIdentity;
 import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
@@ -122,6 +123,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaLayerService layerService;
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
+    private final DockerResourceIdentity resourceIdentity;
 
     @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
@@ -134,7 +136,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              EcrRegistryManager ecrRegistryManager,
                              LambdaLayerService layerService,
                              LaunchedContainerAwsEnv awsEnv,
-                             LambdaExecutionRoleCredentials executionRoleCredentials) {
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             DockerResourceIdentity resourceIdentity) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -146,6 +149,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.layerService = layerService;
         this.awsEnv = awsEnv;
         this.executionRoleCredentials = executionRoleCredentials;
+        this.resourceIdentity = resourceIdentity;
     }
 
     @PostConstruct
@@ -286,7 +290,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withHostDockerInternalOnLinux()
                 .withLogRotation()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
-                        "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
+                        "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion))
+                .withLabels(LambdaDockerResourceLabels.forFunction(
+                        resourceIdentity.instanceId(), fn, LambdaDockerResourceLabels.EXECUTION));
 
         specBuilder.withEmbeddedDns();
 
@@ -704,7 +710,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * just mounts the volume read-only, turning a ~95s per-container copy into a ~0.2s mount.
      */
     String ensureCodeVolume(LambdaFunction fn, String image) {
-        String volName = codeVolumeName(resolveContainerNamePrefix(config), fn);
+        String instanceId = resourceIdentity.instanceId();
+        String volName = resolveCodeVolumeName(fn, instanceId);
         // Held for the whole resolve-and-reconcile, not just the populate branch: this is the same
         // lock cleanupSupersededVolumes acquires before claiming a volume for deletion, so a launch
         // that resolves a volume can never race a sweep that's about to delete that exact volume out
@@ -766,6 +773,27 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         return volName;
     }
 
+    private String resolveCodeVolumeName(LambdaFunction fn, String instanceId) {
+        String namePrefix = resolveContainerNamePrefix(config);
+        String ownedName = ownedCodeVolumeName(namePrefix, fn, instanceId);
+        if (lifecycleManager.volumeExists(ownedName)) {
+            java.util.Optional<Boolean> owned = lifecycleManager.tryVolumeHasAllLabels(
+                    ownedName, LambdaDockerResourceLabels.ownedCodeVolume(instanceId));
+            if (owned.orElse(false)) {
+                return ownedName;
+            }
+            throw new IllegalStateException("Lambda code volume " + ownedName
+                    + " exists without this Floci instance's ownership labels");
+        }
+
+        String legacyName = codeVolumeName(namePrefix, fn);
+        if (lifecycleManager.volumeExists(legacyName)) {
+            LOG.infov("Reusing existing Lambda code volume {0} without adopting ownership", legacyName);
+            return legacyName;
+        }
+        return ownedName;
+    }
+
     /**
      * Releases the in-flight reference {@link #ensureCodeVolume} placed on {@code volName}. Safe to
      * call with {@code null} (nothing was reserved) and idempotent bookkeeping-wise: the counter
@@ -815,6 +843,17 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     continue;
                 }
                 volumesPendingCleanup.remove(volName, stillQueuedAt);
+                java.util.Optional<Boolean> owned = lifecycleManager.tryVolumeHasAllLabels(
+                        volName, LambdaDockerResourceLabels.ownedCodeVolume(resourceIdentity.instanceId()));
+                if (owned.isEmpty()) {
+                    volumesPendingCleanup.put(volName, System.currentTimeMillis());
+                    continue;
+                }
+                if (!owned.get()) {
+                    LOG.debugv("Retaining superseded Lambda code volume {0}: it is not owned by this instance",
+                            volName);
+                    continue;
+                }
                 if (lifecycleManager.removeVolume(volName)) {
                     populatedCodeVolumes.remove(volName);
                     LOG.debugv("Removed superseded code volume {0}", volName);
@@ -852,13 +891,20 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     }
 
     void populateCodeVolume(String volName, LambdaFunction fn, String image) {
-        lifecycleManager.ensureVolume(volName);
+        String instanceId = resourceIdentity.instanceId();
+        lifecycleManager.ensureVolume(volName,
+                LambdaDockerResourceLabels.forFunction(
+                        instanceId, fn, LambdaDockerResourceLabels.CODE_VOLUME));
         String shortId = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         // A minimal helper container (sleep) with the volume mounted read-write at /var/task; we
         // tar-copy the code into it, then discard it — the data persists in the volume.
         ContainerSpec helperSpec = containerBuilder.newContainer(image)
-                .withName(resolveContainerNamePrefix(config) + "-codevol-" + fn.getFunctionName() + "-" + shortId)
+                .withName(ContainerStorageHelper.prefixedDockerName(
+                        config, resolveContainerNamePrefix(config),
+                        "codevol-" + fn.getFunctionName() + "-" + shortId))
                 .withEnv(java.util.List.of())
+                .withLabels(LambdaDockerResourceLabels.forFunction(
+                        instanceId, fn, LambdaDockerResourceLabels.CODE_POPULATOR))
                 .withEntrypoint(java.util.List.of("sleep"))
                 .withCmd(java.util.List.of("3600"))
                 .withNamedVolume(volName, TASK_DIR, false)
@@ -1028,10 +1074,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
 
     /** {@link #codeVolumeName(LambdaFunction)} with a configured base prefix in place of {@code floci}. */
     static String codeVolumeName(String namePrefix, LambdaFunction fn) {
-        String key = fn.getCodeSha256();
-        if (key == null || key.isBlank()) {
-            key = Long.toString(fn.getLastModified());
-        }
+        String key = codeIdentity(fn);
         String h = key.replaceAll("[^a-zA-Z0-9]", "");
         if (h.length() > 20) {
             h = h.substring(0, 20);
@@ -1041,6 +1084,27 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
         String fname = fn.getFunctionName().replaceAll("[^a-zA-Z0-9_.-]", "-");
         return namePrefix + "-code-" + fname + "-" + h;
+    }
+
+    static String ownedCodeVolumeName(String namePrefix, LambdaFunction fn, String instanceId) {
+        return codeVolumeName(namePrefix, fn) + "-" + shortIdentityHash(instanceId);
+    }
+
+    static String codeIdentity(LambdaFunction fn) {
+        String codeIdentity = fn.getCodeSha256();
+        return codeIdentity == null || codeIdentity.isBlank()
+                ? Long.toString(fn.getLastModified())
+                : codeIdentity;
+    }
+
+    private static String shortIdentityHash(String instanceId) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256")
+                    .digest(instanceId.getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(digest, 0, 6);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is required but not available", e);
+        }
     }
 
     static String efsVolumeName(String accessPointArn) {

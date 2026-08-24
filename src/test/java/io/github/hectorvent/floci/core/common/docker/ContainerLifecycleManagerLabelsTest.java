@@ -131,6 +131,27 @@ class ContainerLifecycleManagerLabelsTest {
     }
 
     @Test
+    void ensureVolumeMergesResourceOwnershipLabels() {
+        InspectVolumeCmd inspectVolumeCmd = mock(InspectVolumeCmd.class);
+        when(dockerClient.inspectVolumeCmd("volume-1")).thenReturn(inspectVolumeCmd);
+        when(inspectVolumeCmd.exec()).thenThrow(new NotFoundException("missing"));
+        CreateVolumeCmd createVolumeCmd = mock(CreateVolumeCmd.class, RETURNS_SELF);
+        when(dockerClient.createVolumeCmd()).thenReturn(createVolumeCmd);
+
+        manager().ensureVolume("volume-1", Map.of(
+                "io.floci.managed", "true",
+                "io.floci.instance", "test-instance"));
+
+        ArgumentCaptor<Map<String, String>> labels = labelsCaptor();
+        verify(createVolumeCmd).withLabels(labels.capture());
+        assertEquals(Map.of(
+                "floci", "true",
+                "floci_emulator", "floci-aws",
+                "io.floci.managed", "true",
+                "io.floci.instance", "test-instance"), labels.getValue());
+    }
+
+    @Test
     void sharedVolumeInitHelperCarriesDefaultLabels() {
         InspectVolumeCmd inspectVolumeCmd = mock(InspectVolumeCmd.class);
         when(dockerClient.inspectVolumeCmd("shared")).thenReturn(inspectVolumeCmd);

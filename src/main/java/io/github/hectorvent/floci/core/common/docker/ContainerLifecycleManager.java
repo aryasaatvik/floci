@@ -285,10 +285,18 @@ public class ContainerLifecycleManager {
      * {@code --filter label=floci_emulator=floci-aws} (this emulator only) work.
      */
     public void ensureVolume(String volumeName) {
+        ensureVolume(volumeName, Map.of());
+    }
+
+    /**
+     * Creates a named volume with the supplied labels merged over Floci's default labels.
+     * Existing volumes are never relabelled or adopted because Docker volume labels are immutable.
+     */
+    public void ensureVolume(String volumeName, Map<String, String> labels) {
         if (!volumeExists(volumeName)) {
             dockerClient.createVolumeCmd()
                     .withName(volumeName)
-                    .withLabels(ContainerStorageHelper.defaultLabels(config))
+                    .withLabels(mergedLabels(labels))
                     .exec();
             LOG.debugv("Created volume {0}", volumeName);
         }
@@ -470,6 +478,73 @@ public class ContainerLifecycleManager {
             LOG.debugv("Error searching for container {0}: {1}", name, e.getMessage());
         }
         return Optional.empty();
+    }
+
+    /** Returns containers carrying every required label, including stopped containers. */
+    public List<Container> listContainersByLabels(Map<String, String> requiredLabels) {
+        if (requiredLabels == null || requiredLabels.isEmpty()) {
+            return List.of();
+        }
+        try {
+            return dockerClient.listContainersCmd()
+                    .withShowAll(true)
+                    .withLabelFilter(requiredLabels)
+                    .exec().stream()
+                    .filter(container -> hasAllLabels(container.getLabels(), requiredLabels))
+                    .toList();
+        } catch (Exception e) {
+            LOG.warnv("Could not list managed Docker containers: {0}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /** Returns volumes carrying every required label. */
+    public List<InspectVolumeResponse> listVolumesByLabels(Map<String, String> requiredLabels) {
+        if (requiredLabels == null || requiredLabels.isEmpty()) {
+            return List.of();
+        }
+        try {
+            List<String> filters = requiredLabels.entrySet().stream()
+                    .map(entry -> entry.getKey() + "=" + entry.getValue())
+                    .toList();
+            ListVolumesResponse response = dockerClient.listVolumesCmd()
+                    .withFilter("label", filters)
+                    .exec();
+            if (response == null || response.getVolumes() == null) {
+                return List.of();
+            }
+            return response.getVolumes().stream()
+                    .filter(volume -> hasAllLabels(volume.getLabels(), requiredLabels))
+                    .toList();
+        } catch (Exception e) {
+            LOG.warnv("Could not list managed Docker volumes: {0}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Checks exact volume labels. An empty result means Docker could not be queried, allowing a
+     * cleanup caller to retry instead of treating a daemon failure as proof of ownership.
+     */
+    public Optional<Boolean> tryVolumeHasAllLabels(String name, Map<String, String> requiredLabels) {
+        if (name == null || name.isBlank() || requiredLabels == null || requiredLabels.isEmpty()) {
+            return Optional.of(false);
+        }
+        try {
+            InspectVolumeResponse volume = dockerClient.inspectVolumeCmd(name).exec();
+            return Optional.of(volume != null && hasAllLabels(volume.getLabels(), requiredLabels));
+        } catch (NotFoundException e) {
+            return Optional.of(false);
+        } catch (Exception e) {
+            LOG.warnv("Could not inspect ownership labels for Docker volume {0}: {1}",
+                    name, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    static boolean hasAllLabels(Map<String, String> actual, Map<String, String> required) {
+        return actual != null && required.entrySet().stream()
+                .allMatch(entry -> entry.getValue().equals(actual.get(entry.getKey())));
     }
 
     /**
