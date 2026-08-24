@@ -12,6 +12,8 @@
 | `ListTopics` | List all topics |
 | `GetTopicAttributes` | Get topic configuration |
 | `SetTopicAttributes` | Update topic configuration |
+| `GetDataProtectionPolicy` | Get a topic's data protection policy |
+| `PutDataProtectionPolicy` | Set, replace, or remove a topic's data protection policy |
 | `Subscribe` | Subscribe an endpoint (SQS, HTTP, Lambda, email) |
 | `Unsubscribe` | Remove a subscription |
 | `ListSubscriptions` | List all subscriptions |
@@ -34,6 +36,13 @@
 | `GetEndpointAttributes` | Read endpoint attributes |
 | `SetEndpointAttributes` | Update endpoint attributes (e.g. `Enabled=false` to simulate token expiry) |
 | `ListEndpointsByPlatformApplication` | List endpoints under a platform app |
+
+## Data protection policies
+
+Data protection policies are stored with standard topics and shared by the Query and JSON
+compatibility paths. FIFO topics reject these operations. `PutDataProtectionPolicy` accepts
+an empty string to remove the policy, requires `Name`, `Version`, and at least one `Statement`,
+and rejects policy documents larger than 30,720 UTF-8 bytes.
 
 ## Configuration
 

@@ -21,7 +21,9 @@ import io.github.hectorvent.floci.services.sns.model.Subscription;
 import io.github.hectorvent.floci.services.sns.model.Topic;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -59,6 +61,7 @@ public class SnsService implements Resettable, ResourceProvider {
     private static final Logger LOG = Logger.getLogger(SnsService.class);
     private static final Duration FIFO_DEDUP_WINDOW = Duration.ofMinutes(5);
     private static final int MAX_PUBLISH_SIZE = 262_144;
+    private static final int MAX_DATA_PROTECTION_POLICY_SIZE = 30_720;
     private static final int PUSH_CAPTURE_LIMIT = 1000;
     private static final String CONTROL_TOWER_AGGREGATE_SECURITY_TOPIC =
             "aws-controltower-AggregateSecurityNotifications";
@@ -890,6 +893,72 @@ public class SnsService implements Resettable, ResourceProvider {
             successful.add(new String[]{id, messageId});
         }
         return new BatchPublishResult(successful, failed);
+    }
+
+    public String getDataProtectionPolicy(String resourceArn, String region) {
+        return requireDataProtectionPolicyTopic(resourceArn, region).getDataProtectionPolicy();
+    }
+
+    public void putDataProtectionPolicy(String resourceArn, String dataProtectionPolicy, String region) {
+        if (dataProtectionPolicy == null) {
+            throw new AwsException("InvalidParameter", "DataProtectionPolicy is required.", 400);
+        }
+        Topic topic = requireDataProtectionPolicyTopic(resourceArn, region);
+        String storedPolicy = validateDataProtectionPolicy(dataProtectionPolicy);
+        String key = topicKey(region, resourceArn);
+        topic.setDataProtectionPolicy(storedPolicy);
+        topicStore.put(key, topic);
+    }
+
+    private Topic requireDataProtectionPolicyTopic(String resourceArn, String region) {
+        if (resourceArn == null || resourceArn.isBlank()) {
+            throw new AwsException("InvalidParameter", "ResourceArn is required.", 400);
+        }
+        Topic topic = topicStore.get(topicKey(region, resourceArn))
+                .orElseThrow(() -> new AwsException("NotFound", "Topic does not exist.", 404));
+        if ("true".equals(topic.getAttributes().get("FifoTopic"))) {
+            throw new AwsException("InvalidParameter",
+                    "Data protection policies are not supported for FIFO topics.", 400);
+        }
+        return topic;
+    }
+
+    private String validateDataProtectionPolicy(String dataProtectionPolicy) {
+        if (dataProtectionPolicy.isEmpty()) {
+            return null;
+        }
+        if (dataProtectionPolicy.getBytes(StandardCharsets.UTF_8).length > MAX_DATA_PROTECTION_POLICY_SIZE) {
+            throw new AwsException("InvalidParameter",
+                    "DataProtectionPolicy must not exceed 30720 bytes.", 400);
+        }
+        try {
+            JsonNode policy = objectMapper.reader()
+                    .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .readTree(dataProtectionPolicy);
+            if (policy == null || !policy.isObject()) {
+                throw new AwsException("InvalidParameter",
+                        "DataProtectionPolicy must be a JSON object.", 400);
+            }
+            JsonNode name = policy.get("Name");
+            JsonNode version = policy.get("Version");
+            JsonNode statements = policy.get("Statement");
+            if (name == null || !name.isTextual() || name.asText().isBlank()) {
+                throw new AwsException("InvalidParameter",
+                        "DataProtectionPolicy must include a non-empty Name.", 400);
+            }
+            if (version == null || !version.isTextual() || version.asText().isBlank()) {
+                throw new AwsException("InvalidParameter",
+                        "DataProtectionPolicy must include a non-empty Version.", 400);
+            }
+            if (statements == null || !statements.isArray() || statements.isEmpty()) {
+                throw new AwsException("InvalidParameter",
+                        "DataProtectionPolicy must include at least one Statement.", 400);
+            }
+        } catch (JsonProcessingException e) {
+            throw new AwsException("InvalidParameter",
+                    "DataProtectionPolicy must be valid JSON.", 400);
+        }
+        return dataProtectionPolicy;
     }
 
     public void tagResource(String resourceArn, Map<String, String> tags, String region) {
