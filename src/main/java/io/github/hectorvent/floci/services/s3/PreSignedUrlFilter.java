@@ -50,7 +50,6 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
         String amzDate = queryParams.getFirst("X-Amz-Date");
         String expiresStr = queryParams.getFirst("X-Amz-Expires");
         String signature = queryParams.getFirst("X-Amz-Signature");
-
         int expires;
         try {
             expires = Integer.parseInt(expiresStr);
@@ -67,30 +66,18 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
             return;
         }
 
-        // Optionally verify Floci's own HMAC (if validateSignatures is enabled).
+        // Optionally verify the full SigV4 signature.
         if (presignGenerator.shouldValidateSignatures()) {
-            String path = requestContext.getUriInfo().getPath();
-            String[] parts = path.split("/", 3);
-            if (parts.length < 3) {
-                requestContext.abortWith(errorResponse(403, "AccessDenied",
-                        "Invalid pre-signed URL path."));
-                return;
-            }
-            String bucket = parts[1];
-            String key = parts[2];
-            String method = requestContext.getMethod();
-
-            if (!presignGenerator.verifySignature(method, bucket, key, amzDate, expires, signature)) {
+            if (!presignGenerator.verifySignature(requestContext.getMethod(),
+                    requestContext.getUriInfo().getRequestUri(), requestContext.getHeaders())) {
                 requestContext.abortWith(errorResponse(403, "SignatureDoesNotMatch",
                         "The request signature we calculated does not match the signature you provided."));
                 return;
             }
         }
 
-        // Always enforce signed Content-Type on AWS SDK / distilled presigned
-        // PUTs. validate-signatures defaults false (Floci HMAC vs real SigV4),
-        // but a URL that lists content-type in X-Amz-SignedHeaders must reject
-        // a mismatched Content-Type the same way real S3 does (403).
+        // AWS SDK PUT presigns commonly bind Content-Type. Keep enforcing that
+        // boundary even when general signature validation is disabled.
         String signedHeaders = maybeUrlDecode(queryParams.getFirst("X-Amz-SignedHeaders"));
         if (S3PresignedSignature.signedHeadersInclude(signedHeaders, "content-type")
                 && !signedContentTypeMatches(requestContext, queryParams, signedHeaders, amzDate, signature)) {
@@ -152,13 +139,6 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
         return false;
     }
 
-    /**
-     * RestAssured and some HTTP clients append {@code ; charset=...} to
-     * Content-Type. AWS signs the media type the caller passed (e.g.
-     * {@code text/plain}). Try both the raw header and the type without
-     * parameters so a charset suffix does not mask a real media-type match,
-     * while {@code application/json} vs {@code text/plain} still fails.
-     */
     private static List<Map<String, String>> contentTypeHeaderVariants(Map<String, String> headers) {
         List<Map<String, String>> variants = new ArrayList<>();
         variants.add(headers);
