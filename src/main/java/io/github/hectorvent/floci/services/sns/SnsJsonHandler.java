@@ -47,6 +47,8 @@ public class SnsJsonHandler {
             case "ListTopics" -> handleListTopics(request, region);
             case "GetTopicAttributes" -> handleGetTopicAttributes(request, region);
             case "SetTopicAttributes" -> handleSetTopicAttributes(request, region);
+            case "GetDataProtectionPolicy" -> handleGetDataProtectionPolicy(request, region);
+            case "PutDataProtectionPolicy" -> handlePutDataProtectionPolicy(request, region);
             case "AddPermission" -> handleAddPermission(request, region);
             case "RemovePermission" -> handleRemovePermission(request, region);
             case "SetSMSAttributes" -> handleSetSmsAttributes(request, region);
@@ -232,6 +234,23 @@ public class SnsJsonHandler {
 
     private Response handleOptInPhoneNumber(JsonNode request) {
         snsService.optInPhoneNumber(request.path("phoneNumber").asText(null));
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleGetDataProtectionPolicy(JsonNode request, String region) {
+        String resourceArn = request.path("ResourceArn").asText(null);
+        String policy = snsService.getDataProtectionPolicy(resourceArn, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        if (policy != null) {
+            response.put("DataProtectionPolicy", policy);
+        }
+        return Response.ok(response).build();
+    }
+
+    private Response handlePutDataProtectionPolicy(JsonNode request, String region) {
+        String resourceArn = request.path("ResourceArn").asText(null);
+        String dataProtectionPolicy = request.path("DataProtectionPolicy").asText(null);
+        snsService.putDataProtectionPolicy(resourceArn, dataProtectionPolicy, region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 

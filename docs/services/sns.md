@@ -12,6 +12,8 @@
 | `ListTopics` | List all topics |
 | `GetTopicAttributes` | Get topic configuration |
 | `SetTopicAttributes` | Update topic configuration |
+| `GetDataProtectionPolicy` | Get a topic's data protection policy |
+| `PutDataProtectionPolicy` | Set, replace, or remove a topic's data protection policy |
 | `AddPermission` | Add a labelled statement to a topic's access policy |
 | `RemovePermission` | Remove a labelled statement from a topic's access policy |
 | `GetSMSAttributes` | Read account SMS preferences in this region |
@@ -64,6 +66,13 @@ form body, which enforcement does not read yet, so the topic policy plays no par
 Query-protocol request that IAM enforcement refuses answers `AuthorizationError` (HTTP 403), the
 error every SNS operation lists for a caller denied access, which SDKs raise as
 `AuthorizationErrorException`.
+
+## Data protection policies
+
+Data protection policies are stored with standard topics and shared by the Query and JSON
+compatibility paths. FIFO topics reject these operations. `PutDataProtectionPolicy` accepts
+an empty string to remove the policy, requires `Name`, `Version`, and at least one `Statement`,
+and rejects policy documents larger than 30,720 UTF-8 bytes.
 
 ## SMS sandbox and opt-out
 
