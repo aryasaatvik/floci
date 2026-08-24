@@ -50,6 +50,7 @@ class CloudWatchLogsHandlerTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 10_000,
                 new RegionResolver(REGION, ACCOUNT)
         );
@@ -688,5 +689,88 @@ class CloudWatchLogsHandlerTest {
         ArrayNode groups = (ArrayNode) ((ObjectNode) response.getEntity()).path("logGroups");
         assertEquals(1, groups.size());
         return groups.get(0);
+    }
+
+    @Test
+    void metricFilterActionsRoundTripFullJsonShapeAndPreserveCreationTime() {
+        ObjectNode put = MAPPER.createObjectNode();
+        put.put("logGroupName", GROUP);
+        put.put("filterName", "requests");
+        put.put("filterPattern", "");
+        put.put("applyOnTransformedLogs", true);
+        ObjectNode transformation = put.putArray("metricTransformations").addObject();
+        transformation.put("metricName", "Requests");
+        transformation.put("metricNamespace", "Test");
+        transformation.put("metricValue", "1");
+        transformation.put("defaultValue", 0.0);
+        transformation.putObject("dimensions").put("Service", "api").put("Stage", "local");
+        transformation.put("unit", "Count");
+
+        assertEquals(200, handler.handle("PutMetricFilter", put, REGION).getStatus());
+        service.describeMetricFilters(GROUP, "requests", null, 50, REGION)
+                .metricFilters().getFirst().setCreationTime(1234L);
+        assertEquals(200, handler.handle("PutMetricFilter", put, REGION).getStatus());
+
+        ObjectNode describe = MAPPER.createObjectNode();
+        describe.put("logGroupIdentifier", GROUP_ARN);
+        describe.put("filterNamePrefix", "requests");
+        JsonNode body = (JsonNode) handler.handle("DescribeMetricFilters", describe, REGION).getEntity();
+        JsonNode filter = body.path("metricFilters").get(0);
+        assertEquals("requests", filter.path("filterName").asText());
+        assertEquals("", filter.path("filterPattern").asText());
+        assertEquals(1234L, filter.path("creationTime").asLong());
+        assertTrue(filter.path("applyOnTransformedLogs").asBoolean());
+        assertEquals(transformation, filter.path("metricTransformations").get(0));
+
+        ObjectNode groupsRequest = MAPPER.createObjectNode().put("logGroupNamePrefix", GROUP);
+        JsonNode group = ((JsonNode) handler.handle("DescribeLogGroups", groupsRequest, REGION).getEntity())
+                .path("logGroups").get(0);
+        assertEquals(1, group.path("metricFilterCount").asInt());
+    }
+
+    @Test
+    void metricFilterNullableFieldIsOmittedAndDeleteActionRemovesFilter() {
+        ObjectNode put = MAPPER.createObjectNode();
+        put.put("logGroupName", GROUP);
+        put.put("filterName", "errors");
+        put.put("filterPattern", "ERROR");
+        put.putArray("metricTransformations").addObject()
+                .put("metricName", "Errors")
+                .put("metricNamespace", "Test")
+                .put("metricValue", "1");
+        handler.handle("PutMetricFilter", put, REGION);
+
+        ObjectNode describe = MAPPER.createObjectNode().put("logGroupName", GROUP);
+        JsonNode filter = ((JsonNode) handler.handle("DescribeMetricFilters", describe, REGION).getEntity())
+                .path("metricFilters").get(0);
+        assertTrue(filter.path("applyOnTransformedLogs").isMissingNode());
+
+        ObjectNode delete = MAPPER.createObjectNode()
+                .put("logGroupName", GROUP)
+                .put("filterName", "errors");
+        assertEquals(200, handler.handle("DeleteMetricFilter", delete, REGION).getStatus());
+        JsonNode afterDelete = (JsonNode) handler.handle("DescribeMetricFilters", describe, REGION).getEntity();
+        assertTrue(afterDelete.path("metricFilters").isEmpty());
+    }
+
+    @Test
+    void describeMetricFiltersWithoutGroupListsAccountRegionWideInStableOrder() {
+        String otherGroup = GROUP + "-other";
+        service.createLogGroup(otherGroup, null, null, REGION);
+        var transformation = java.util.Map.<String, Object>of(
+                "metricName", "Count", "metricNamespace", "Test", "metricValue", "1");
+        service.putMetricFilter(otherGroup, "account-wide-bravo", "", java.util.List.of(transformation), null, REGION);
+        service.putMetricFilter(GROUP, "account-wide-alpha", "", java.util.List.of(transformation), null, REGION);
+
+        ObjectNode request = MAPPER.createObjectNode()
+                .put("filterNamePrefix", "account-wide-")
+                .put("limit", 1);
+        ObjectNode first = (ObjectNode) handler.handle("DescribeMetricFilters", request, REGION).getEntity();
+        ObjectNode secondRequest = request.deepCopy().put("nextToken", first.path("nextToken").asText());
+        ObjectNode second = (ObjectNode) handler.handle("DescribeMetricFilters", secondRequest, REGION).getEntity();
+
+        assertEquals(GROUP, first.path("metricFilters").get(0).path("logGroupName").asText());
+        assertEquals(otherGroup, second.path("metricFilters").get(0).path("logGroupName").asText());
+        assertTrue(second.path("nextToken").isMissingNode());
     }
 }

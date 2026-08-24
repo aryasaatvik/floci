@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogEvent;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogGroup;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogStream;
+import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricFilter;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.ResourcePolicy;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.SubscriptionFilter;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -60,6 +61,9 @@ public class CloudWatchLogsHandler {
             case "DisassociateKmsKey" -> handleDisassociateKmsKey(request, region);
             case "PutResourcePolicy" -> handlePutResourcePolicy(request, region);
             case "DescribeResourcePolicies" -> handleDescribeResourcePolicies(region);
+            case "PutMetricFilter" -> handlePutMetricFilter(request, region);
+            case "DescribeMetricFilters" -> handleDescribeMetricFilters(request, region);
+            case "DeleteMetricFilter" -> handleDeleteMetricFilter(request, region);
             case "GetDataProtectionPolicy" -> handleGetDataProtectionPolicy(request, region);
             case "StartQuery" -> handleStartQuery(request, region);
             case "GetQueryResults" -> handleGetQueryResults(request, region);
@@ -120,7 +124,7 @@ public class CloudWatchLogsHandler {
                 node.put("kmsKeyId", g.getKmsKeyId());
             }
             node.put("storedBytes", 0);
-            node.put("metricFilterCount", 0);
+            node.put("metricFilterCount", logsService.metricFilterCount(g.getLogGroupName(), region));
             groupsArray.add(node);
         }
         response.set("logGroups", groupsArray);
@@ -525,6 +529,98 @@ public class CloudWatchLogsHandler {
         String logGroupName = request.path("logGroupName").asText();
         String filterName = request.path("filterName").asText();
         logsService.deleteSubscriptionFilter(logGroupName, filterName, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handlePutMetricFilter(JsonNode request, String region) {
+        String logGroupName = resolveLogGroupName(request);
+        String filterName = request.path("filterName").asText(null);
+        String filterPattern = request.path("filterPattern").asText(null);
+        List<Map<String, Object>> transformations = new ArrayList<>();
+        request.path("metricTransformations").forEach(node -> {
+            Map<String, Object> transformation = new LinkedHashMap<>();
+            transformation.put("metricName", node.path("metricName").asText(null));
+            transformation.put("metricNamespace", node.path("metricNamespace").asText(null));
+            transformation.put("metricValue", node.path("metricValue").asText(null));
+            if (node.has("defaultValue")) {
+                transformation.put("defaultValue", node.path("defaultValue").asDouble());
+            }
+            if (node.has("dimensions")) {
+                Map<String, String> dimensions = new LinkedHashMap<>();
+                node.path("dimensions").fields().forEachRemaining(entry ->
+                        dimensions.put(entry.getKey(), entry.getValue().asText()));
+                transformation.put("dimensions", dimensions);
+            }
+            if (node.has("unit")) {
+                transformation.put("unit", node.path("unit").asText());
+            }
+            transformations.add(transformation);
+        });
+        Boolean applyOnTransformedLogs = request.hasNonNull("applyOnTransformedLogs")
+                ? request.path("applyOnTransformedLogs").asBoolean()
+                : null;
+        logsService.putMetricFilter(logGroupName, filterName, filterPattern, transformations,
+                applyOnTransformedLogs, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private Response handleDescribeMetricFilters(JsonNode request, String region) {
+        String logGroupName = resolveLogGroupName(request);
+        String filterNamePrefix = request.path("filterNamePrefix").asText(null);
+        String nextToken = request.path("nextToken").asText(null);
+        int limit = request.path("limit").asInt(0);
+        CloudWatchLogsService.DescribeMetricFiltersResult result = logsService.describeMetricFilters(
+                logGroupName, filterNamePrefix, nextToken, limit, region);
+
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode filters = response.putArray("metricFilters");
+        for (MetricFilter filter : result.metricFilters()) {
+            ObjectNode node = filters.addObject();
+            node.put("filterName", filter.getFilterName());
+            node.put("logGroupName", filter.getLogGroupName());
+            node.put("filterPattern", filter.getFilterPattern());
+            node.put("creationTime", filter.getCreationTime());
+            ArrayNode transformations = node.putArray("metricTransformations");
+            for (Map<String, Object> transformation : filter.getMetricTransformations()) {
+                transformations.add(metricTransformationNode(transformation));
+            }
+            if (filter.getApplyOnTransformedLogs() != null) {
+                node.put("applyOnTransformedLogs", filter.getApplyOnTransformedLogs());
+            }
+        }
+        if (result.nextToken() != null) {
+            response.put("nextToken", result.nextToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    private ObjectNode metricTransformationNode(Map<String, Object> transformation) {
+        ObjectNode node = objectMapper.createObjectNode();
+        if (transformation.get("metricName") != null) {
+            node.put("metricName", String.valueOf(transformation.get("metricName")));
+        }
+        if (transformation.get("metricNamespace") != null) {
+            node.put("metricNamespace", String.valueOf(transformation.get("metricNamespace")));
+        }
+        if (transformation.get("metricValue") != null) {
+            node.put("metricValue", String.valueOf(transformation.get("metricValue")));
+        }
+        if (transformation.get("defaultValue") instanceof Number defaultValue) {
+            node.put("defaultValue", defaultValue.doubleValue());
+        }
+        if (transformation.get("dimensions") instanceof Map<?, ?> dimensions) {
+            ObjectNode dimensionNode = node.putObject("dimensions");
+            dimensions.forEach((key, value) -> dimensionNode.put(String.valueOf(key), String.valueOf(value)));
+        }
+        if (transformation.get("unit") != null) {
+            node.put("unit", String.valueOf(transformation.get("unit")));
+        }
+        return node;
+    }
+
+    private Response handleDeleteMetricFilter(JsonNode request, String region) {
+        logsService.deleteMetricFilter(
+                resolveLogGroupName(request), request.path("filterName").asText(null), region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 

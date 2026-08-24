@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogEvent;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogGroup;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogStream;
+import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricFilter;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.SubscriptionFilter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -28,6 +29,7 @@ class CloudWatchLogsServiceTest {
     @BeforeEach
     void setUp() {
         service = new CloudWatchLogsService(
+                new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
@@ -79,6 +81,7 @@ class CloudWatchLogsServiceTest {
                 new AccountAwareStorageBackend<>(rawGroups, null, "000000000000"),
                 new AccountAwareStorageBackend<>(rawStreams, null, "000000000000"),
                 new AccountAwareStorageBackend<>(rawEvents, null, "000000000000"),
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "000000000000"),
                 new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "000000000000"),
                 10_000, new RegionResolver(REGION, "000000000000"));
         String accountA = "111111111111";
@@ -669,6 +672,7 @@ class CloudWatchLogsServiceTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 2,
                 new RegionResolver("us-east-1", "000000000000")
         );
@@ -749,6 +753,7 @@ class CloudWatchLogsServiceTest {
     @Test
     void getLogEventsPagesForwardWithAnUnboundedMaxEventsPerQuery() {
         CloudWatchLogsService unboundedService = new CloudWatchLogsService(
+                new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
@@ -1048,6 +1053,7 @@ class CloudWatchLogsServiceTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
+                new InMemoryStorage<>(),
                 0,
                 new RegionResolver("us-east-1", "000000000000")
         );
@@ -1121,6 +1127,158 @@ class CloudWatchLogsServiceTest {
             assertEquals(400, exception.getHttpStatus());
             assertEquals("The specified nextToken is invalid.", exception.getMessage());
         }
+    }
+
+    // ──────────────────────────── Metric Filters ────────────────────────────
+
+    @Test
+    void metricFilterUpsertPreservesCreationTimeAndFullShape() {
+        service.createLogGroup("/app/logs", null, null, REGION);
+        Map<String, Object> transformation = new java.util.LinkedHashMap<>();
+        transformation.put("metricName", "Requests");
+        transformation.put("metricNamespace", "Test");
+        transformation.put("metricValue", "1");
+        transformation.put("defaultValue", 0.0);
+        transformation.put("dimensions", Map.of("Service", "api", "Stage", "local"));
+        transformation.put("unit", "Count");
+
+        service.putMetricFilter("/app/logs", "requests", "", List.of(transformation), true, REGION);
+        MetricFilter first = service.describeMetricFilters("/app/logs", "requests", null, 50, REGION)
+                .metricFilters().getFirst();
+        first.setCreationTime(1234L);
+
+        service.putMetricFilter("/app/logs", "requests", "status = 200", List.of(transformation), false, REGION);
+        MetricFilter updated = service.describeMetricFilters("/app/logs", "requests", null, 50, REGION)
+                .metricFilters().getFirst();
+
+        assertEquals(1234L, updated.getCreationTime());
+        assertEquals("status = 200", updated.getFilterPattern());
+        assertEquals(List.of(transformation), updated.getMetricTransformations());
+        assertEquals(Boolean.FALSE, updated.getApplyOnTransformedLogs());
+    }
+
+    @Test
+    void describeMetricFiltersFiltersSortsAndPaginatesDeterministically() {
+        service.createLogGroup("/app/logs", null, null, REGION);
+        Map<String, Object> transformation = Map.of(
+                "metricName", "Count", "metricNamespace", "Test", "metricValue", "1");
+        for (String name : List.of("prefix-charlie", "other", "prefix-alpha", "prefix-bravo")) {
+            service.putMetricFilter("/app/logs", name, "", List.of(transformation), null, REGION);
+        }
+
+        var first = service.describeMetricFilters("/app/logs", "prefix-", null, 2, REGION);
+        var second = service.describeMetricFilters("/app/logs", "prefix-", first.nextToken(), 2, REGION);
+
+        assertEquals(List.of("prefix-alpha", "prefix-bravo"),
+                first.metricFilters().stream().map(MetricFilter::getFilterName).toList());
+        assertEquals("2", first.nextToken());
+        assertEquals(List.of("prefix-charlie"),
+                second.metricFilters().stream().map(MetricFilter::getFilterName).toList());
+        assertNull(second.nextToken());
+
+        AwsException malformed = assertThrows(AwsException.class, () ->
+                service.describeMetricFilters("/app/logs", null, "not-a-token", 2, REGION));
+        assertEquals("InvalidParameterException", malformed.getErrorCode());
+    }
+
+    @Test
+    void describeMetricFiltersListsAcrossGroupsWithinTheCurrentRegion() {
+        Map<String, Object> transformation = Map.of(
+                "metricName", "Count", "metricNamespace", "Test", "metricValue", "1");
+        service.createLogGroup("/app/b", null, null, REGION);
+        service.createLogGroup("/app/a", null, null, REGION);
+        service.createLogGroup("/app/a", null, null, "eu-west-1");
+        service.putMetricFilter("/app/b", "shared-bravo", "", List.of(transformation), null, REGION);
+        service.putMetricFilter("/app/a", "shared-charlie", "", List.of(transformation), null, REGION);
+        service.putMetricFilter("/app/a", "shared-alpha", "", List.of(transformation), null, REGION);
+        service.putMetricFilter("/app/a", "shared-west", "", List.of(transformation), null, "eu-west-1");
+
+        var first = service.describeMetricFilters(null, "shared-", null, 2, REGION);
+        var second = service.describeMetricFilters(null, "shared-", first.nextToken(), 2, REGION);
+
+        assertEquals(List.of("/app/a/shared-alpha", "/app/a/shared-charlie"), first.metricFilters().stream()
+                .map(filter -> filter.getLogGroupName() + "/" + filter.getFilterName()).toList());
+        assertEquals("2", first.nextToken());
+        assertEquals(List.of("/app/b/shared-bravo"), second.metricFilters().stream()
+                .map(filter -> filter.getLogGroupName() + "/" + filter.getFilterName()).toList());
+        assertNull(second.nextToken());
+    }
+
+    @Test
+    void metricFiltersAreIsolatedByRegionAndLogGroupAndDeletedWithTheirGroup() {
+        Map<String, Object> transformation = Map.of(
+                "metricName", "Count", "metricNamespace", "Test", "metricValue", "1");
+        service.createLogGroup("/app/a", null, null, REGION);
+        service.createLogGroup("/app/b", null, null, REGION);
+        service.createLogGroup("/app/a", null, null, "eu-west-1");
+        service.putMetricFilter("/app/a", "shared", "east-a", List.of(transformation), null, REGION);
+        service.putMetricFilter("/app/b", "shared", "east-b", List.of(transformation), null, REGION);
+        service.putMetricFilter("/app/a", "shared", "west-a", List.of(transformation), null, "eu-west-1");
+
+        assertEquals("east-a", service.describeMetricFilters("/app/a", null, null, 50, REGION)
+                .metricFilters().getFirst().getFilterPattern());
+        assertEquals("east-b", service.describeMetricFilters("/app/b", null, null, 50, REGION)
+                .metricFilters().getFirst().getFilterPattern());
+        assertEquals("west-a", service.describeMetricFilters("/app/a", null, null, 50, "eu-west-1")
+                .metricFilters().getFirst().getFilterPattern());
+
+        service.deleteLogGroup("/app/a", REGION);
+        service.createLogGroup("/app/a", null, null, REGION);
+        assertTrue(service.describeMetricFilters("/app/a", null, null, 50, REGION).metricFilters().isEmpty());
+        assertEquals(1, service.metricFilterCount("/app/a", "eu-west-1"));
+    }
+
+    @Test
+    void accountAwareMetricFilterStoreIsolatesIdenticalKeys() {
+        InMemoryStorage<String, LogGroup> rawGroups = new InMemoryStorage<>();
+        InMemoryStorage<String, MetricFilter> rawMetricFilters = new InMemoryStorage<>();
+        CloudWatchLogsService firstAccount = accountScopedMetricFilterService(
+                "111111111111", rawGroups, rawMetricFilters);
+        CloudWatchLogsService secondAccount = accountScopedMetricFilterService(
+                "222222222222", rawGroups, rawMetricFilters);
+        Map<String, Object> transformation = Map.of(
+                "metricName", "Count", "metricNamespace", "Test", "metricValue", "1");
+
+        firstAccount.createLogGroup("/app/logs", null, null, REGION);
+        secondAccount.createLogGroup("/app/logs", null, null, REGION);
+        firstAccount.putMetricFilter("/app/logs", "shared", "first", List.of(transformation), null, REGION);
+        secondAccount.putMetricFilter("/app/logs", "shared", "second", List.of(transformation), null, REGION);
+
+        assertEquals("first", firstAccount.describeMetricFilters("/app/logs", null, null, 50, REGION)
+                .metricFilters().getFirst().getFilterPattern());
+        assertEquals("second", secondAccount.describeMetricFilters("/app/logs", null, null, 50, REGION)
+                .metricFilters().getFirst().getFilterPattern());
+        assertEquals(2, rawMetricFilters.keys().size());
+    }
+
+    private CloudWatchLogsService accountScopedMetricFilterService(
+            String accountId, InMemoryStorage<String, LogGroup> groups,
+            InMemoryStorage<String, MetricFilter> metricFilters) {
+        return new CloudWatchLogsService(
+                new AccountAwareStorageBackend<>(groups, null, accountId),
+                AccountAwareStorageBackend.inMemory(accountId),
+                AccountAwareStorageBackend.inMemory(accountId),
+                AccountAwareStorageBackend.inMemory(accountId),
+                new AccountAwareStorageBackend<>(metricFilters, null, accountId),
+                10_000, new RegionResolver(REGION, accountId));
+    }
+
+    @Test
+    void metricFilterOperationsReturnAwsErrorsForInvalidResourcesAndInput() {
+        Map<String, Object> transformation = Map.of(
+                "metricName", "Count", "metricNamespace", "Test", "metricValue", "1");
+        AwsException missingGroup = assertThrows(AwsException.class, () ->
+                service.putMetricFilter("/missing", "filter", "", List.of(transformation), null, REGION));
+        assertEquals("ResourceNotFoundException", missingGroup.getErrorCode());
+
+        service.createLogGroup("/app/logs", null, null, REGION);
+        AwsException missingTransformation = assertThrows(AwsException.class, () ->
+                service.putMetricFilter("/app/logs", "filter", "", List.of(), null, REGION));
+        assertEquals("InvalidParameterException", missingTransformation.getErrorCode());
+
+        AwsException missingFilter = assertThrows(AwsException.class, () ->
+                service.deleteMetricFilter("/app/logs", "missing", REGION));
+        assertEquals("ResourceNotFoundException", missingFilter.getErrorCode());
     }
 
     // ──────────────────────────── Subscription Filters ────────────────────────────

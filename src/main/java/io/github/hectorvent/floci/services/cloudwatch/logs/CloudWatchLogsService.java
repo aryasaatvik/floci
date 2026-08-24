@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogEvent;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogGroup;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.LogStream;
+import io.github.hectorvent.floci.services.cloudwatch.logs.model.MetricFilter;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.ResourcePolicy;
 import io.github.hectorvent.floci.services.cloudwatch.logs.model.SubscriptionFilter;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -58,6 +59,7 @@ public class CloudWatchLogsService implements ResourceProvider {
     private final StorageBackend<String, LogEvent> eventStore;
     private final StorageBackend<String, SubscriptionFilter> subscriptionFilterStore;
     private final StorageBackend<String, ResourcePolicy> resourcePolicyStore;
+    private final StorageBackend<String, MetricFilter> metricFilterStore;
     private final RegionResolver regionResolver;
     private final int maxEventsPerQuery;
     /**
@@ -104,6 +106,8 @@ public class CloudWatchLogsService implements ResourceProvider {
                         new TypeReference<>() {}),
                 storageFactory.create("cloudwatchlogs", "cwlogs-resource-policies.json",
                         new TypeReference<>() {}),
+                storageFactory.create("cloudwatchlogs", "cwlogs-metric-filters.json",
+                        new TypeReference<>() {}),
                 config.services().cloudwatchlogs().maxEventsPerQuery(),
                 regionResolver,
                 config.services().cloudwatchlogs().queryCompletionDelayMs(),
@@ -117,8 +121,35 @@ public class CloudWatchLogsService implements ResourceProvider {
                            StorageBackend<String, SubscriptionFilter> subscriptionFilterStore,
                            int maxEventsPerQuery,
                            RegionResolver regionResolver) {
-        this(groupStore, streamStore, eventStore, subscriptionFilterStore, new InMemoryStorage<>(),
+        this(groupStore, streamStore, eventStore, subscriptionFilterStore,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
                 maxEventsPerQuery, regionResolver, 0L, System::currentTimeMillis);
+    }
+
+    CloudWatchLogsService(StorageBackend<String, LogGroup> groupStore,
+                           StorageBackend<String, LogStream> streamStore,
+                           StorageBackend<String, LogEvent> eventStore,
+                           StorageBackend<String, SubscriptionFilter> subscriptionFilterStore,
+                           StorageBackend<String, MetricFilter> metricFilterStore,
+                           int maxEventsPerQuery,
+                           RegionResolver regionResolver) {
+        this(groupStore, streamStore, eventStore, subscriptionFilterStore,
+                new InMemoryStorage<>(), metricFilterStore,
+                maxEventsPerQuery, regionResolver, 0L, System::currentTimeMillis);
+    }
+
+    CloudWatchLogsService(StorageBackend<String, LogGroup> groupStore,
+                           StorageBackend<String, LogStream> streamStore,
+                           StorageBackend<String, LogEvent> eventStore,
+                           StorageBackend<String, SubscriptionFilter> subscriptionFilterStore,
+                           StorageBackend<String, MetricFilter> metricFilterStore,
+                           int maxEventsPerQuery,
+                           RegionResolver regionResolver,
+                           long queryCompletionDelayMs,
+                           LongSupplier clock) {
+        this(groupStore, streamStore, eventStore, subscriptionFilterStore,
+                new InMemoryStorage<>(), metricFilterStore,
+                maxEventsPerQuery, regionResolver, queryCompletionDelayMs, clock);
     }
 
     CloudWatchLogsService(StorageBackend<String, LogGroup> groupStore,
@@ -129,7 +160,8 @@ public class CloudWatchLogsService implements ResourceProvider {
                            RegionResolver regionResolver,
                            long queryCompletionDelayMs,
                            LongSupplier clock) {
-        this(groupStore, streamStore, eventStore, subscriptionFilterStore, new InMemoryStorage<>(),
+        this(groupStore, streamStore, eventStore, subscriptionFilterStore,
+                new InMemoryStorage<>(), new InMemoryStorage<>(),
                 maxEventsPerQuery, regionResolver, queryCompletionDelayMs, clock);
     }
 
@@ -138,6 +170,7 @@ public class CloudWatchLogsService implements ResourceProvider {
                            StorageBackend<String, LogEvent> eventStore,
                            StorageBackend<String, SubscriptionFilter> subscriptionFilterStore,
                            StorageBackend<String, ResourcePolicy> resourcePolicyStore,
+                           StorageBackend<String, MetricFilter> metricFilterStore,
                            int maxEventsPerQuery,
                            RegionResolver regionResolver,
                            long queryCompletionDelayMs,
@@ -147,6 +180,7 @@ public class CloudWatchLogsService implements ResourceProvider {
         this.eventStore = eventStore;
         this.subscriptionFilterStore = subscriptionFilterStore;
         this.resourcePolicyStore = resourcePolicyStore;
+        this.metricFilterStore = metricFilterStore;
         this.maxEventsPerQuery = maxEventsPerQuery;
         this.regionResolver = regionResolver;
         long maxSequence = eventStore.scan(k -> true).stream()
@@ -237,6 +271,7 @@ public class CloudWatchLogsService implements ResourceProvider {
                 streamStore.delete(sk);
             }
         }
+        deleteMetricFiltersForLogGroup(region, name);
         groupStore.delete(key);
         LOG.infov("Deleted log group: {0}", name);
     }
@@ -977,6 +1012,92 @@ public class CloudWatchLogsService implements ResourceProvider {
         return policies;
     }
 
+    // ──────────────────────────── Metric Filters ────────────────────────────
+
+    public void putMetricFilter(String logGroupName, String filterName, String filterPattern,
+                                List<Map<String, Object>> transformations, Boolean applyOnTransformedLogs,
+                                String region) {
+        requireMetricFilterLogGroup(logGroupName, region);
+        if (filterName == null || filterName.isBlank()) {
+            throw new AwsException("InvalidParameterException", "filterName is required.", 400);
+        }
+        if (filterPattern == null) {
+            throw new AwsException("InvalidParameterException", "filterPattern is required.", 400);
+        }
+        if (transformations == null || transformations.isEmpty()) {
+            throw new AwsException("InvalidParameterException", "metricTransformations is required.", 400);
+        }
+        for (Map<String, Object> transformation : transformations) {
+            requireMetricTransformationField(transformation, "metricName");
+            requireMetricTransformationField(transformation, "metricNamespace");
+            requireMetricTransformationField(transformation, "metricValue");
+        }
+
+        String key = metricFilterKey(region, logGroupName, filterName);
+        MetricFilter filter = new MetricFilter();
+        filter.setFilterName(filterName);
+        filter.setLogGroupName(logGroupName);
+        filter.setFilterPattern(filterPattern);
+        filter.setMetricTransformations(transformations);
+        filter.setApplyOnTransformedLogs(applyOnTransformedLogs);
+        filter.setCreationTime(metricFilterStore.get(key)
+                .map(MetricFilter::getCreationTime)
+                .orElseGet(System::currentTimeMillis));
+        metricFilterStore.put(key, filter);
+        LOG.infov("Put metric filter: {0} on log group: {1}", filterName, logGroupName);
+    }
+
+    public record DescribeMetricFiltersResult(List<MetricFilter> metricFilters, String nextToken) {}
+
+    public DescribeMetricFiltersResult describeMetricFilters(String logGroupName, String filterNamePrefix,
+                                                              String nextToken, int limit, String region) {
+        if (logGroupName != null && !logGroupName.isBlank()) {
+            requireMetricFilterLogGroup(logGroupName, region);
+        }
+        if (limit < 0 || limit > 50) {
+            throw new AwsException("InvalidParameterException", "limit must be between 1 and 50.", 400);
+        }
+
+        String regionPrefix = region + "::";
+        String groupPrefix = logGroupName != null && !logGroupName.isBlank()
+                ? metricFilterKeyPrefix(region, logGroupName)
+                : null;
+        List<MetricFilter> all = metricFilterStore.scan(key -> {
+            return key.startsWith(regionPrefix) && (groupPrefix == null || key.startsWith(groupPrefix));
+        });
+        if (filterNamePrefix != null && !filterNamePrefix.isEmpty()) {
+            all.removeIf(filter -> !filter.getFilterName().startsWith(filterNamePrefix));
+        }
+        all.sort(Comparator.comparing(MetricFilter::getLogGroupName)
+                .thenComparing(MetricFilter::getFilterName));
+
+        int offset = parseMetricFilterToken(nextToken, all.size());
+        int maxResults = limit > 0 ? limit : 50;
+        int end = Math.min(offset + maxResults, all.size());
+        List<MetricFilter> page = List.copyOf(all.subList(offset, end));
+        String token = end < all.size() ? String.valueOf(end) : null;
+        return new DescribeMetricFiltersResult(page, token);
+    }
+
+    public void deleteMetricFilter(String logGroupName, String filterName, String region) {
+        requireMetricFilterLogGroup(logGroupName, region);
+        if (filterName == null || filterName.isBlank()) {
+            throw new AwsException("InvalidParameterException", "filterName is required.", 400);
+        }
+        String key = metricFilterKey(region, logGroupName, filterName);
+        if (metricFilterStore.get(key).isEmpty()) {
+            throw new AwsException("ResourceNotFoundException",
+                    "The specified metric filter does not exist: " + filterName, 400);
+        }
+        metricFilterStore.delete(key);
+        LOG.infov("Deleted metric filter: {0} on log group: {1}", filterName, logGroupName);
+    }
+
+    public int metricFilterCount(String logGroupName, String region) {
+        String prefix = metricFilterKeyPrefix(region, logGroupName);
+        return metricFilterStore.scan(key -> key.startsWith(prefix)).size();
+    }
+
     // ──────────────────────────── Helpers ────────────────────────────
 
     private void deleteEventsForStream(String region, String groupName, String streamName) {
@@ -985,6 +1106,50 @@ public class CloudWatchLogsService implements ResourceProvider {
                 .filter(k -> k.startsWith(eventPrefix))
                 .toList();
         keys.forEach(eventStore::delete);
+    }
+
+    private void deleteMetricFiltersForLogGroup(String region, String groupName) {
+        String prefix = metricFilterKeyPrefix(region, groupName);
+        metricFilterStore.keys().stream()
+                .filter(key -> key.startsWith(prefix))
+                .toList()
+                .forEach(metricFilterStore::delete);
+    }
+
+    private void requireMetricFilterLogGroup(String logGroupName, String region) {
+        if (logGroupName == null || logGroupName.isBlank()) {
+            throw new AwsException("InvalidParameterException", "logGroupName is required.", 400);
+        }
+        groupStore.get(groupKey(region, logGroupName))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "The specified log group does not exist: " + logGroupName, 400));
+    }
+
+    private int parseMetricFilterToken(String nextToken, int resultCount) {
+        if (nextToken == null || nextToken.isBlank()) {
+            return 0;
+        }
+        try {
+            int offset = Integer.parseInt(nextToken);
+            if (offset < 0 || offset >= resultCount) {
+                throw invalidMetricFilterToken();
+            }
+            return offset;
+        } catch (NumberFormatException e) {
+            throw invalidMetricFilterToken();
+        }
+    }
+
+    private AwsException invalidMetricFilterToken() {
+        return new AwsException("InvalidParameterException", "The specified nextToken is invalid.", 400);
+    }
+
+    private void requireMetricTransformationField(Map<String, Object> transformation, String fieldName) {
+        Object value = transformation != null ? transformation.get(fieldName) : null;
+        if (!(value instanceof String text) || text.isBlank()) {
+            throw new AwsException("InvalidParameterException",
+                    "metricTransformations." + fieldName + " is required.", 400);
+        }
     }
 
     public String buildArn(String groupName, String region) {
@@ -1046,6 +1211,14 @@ public class CloudWatchLogsService implements ResourceProvider {
 
     private static String resourcePolicyKey(String region, String policyName) {
         return resourcePolicyKeyPrefix(region) + policyName;
+    }
+
+    private static String metricFilterKeyPrefix(String region, String logGroupName) {
+        return region + "::" + logGroupName + "::metric-filter::";
+    }
+
+    private static String metricFilterKey(String region, String logGroupName, String filterName) {
+        return metricFilterKeyPrefix(region, logGroupName) + filterName;
     }
 
     private static long toLong(Object value, long defaultValue) {
