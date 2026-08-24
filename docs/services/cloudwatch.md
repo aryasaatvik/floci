@@ -42,6 +42,9 @@ Floci supports both CloudWatch Logs and CloudWatch Metrics.
 | `PutDestinationPolicy` | Create or update the access policy for a destination |
 | `PutAccountPolicy` | Create or update an account-level Logs policy |
 | `DescribeAccountPolicies` | List account-level Logs policies by type and optional name |
+| `PutMetricFilter` | Create or update a metric filter |
+| `DescribeMetricFilters` | List metric filters in a region or on a log group, with prefix filtering and pagination |
+| `DeleteMetricFilter` | Delete a metric filter |
 | `GetDataProtectionPolicy` | Return the resolved log group identifier (see note below) |
 | `StartQuery` | Start a Logs Insights query (see [Logs Insights](#logs-insights)) |
 | `GetQueryResults` | Get the status and results of a Logs Insights query |
@@ -50,6 +53,9 @@ Floci supports both CloudWatch Logs and CloudWatch Metrics.
 Log group deletion protection defaults to disabled and is persisted with the log group. When it is
 enabled, `DeleteLogGroup` returns `ValidationException` until protection is explicitly disabled
 with `PutLogGroupDeletionProtection`.
+
+Metric filters are persisted per account, region, and log group. Updating an existing filter keeps
+its original `creationTime`; deleting a log group also deletes its metric filters.
 
 Two actions are currently simplified:
 
