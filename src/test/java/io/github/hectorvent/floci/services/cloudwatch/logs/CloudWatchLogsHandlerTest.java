@@ -321,4 +321,62 @@ class CloudWatchLogsHandlerTest {
         assertEquals("central", dest.path("destinationName").asText());
         assertEquals("arn:aws:iam::000000000000:role/delivery", dest.path("roleArn").asText());
     }
+
+    @Test
+    void metricFilterRoundTripsStableFullWireShape() {
+        ObjectNode put = MAPPER.createObjectNode();
+        put.put("logGroupName", GROUP);
+        put.put("filterName", "requests");
+        put.put("filterPattern", "");
+        put.put("applyOnTransformedLogs", true);
+        ObjectNode transformation = put.putArray("metricTransformations").addObject();
+        transformation.put("metricName", "Requests");
+        transformation.put("metricNamespace", "Test");
+        transformation.put("metricValue", "1");
+        transformation.put("defaultValue", 0.0);
+        transformation.putObject("dimensions").put("Service", "api").put("Stage", "local");
+        transformation.put("unit", "Count");
+
+        assertEquals(200, handler.handle("PutMetricFilter", put, REGION).getStatus());
+        ObjectNode describe = MAPPER.createObjectNode();
+        describe.put("logGroupName", GROUP);
+        describe.put("filterNamePrefix", "requests");
+        JsonNode first = ((JsonNode) handler.handle("DescribeMetricFilters", describe, REGION).getEntity())
+                .path("metricFilters").get(0);
+
+        assertEquals(transformation, first.path("metricTransformations").get(0));
+        var fieldOrder = new java.util.ArrayList<String>();
+        first.path("metricTransformations").get(0).fieldNames().forEachRemaining(fieldOrder::add);
+        assertEquals(java.util.List.of("metricName", "metricNamespace", "metricValue", "defaultValue", "dimensions", "unit"),
+                fieldOrder);
+        assertTrue(first.path("applyOnTransformedLogs").asBoolean());
+        long creationTime = first.path("creationTime").asLong();
+
+        assertEquals(200, handler.handle("PutMetricFilter", put, REGION).getStatus());
+        JsonNode second = ((JsonNode) handler.handle("DescribeMetricFilters", describe, REGION).getEntity())
+                .path("metricFilters").get(0);
+        assertEquals(first.path("metricTransformations"), second.path("metricTransformations"));
+        assertEquals(creationTime, second.path("creationTime").asLong());
+    }
+
+    @Test
+    void metricFilterOmitsApplyOnTransformedLogsWhenAbsent() {
+        ObjectNode put = MAPPER.createObjectNode();
+        put.put("logGroupName", GROUP);
+        put.put("filterName", "errors");
+        put.put("filterPattern", "ERROR");
+        put.putArray("metricTransformations").addObject()
+                .put("metricName", "Errors")
+                .put("metricNamespace", "Test")
+                .put("metricValue", "1")
+                .put("unit", "Count");
+
+        handler.handle("PutMetricFilter", put, REGION);
+        ObjectNode describe = MAPPER.createObjectNode();
+        describe.put("logGroupName", GROUP);
+        JsonNode filter = ((JsonNode) handler.handle("DescribeMetricFilters", describe, REGION).getEntity())
+                .path("metricFilters").get(0);
+
+        assertTrue(filter.path("applyOnTransformedLogs").isMissingNode());
+    }
 }

@@ -15,6 +15,7 @@ public class MetricFilter {
     private String logGroupName;
     private String filterPattern;
     private List<Map<String, Object>> metricTransformations = new ArrayList<>();
+    private Boolean applyOnTransformedLogs;
     private long creationTime;
 
     public MetricFilter() {}
@@ -31,6 +32,11 @@ public class MetricFilter {
     public List<Map<String, Object>> getMetricTransformations() { return metricTransformations; }
     public void setMetricTransformations(List<Map<String, Object>> metricTransformations) {
         this.metricTransformations = metricTransformations != null ? metricTransformations : new ArrayList<>();
+    }
+
+    public Boolean getApplyOnTransformedLogs() { return applyOnTransformedLogs; }
+    public void setApplyOnTransformedLogs(Boolean applyOnTransformedLogs) {
+        this.applyOnTransformedLogs = applyOnTransformedLogs;
     }
 
     public long getCreationTime() { return creationTime; }

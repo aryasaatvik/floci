@@ -875,18 +875,23 @@ public class CloudWatchLogsService {
     // ──────────────────────────── Metric Filters ────────────────────────────
 
     public void putMetricFilter(String logGroupName, String filterName, String filterPattern,
-                                List<Map<String, Object>> transformations, String region) {
+                                List<Map<String, Object>> transformations, Boolean applyOnTransformedLogs,
+                                String region) {
         requireLogGroup(logGroupName, region);
         if (filterName == null || filterName.isBlank()) {
             throw new AwsException("InvalidParameterException", "filterName is required.", 400);
         }
+        String key = metricFilterKey(region, logGroupName, filterName);
         MetricFilter filter = new MetricFilter();
         filter.setFilterName(filterName);
         filter.setLogGroupName(logGroupName);
         filter.setFilterPattern(filterPattern != null ? filterPattern : "");
         filter.setMetricTransformations(transformations != null ? transformations : List.of());
-        filter.setCreationTime(System.currentTimeMillis());
-        metricFilterStore.put(metricFilterKey(region, logGroupName, filterName), filter);
+        filter.setApplyOnTransformedLogs(applyOnTransformedLogs);
+        filter.setCreationTime(metricFilterStore.get(key)
+                .map(MetricFilter::getCreationTime)
+                .orElseGet(System::currentTimeMillis));
+        metricFilterStore.put(key, filter);
         LOG.infov("Put metric filter: {0} on log group: {1}", filterName, logGroupName);
     }
 

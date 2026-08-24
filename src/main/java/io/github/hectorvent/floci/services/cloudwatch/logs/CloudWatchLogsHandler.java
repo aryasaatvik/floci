@@ -558,16 +558,29 @@ public class CloudWatchLogsHandler {
         String filterPattern = request.path("filterPattern").asText("");
         List<Map<String, Object>> transformations = new ArrayList<>();
         request.path("metricTransformations").forEach(node -> {
-            Map<String, Object> t = new HashMap<>();
+            Map<String, Object> t = new LinkedHashMap<>();
             t.put("metricName", node.path("metricName").asText());
             t.put("metricNamespace", node.path("metricNamespace").asText());
             t.put("metricValue", node.path("metricValue").asText());
             if (node.has("defaultValue")) {
                 t.put("defaultValue", node.path("defaultValue").asDouble());
             }
+            if (node.has("dimensions")) {
+                Map<String, String> dimensions = new LinkedHashMap<>();
+                node.path("dimensions").fields().forEachRemaining(entry ->
+                        dimensions.put(entry.getKey(), entry.getValue().asText()));
+                t.put("dimensions", dimensions);
+            }
+            if (node.has("unit")) {
+                t.put("unit", node.path("unit").asText());
+            }
             transformations.add(t);
         });
-        logsService.putMetricFilter(logGroupName, filterName, filterPattern, transformations, region);
+        Boolean applyOnTransformedLogs = request.has("applyOnTransformedLogs")
+                ? request.path("applyOnTransformedLogs").asBoolean()
+                : null;
+        logsService.putMetricFilter(logGroupName, filterName, filterPattern, transformations,
+                applyOnTransformedLogs, region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -602,7 +615,17 @@ public class CloudWatchLogsHandler {
                 if (t.get("defaultValue") instanceof Number n) {
                     tn.put("defaultValue", n.doubleValue());
                 }
+                if (t.get("dimensions") instanceof Map<?, ?> dimensions) {
+                    ObjectNode dimensionNode = tn.putObject("dimensions");
+                    dimensions.forEach((key, value) -> dimensionNode.put(String.valueOf(key), String.valueOf(value)));
+                }
+                if (t.get("unit") != null) {
+                    tn.put("unit", String.valueOf(t.get("unit")));
+                }
                 transforms.add(tn);
+            }
+            if (f.getApplyOnTransformedLogs() != null) {
+                node.put("applyOnTransformedLogs", f.getApplyOnTransformedLogs());
             }
             filters.add(node);
         }

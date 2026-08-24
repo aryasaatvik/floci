@@ -576,12 +576,36 @@ class CloudWatchLogsServiceTest {
         service.createLogGroup("/app/logs", null, null, REGION);
         service.putMetricFilter("/app/logs", "errors", "?ERROR",
                 List.of(Map.of("metricName", "Errors", "metricNamespace", "Test", "metricValue", "1", "defaultValue", 0)),
+                null,
                 REGION);
         var described = service.describeMetricFilters("/app/logs", "errors", null, 10, REGION);
         assertEquals(1, described.metricFilters().size());
         assertEquals("?ERROR", described.metricFilters().getFirst().getFilterPattern());
         service.deleteMetricFilter("/app/logs", "errors", REGION);
         assertTrue(service.describeMetricFilters("/app/logs", "errors", null, 10, REGION).metricFilters().isEmpty());
+    }
+
+    @Test
+    void metricFilterUpsertPreservesFullShapeAndCreationTime() {
+        service.createLogGroup("/app/logs", null, null, REGION);
+        var transformation = new java.util.LinkedHashMap<String, Object>();
+        transformation.put("metricName", "Requests");
+        transformation.put("metricNamespace", "Test");
+        transformation.put("metricValue", "1");
+        transformation.put("defaultValue", 0.0);
+        transformation.put("dimensions", new java.util.LinkedHashMap<>(Map.of("Service", "api", "Stage", "local")));
+        transformation.put("unit", "Count");
+
+        service.putMetricFilter("/app/logs", "requests", "", List.of(transformation), false, REGION);
+        var first = service.describeMetricFilters("/app/logs", "requests", null, 10, REGION)
+                .metricFilters().getFirst();
+        service.putMetricFilter("/app/logs", "requests", "", List.of(transformation), false, REGION);
+        var second = service.describeMetricFilters("/app/logs", "requests", null, 10, REGION)
+                .metricFilters().getFirst();
+
+        assertEquals(first.getCreationTime(), second.getCreationTime());
+        assertEquals(transformation, second.getMetricTransformations().getFirst());
+        assertEquals(Boolean.FALSE, second.getApplyOnTransformedLogs());
     }
 
     @Test
