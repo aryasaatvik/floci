@@ -40,7 +40,9 @@ class LambdaEnvironmentLimiterTest {
             }
             assertTrue(started.await(2, TimeUnit.SECONDS), "all logical invocations did not start");
             awaitQueued(limiter, 16);
-            assertEquals(4, limiter.status().inFlight());
+            assertEquals(4, limiter.status().total());
+            assertEquals(4, limiter.status().active());
+            assertEquals(0, limiter.status().idle());
             assertEquals(16, limiter.status().queued());
             assertEquals(0, limiter.status().available());
 
@@ -52,13 +54,13 @@ class LambdaEnvironmentLimiterTest {
                 permit.close();
             }
             assertEquals(20, limiter.status().granted());
-            assertEquals(0, limiter.status().inFlight());
+            assertEquals(0, limiter.status().total());
             assertEquals(0, limiter.status().queued());
         } finally {
             held.forEach(LambdaEnvironmentLimiter.Permit::close);
             workers.shutdownNow();
         }
-        assertEquals(0, limiter.status().inFlight());
+        assertEquals(0, limiter.status().total());
         assertEquals(0, limiter.status().queued());
     }
 
@@ -122,11 +124,11 @@ class LambdaEnvironmentLimiterTest {
             assertEquals("timed-out", exception.environmentKey());
             assertEquals(0, limiter.status().queued());
             assertEquals(1, limiter.status().timedOut());
-            assertEquals(1, limiter.status().inFlight());
+            assertEquals(1, limiter.status().total());
         } finally {
             holder.close();
         }
-        assertEquals(0, limiter.status().inFlight());
+        assertEquals(0, limiter.status().total());
     }
 
     @Test
@@ -195,10 +197,12 @@ class LambdaEnvironmentLimiterTest {
         LambdaEnvironmentLimiter.Permit first = limiter.acquire("account-a/function-a:$LATEST");
         LambdaEnvironmentLimiter.Permit second = limiter.acquire("account-b/function-a:$LATEST");
         try {
-            assertEquals(1, limiter.status("account-a/function-a:$LATEST").inFlight());
-            assertEquals(1, limiter.status("account-b/function-a:$LATEST").inFlight());
-            assertEquals(0, limiter.status("account-c/function-a:$LATEST").inFlight());
-            assertEquals(2, limiter.status().inFlight());
+            assertEquals(1, limiter.status("account-a/function-a:$LATEST").total());
+            assertEquals(1, limiter.status("account-a/function-a:$LATEST").active());
+            assertEquals(0, limiter.status("account-a/function-a:$LATEST").idle());
+            assertEquals(1, limiter.status("account-b/function-a:$LATEST").total());
+            assertEquals(0, limiter.status("account-c/function-a:$LATEST").total());
+            assertEquals(2, limiter.status().total());
         } finally {
             first.close();
             second.close();

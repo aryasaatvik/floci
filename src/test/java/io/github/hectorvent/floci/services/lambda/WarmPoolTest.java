@@ -324,7 +324,7 @@ class WarmPoolTest {
     }
 
     @Test
-    void boundedProfileRetainsAtMostConfiguredIdleEnvironmentsAcrossFunctions() {
+    void boundedProfileRetiresIdleVictimBeforeColdStartingAnotherFunction() {
         WarmPool pool = buildBoundedPool(1);
         pool.init();
 
@@ -346,10 +346,104 @@ class WarmPoolTest {
         pool.release(pool.acquire(accountB));
 
         assertEquals(1, pool.idleContainerCount());
-        verify(containerLauncher).stop(second);
+        verify(containerLauncher).stop(first);
         assertEquals(1, pool.status().configuredLimit());
-        assertEquals(0, pool.status().inFlight());
+        assertEquals(1, pool.status().total());
+        assertEquals(0, pool.status().active());
+        assertEquals(1, pool.status().idle());
         pool.shutdown();
+    }
+
+    @Test
+    void queuedInvocationRetiresNewlyIdleVictimAndMakesProgress() throws Exception {
+        WarmPool pool = buildBoundedPool(1);
+        pool.init();
+
+        LambdaFunction first = mock(LambdaFunction.class);
+        LambdaFunction second = mock(LambdaFunction.class);
+        when(first.getFunctionName()).thenReturn("queued-first");
+        when(second.getFunctionName()).thenReturn("queued-second");
+        when(first.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:queued-first");
+        when(second.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:queued-second");
+        ContainerHandle firstHandle = new ContainerHandle("cid-queued-first", "queued-first", null,
+                ContainerState.WARM);
+        ContainerHandle secondHandle = new ContainerHandle("cid-queued-second", "queued-second", null,
+                ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(firstHandle, secondHandle);
+
+        ContainerHandle active = pool.acquire(first);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<ContainerHandle> waiting = executor.submit(() -> pool.acquire(second));
+            awaitPhysicalQueued(pool, 1);
+
+            // Releasing the first invocation makes an idle environment available, but it is
+            // for a different identity. The queued waiter retires it and cold-starts second.
+            pool.release(active);
+            assertSame(secondHandle, waiting.get(5, TimeUnit.SECONDS));
+            verify(containerLauncher).stop(firstHandle);
+            assertEquals(1, pool.status().total());
+            assertEquals(1, pool.status().active());
+            assertEquals(0, pool.status().idle());
+            pool.release(secondHandle);
+        } finally {
+            executor.shutdownNow();
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void fullBoundedProfileNeverExceedsPhysicalCapAcrossIdleFunctions() {
+        WarmPool pool = buildBoundedPool(4);
+        pool.init();
+
+        LambdaFunction first = mock(LambdaFunction.class);
+        LambdaFunction second = mock(LambdaFunction.class);
+        LambdaFunction third = mock(LambdaFunction.class);
+        LambdaFunction fourth = mock(LambdaFunction.class);
+        LambdaFunction fifth = mock(LambdaFunction.class);
+        LambdaFunction[] functions = {first, second, third, fourth, fifth};
+        for (int i = 0; i < functions.length; i++) {
+            when(functions[i].getFunctionName()).thenReturn("cap-fn-" + i);
+            when(functions[i].getFunctionArn()).thenReturn(
+                    "arn:aws:lambda:us-east-1:000000000000:function:cap-fn-" + i);
+        }
+
+        ContainerHandle[] handles = new ContainerHandle[functions.length];
+        for (int i = 0; i < handles.length; i++) {
+            handles[i] = new ContainerHandle("cid-cap-" + i, "cap-fn-" + i, null, ContainerState.WARM);
+        }
+        when(containerLauncher.launch(any())).thenReturn(handles[0], handles[1], handles[2], handles[3], handles[4]);
+
+        for (int i = 0; i < 4; i++) {
+            pool.release(pool.acquire(functions[i]));
+        }
+        assertEquals(4, pool.status().total());
+        assertEquals(0, pool.status().active());
+        assertEquals(4, pool.status().idle());
+
+        // The fifth identity cannot create a fifth Docker environment. The oldest idle
+        // environment is explicitly retired first, then its slot is reused for the cold start.
+        assertSame(handles[4], pool.acquire(functions[4]));
+        verify(containerLauncher).stop(handles[0]);
+        assertEquals(4, pool.status().total());
+        assertEquals(1, pool.status().active());
+        assertEquals(3, pool.status().idle());
+        pool.release(handles[4]);
+        assertEquals(4, pool.status().total());
+        assertEquals(4, pool.status().idle());
+        verify(containerLauncher, times(5)).launch(any());
+        pool.shutdown();
+    }
+
+    private static void awaitPhysicalQueued(WarmPool pool, int expected) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (pool.status().queued() < expected && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
+        assertEquals(expected, pool.status().queued());
     }
 
     @Test
@@ -365,9 +459,9 @@ class WarmPoolTest {
         when(containerLauncher.launch(any())).thenReturn(handle);
 
         assertSame(handle, pool.acquire(fn));
-        assertEquals(1, pool.status().inFlight());
+        assertEquals(1, pool.status().total());
         pool.destroyHandle(handle);
-        assertEquals(0, pool.status().inFlight());
+        assertEquals(0, pool.status().total());
         verify(containerLauncher).stop(handle);
         pool.shutdown();
     }
