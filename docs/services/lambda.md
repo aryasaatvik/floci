@@ -216,9 +216,11 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_INIT_IMAGE` | `busybox:1.36` | Init-container image that downloads function code (needs `sh`, `wget`, `unzip`) |
 
 When a physical cap is configured, admission status reports the live physical total split into
-active and retained-warm environments, plus queued waiters. Reusing a warm environment transfers
-its existing lifetime permit; a new environment is admitted only after capacity is available or
-an older idle environment is retired.
+active, retained-warm, and retiring environments, plus queued waiters. A retiring environment
+keeps its lifetime permit until its removal is confirmed, so inconclusive teardown cannot make
+the cap appear available while the old container may still exist. Reusing a warm environment
+transfers its existing lifetime permit; a new environment is admitted only after capacity is
+available or an older idle environment is retired.
 
 !!! note "Changing the container name prefix"
     Code volumes are resolved by name, and a Floci process only manages resources under its

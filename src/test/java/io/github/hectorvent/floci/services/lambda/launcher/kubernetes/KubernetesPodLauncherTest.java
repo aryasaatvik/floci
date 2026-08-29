@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.services.lambda.LambdaLayerService;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageResolver;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
@@ -323,6 +324,12 @@ class KubernetesPodLauncherTest {
         assertThat(launcher.isAlive(handleFor("pod-running"))).isTrue();
         assertThat(launcher.isAlive(handleFor("pod-pending"))).isFalse();
         assertThat(launcher.isAlive(handleFor("pod-absent"))).isFalse();
+        assertThat(launcher.liveness(handleFor("pod-running")))
+                .isEqualTo(LambdaRuntimeLauncher.Liveness.ALIVE);
+        assertThat(launcher.liveness(handleFor("pod-pending")))
+                .isEqualTo(LambdaRuntimeLauncher.Liveness.UNKNOWN);
+        assertThat(launcher.liveness(handleFor("pod-absent")))
+                .isEqualTo(LambdaRuntimeLauncher.Liveness.DEAD);
     }
 
     @Test

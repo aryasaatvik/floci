@@ -42,6 +42,13 @@ public class ContainerLifecycleManager {
 
     private static final Logger LOG = Logger.getLogger(ContainerLifecycleManager.class);
 
+    /** Lifecycle probe result that distinguishes a missing container from an inspect failure. */
+    public enum ContainerLiveness {
+        ALIVE,
+        DEAD,
+        UNKNOWN
+    }
+
     private final DockerClient dockerClient;
     private final ImageCacheService imageCacheService;
     private final ContainerDetector containerDetector;
@@ -556,28 +563,41 @@ public class ContainerLifecycleManager {
 
     /**
      * Returns whether the container is currently running. A missing container is treated as
-     * not-running; any other Docker error (e.g. an inspect timeout under daemon overload) is also
-     * treated as not-running, so a hung/dead container is not reused from the warm pool — a false
-     * negative merely triggers a clean cold-start, which is far cheaper than blocking until the
-     * function timeout.
+     * not-running; an inspect failure is also false for callers that only need a running-state
+     * answer. Teardown-sensitive callers must use {@link #containerLiveness(String)} so a probe
+     * failure cannot be mistaken for confirmed removal.
      *
      * @param containerId the container ID to inspect
-     * @return true only if the container exists and is reported as running; false on any error
+     * @return true only if the container exists and is reported as running; false for stopped,
+     * missing, or inconclusive probes. Use {@link #containerLiveness(String)} when teardown
+     * ownership must distinguish a confirmed missing container from an inspect failure.
      */
     public boolean isContainerRunning(String containerId) {
+        return containerLiveness(containerId) == ContainerLiveness.ALIVE;
+    }
+
+    /**
+     * Probes container ownership state without collapsing an inspect failure into "dead".
+     * A stopped container that still exists is {@link ContainerLiveness#UNKNOWN}: it is not
+     * reusable, but its physical resources cannot be released until removal is confirmed.
+     *
+     * @param containerId the container ID to inspect
+     * @return alive, confirmed missing, or inconclusive
+     */
+    public ContainerLiveness containerLiveness(String containerId) {
         try {
             InspectContainerResponse inspect = dockerClient.inspectContainerCmd(containerId).exec();
-            return Boolean.TRUE.equals(inspect.getState().getRunning());
+            return Boolean.TRUE.equals(inspect.getState().getRunning())
+                    ? ContainerLiveness.ALIVE
+                    : ContainerLiveness.UNKNOWN;
         } catch (NotFoundException e) {
-            return false;
+            return ContainerLiveness.DEAD;
         } catch (Exception e) {
-            // Treat an inspect failure/timeout as NOT running. Under Docker-daemon overload,
-            // returning true here caused the warm pool to "reuse" dead/hung containers, so the
-            // invocation blocked until the function timeout (~20-30s) every time. A false
-            // negative merely triggers a clean cold-start, which is far cheaper than a hang.
-            LOG.warnv("Liveness check failed for container {0}; treating as not running: {1}",
+            // A probe failure cannot establish that the environment was removed. The warm pool
+            // will retire it, but keeps its physical permit until a later reconciliation.
+            LOG.warnv("Liveness check failed for container {0}; state is unknown: {1}",
                     containerId, e.getMessage());
-            return false;
+            return ContainerLiveness.UNKNOWN;
         }
     }
 

@@ -166,14 +166,18 @@ public class WarmPool implements ContainerTeardown {
      */
     public ContainerHandle acquire(LambdaFunction fn) {
         String environmentKey = executionEnvironmentKey(fn);
+        // Start the bounded budget before touching pool state so all admission bookkeeping and
+        // every stale-handle retry share the same end-to-end deadline.
+        long admissionDeadlineNanos = environmentLimiter.admissionDeadlineNanos();
         boolean ephemeral = config != null && config.services().lambda().ephemeral();
         FunctionPoolKey poolKey = functionPoolKey(fn);
         PoolState poolState = poolStates.computeIfAbsent(poolKey, ignored -> new PoolState());
 
         while (true) {
-            LambdaEnvironmentLimiter.Admission<IdleLease> admission = environmentLimiter.acquire(
+            LambdaEnvironmentLimiter.Admission<IdleLease> admission = environmentLimiter.acquireUntil(
                     environmentKey,
-                    () -> ephemeral ? null : takeIdleOrRetire(poolState, environmentKey));
+                    () -> ephemeral ? null : takeIdleOrRetire(poolState, environmentKey),
+                    admissionDeadlineNanos);
 
             if (admission.reused()) {
                 IdleLease idleLease = admission.reusable();
@@ -184,16 +188,16 @@ public class WarmPool implements ContainerTeardown {
                             .getOrDefault(environmentKey, 0L);
                 }
                 if (!current) {
-                    stopAndRelease(idleLease);
+                    retireAfterAdmission(idleLease);
                     continue;
                 }
                 try {
-                    if (!isUsableWarmHandle(handle, fn)) {
-                        stopAndRelease(idleLease);
+                    if (isUsableWarmHandle(handle, fn) != LambdaRuntimeLauncher.Liveness.ALIVE) {
+                        retireAfterAdmission(idleLease);
                         continue;
                     }
                 } catch (RuntimeException | Error e) {
-                    stopAndRelease(idleLease);
+                    retireAfterAdmission(idleLease);
                     throw e;
                 }
                 Lease lease = null;
@@ -209,7 +213,7 @@ public class WarmPool implements ContainerTeardown {
                     if (lease != null) {
                         activeLeases.remove(handle, lease);
                     }
-                    stopAndRelease(idleLease);
+                    retireAfterAdmission(idleLease);
                     throw e;
                 }
             }
@@ -283,7 +287,7 @@ public class WarmPool implements ContainerTeardown {
         return null;
     }
 
-    private boolean isUsableWarmHandle(ContainerHandle handle, LambdaFunction fn) {
+    private LambdaRuntimeLauncher.Liveness isUsableWarmHandle(ContainerHandle handle, LambdaFunction fn) {
         // A container whose extension reported a fatal error is still *running*, so the
         // liveness probe alone would hand it back out. Skip it for the same reason a dead
         // one is skipped: it can no longer serve invocations correctly.
@@ -292,15 +296,45 @@ public class WarmPool implements ContainerTeardown {
         if (faulted) {
             LOG.infov("Discarding pooled container {0} for function {1}: an extension reported a fatal error",
                     handle.getContainerId(), fn.getFunctionName());
-            return false;
+            return LambdaRuntimeLauncher.Liveness.DEAD;
         }
-        boolean alive;
-        alive = lambdaRuntimeLauncher.isAlive(handle);
-        if (!alive) {
+        LambdaRuntimeLauncher.Liveness liveness = liveness(handle);
+        if (liveness == LambdaRuntimeLauncher.Liveness.DEAD) {
             LOG.infov("Discarding dead pooled container {0} for function {1}",
                     handle.getContainerId(), fn.getFunctionName());
+        } else if (liveness == LambdaRuntimeLauncher.Liveness.UNKNOWN) {
+            LOG.warnv("Discarding pooled container {0} for function {1}: liveness is unknown; "
+                            + "retaining physical ownership until teardown is confirmed",
+                    handle.getContainerId(), fn.getFunctionName());
         }
-        return alive;
+        return liveness;
+    }
+
+    /**
+     * Uses the ownership-safe tri-state probe. Mockito may return null from the new method in
+     * focused tests, so fall back to the old boolean probe there; real launchers implement
+     * {@link LambdaRuntimeLauncher#liveness(ContainerHandle)} directly.
+     */
+    private LambdaRuntimeLauncher.Liveness liveness(ContainerHandle handle) {
+        try {
+            LambdaRuntimeLauncher.Liveness observed = lambdaRuntimeLauncher.liveness(handle);
+            if (observed != null) {
+                return observed;
+            }
+            try {
+                return lambdaRuntimeLauncher.isAlive(handle)
+                        ? LambdaRuntimeLauncher.Liveness.ALIVE
+                        : LambdaRuntimeLauncher.Liveness.DEAD;
+            } catch (RuntimeException | Error probeFailure) {
+                LOG.warnv("Could not probe liveness for container {0}; state is unknown: {1}",
+                        handle.getContainerId(), probeFailure.getMessage());
+                return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+            }
+        } catch (RuntimeException | Error probeFailure) {
+            LOG.warnv("Could not probe liveness for container {0}; state is unknown: {1}",
+                    handle.getContainerId(), probeFailure.getMessage());
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        }
     }
 
     /**
@@ -661,13 +695,29 @@ public class WarmPool implements ContainerTeardown {
     }
 
     /**
+     * Retires a warm handle rejected during admission. Bounded admission must not spend its
+     * caller's deadline waiting for Docker/Kubernetes teardown; the unbounded default retains the
+     * historical synchronous cleanup behavior.
+     */
+    private void retireAfterAdmission(IdleLease lease) {
+        if (environmentLimiter.bounded()) {
+            scheduleRetirement(lease);
+        } else {
+            stopAndRelease(lease);
+        }
+    }
+
+    /**
      * Schedules a retirement selected while the limiter lock is held. Teardown is intentionally
      * outside that lock: Docker and Kubernetes stop operations can block, while other waiters must
      * continue to observe their own bounded deadlines.
      */
     private void scheduleRetirement(IdleLease lease) {
+        if (!registerRetirement(lease.handle(), lease.environmentPermit())) {
+            return;
+        }
         try {
-            retirementExecutor.execute(() -> stopAndRelease(lease));
+            retirementExecutor.execute(() -> attemptRetirement(lease.handle(), lease.environmentPermit()));
         } catch (RejectedExecutionException e) {
             // Retain the permit when the executor is already shutting down. Admission is closed
             // during the only normal path to this branch, and retaining ownership is safer than
@@ -686,11 +736,8 @@ public class WarmPool implements ContainerTeardown {
             stopQuietly(handle);
             return;
         }
-        if (stopConfirmed(handle)) {
-            pendingRetirements.remove(handle, permit);
-            permit.close();
-        } else {
-            retainAndRetryRetirement(handle, permit);
+        if (registerRetirement(handle, permit)) {
+            attemptRetirement(handle, permit);
         }
     }
 
@@ -708,6 +755,26 @@ public class WarmPool implements ContainerTeardown {
      * deletion failures, so a normal return alone cannot justify releasing a lifetime permit.
      * A failed or inconclusive probe retains ownership and is retried asynchronously.
      */
+    private boolean registerRetirement(ContainerHandle handle, LambdaEnvironmentLimiter.Permit permit) {
+        if (!environmentLimiter.markRetiring(permit)) {
+            return false;
+        }
+        return pendingRetirements.putIfAbsent(handle, permit) == null;
+    }
+
+    private void attemptRetirement(ContainerHandle handle, LambdaEnvironmentLimiter.Permit permit) {
+        if (pendingRetirements.get(handle) != permit) {
+            return;
+        }
+        if (stopConfirmed(handle)) {
+            if (pendingRetirements.remove(handle, permit)) {
+                permit.close();
+            }
+        } else {
+            submitRetirementRetry(handle, permit);
+        }
+    }
+
     private boolean stopConfirmed(ContainerHandle handle) {
         try {
             lambdaRuntimeLauncher.stop(handle);
@@ -718,12 +785,17 @@ public class WarmPool implements ContainerTeardown {
             // handle, in which case the lifetime permit is safe to release.
         }
         try {
-            boolean alive = lambdaRuntimeLauncher.isAlive(handle);
-            if (!alive) {
+            LambdaRuntimeLauncher.Liveness liveness = liveness(handle);
+            if (liveness == LambdaRuntimeLauncher.Liveness.DEAD) {
                 return true;
             }
-            LOG.warnv("Container {0} remains alive after teardown; retaining its physical permit",
-                    handle.getContainerId());
+            if (liveness == LambdaRuntimeLauncher.Liveness.ALIVE) {
+                LOG.warnv("Container {0} remains alive after teardown; retaining its physical permit",
+                        handle.getContainerId());
+            } else {
+                LOG.warnv("Could not confirm removal of container {0}; retaining its physical permit",
+                        handle.getContainerId());
+            }
         } catch (Exception probeFailure) {
             LOG.warnv("Could not reconcile container {0} after teardown; retaining its physical permit: {1}",
                     handle.getContainerId(), probeFailure.getMessage());
@@ -731,8 +803,8 @@ public class WarmPool implements ContainerTeardown {
         return false;
     }
 
-    private void retainAndRetryRetirement(ContainerHandle handle, LambdaEnvironmentLimiter.Permit permit) {
-        if (pendingRetirements.putIfAbsent(handle, permit) != null) {
+    private void submitRetirementRetry(ContainerHandle handle, LambdaEnvironmentLimiter.Permit permit) {
+        if (pendingRetirements.get(handle) != permit) {
             return;
         }
         try {
