@@ -305,6 +305,28 @@ class LambdaEnvironmentLimiterTest {
         assertEquals(0, limiter.status().total());
     }
 
+    @Test
+    void retiringPermitRemainsInPhysicalTotalButNotIdle() {
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 1);
+        LambdaEnvironmentLimiter.Permit permit = limiter.acquire("function");
+        limiter.markIdle(permit);
+
+        try {
+            assertTrue(limiter.markRetiring(permit));
+            assertEquals(1, limiter.status().total());
+            assertEquals(0, limiter.status().active());
+            assertEquals(0, limiter.status().idle());
+            assertEquals(1, limiter.status().retiring());
+            assertEquals(1, limiter.status("function").retiring());
+            assertEquals(0, limiter.status().available());
+        } finally {
+            permit.close();
+        }
+
+        assertEquals(0, limiter.status().total());
+        assertEquals(0, limiter.status().retiring());
+    }
+
     private static void awaitQueued(LambdaEnvironmentLimiter limiter, int expected) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         while (limiter.queuedCount() < expected && System.nanoTime() < deadline) {

@@ -44,6 +44,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
     private final Map<String, Integer> totalByKey = new HashMap<>();
     private final Map<String, Integer> activeByKey = new HashMap<>();
     private final Map<String, Integer> idleByKey = new HashMap<>();
+    private final Map<String, Integer> retiringByKey = new HashMap<>();
     private final Map<String, Integer> queuedByKey = new HashMap<>();
     private final AtomicLong granted = new AtomicLong();
     private final AtomicLong timedOut = new AtomicLong();
@@ -53,6 +54,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
     private int total;
     private int active;
     private int idle;
+    private int retiring;
     private boolean closed;
 
     private static final class Waiter {
@@ -108,6 +110,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
      * physical environment may be created.
      */
     public <T> Admission<T> acquire(String environmentKey, Supplier<T> reusable) {
+        long deadlineNanos = admissionDeadlineNanos();
         // Keep the opt-in nature of this limiter observable: without a physical cap there is
         // no wait to interrupt, so retain the historical non-blocking acquisition semantics
         // even if a caller arrives with a stale interrupt flag.
@@ -123,7 +126,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
             }
         }
         try {
-            return acquireInterruptibly(environmentKey, reusable);
+            return acquireInterruptiblyUntil(environmentKey, reusable, deadlineNanos);
         } catch (java.lang.InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new AdmissionInterruptedException(normalizeKey(environmentKey), e);
@@ -142,8 +145,29 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
     public <T> Admission<T> acquireInterruptibly(String environmentKey,
                                                   Supplier<T> reusable)
             throws java.lang.InterruptedException {
+        return acquireInterruptiblyUntil(environmentKey, reusable, admissionDeadlineNanos());
+    }
+
+    /**
+     * Package-private admission form used by the warm pool to carry one deadline through stale
+     * handle retries. The public methods create their deadline before taking the limiter lock;
+     * callers that retry after inspecting a warm handle must do the same once, outside the loop.
+     */
+    <T> Admission<T> acquireUntil(String environmentKey, Supplier<T> reusable, long deadlineNanos) {
+        try {
+            return acquireInterruptiblyUntil(environmentKey, reusable, deadlineNanos);
+        } catch (java.lang.InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AdmissionInterruptedException(normalizeKey(environmentKey), e);
+        }
+    }
+
+    /** Interruptible package-private form carrying an already computed absolute deadline. */
+    <T> Admission<T> acquireInterruptiblyUntil(String environmentKey,
+                                                Supplier<T> reusable,
+                                                long deadlineNanos)
+            throws java.lang.InterruptedException {
         String key = normalizeKey(environmentKey);
-        long startedAt = System.nanoTime();
         boolean locked = false;
         Waiter waiter = null;
         try {
@@ -151,7 +175,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
                 // A fair timed lock acquisition makes the admission deadline cover contention on
                 // the limiter itself. This matters because warm-pool callbacks are serialized
                 // here; they must be bounded just like condition waits.
-                if (!lock.tryLock(waitNanos, TimeUnit.NANOSECONDS)) {
+                if (!lock.tryLock(remainingNanos(deadlineNanos), TimeUnit.NANOSECONDS)) {
                     timedOut.incrementAndGet();
                     throw new AdmissionTimeoutException(key, maxPhysicalEnvironments, waitNanos);
                 }
@@ -162,7 +186,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
             }
             locked = true;
             ensureOpen(key);
-            if (bounded() && waitNanos > 0 && System.nanoTime() - startedAt >= waitNanos) {
+            if (bounded() && waitNanos > 0 && deadlineExpired(deadlineNanos)) {
                 timedOut.incrementAndGet();
                 throw new AdmissionTimeoutException(key, maxPhysicalEnvironments, waitNanos);
             }
@@ -181,6 +205,12 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
             increment(queuedByKey, key);
             while (true) {
                 ensureOpenOrRemove(waiter, key);
+                if (bounded() && deadlineExpired(deadlineNanos)) {
+                    removeWaiter(waiter);
+                    timedOut.incrementAndGet();
+                    changed.signalAll();
+                    throw new AdmissionTimeoutException(key, maxPhysicalEnvironments, waitNanos);
+                }
                 // Admission is globally FIFO. Only the head waiter may inspect a warm handle or
                 // consume a newly available physical slot; key-scoped bypass lets a stream of
                 // later identities starve an older waiter indefinitely.
@@ -204,7 +234,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
                     return Admission.permitted(grant(key));
                 }
 
-                long remaining = waitNanos - (System.nanoTime() - startedAt);
+                long remaining = remainingNanos(deadlineNanos);
                 if (remaining <= 0) {
                     removeWaiter(waiter);
                     timedOut.incrementAndGet();
@@ -309,9 +339,12 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
             if (permit.state == PermitState.ACTIVE) {
                 active--;
                 decrement(activeByKey, permit.key);
-            } else {
+            } else if (permit.state == PermitState.IDLE) {
                 idle--;
                 decrement(idleByKey, permit.key);
+            } else if (permit.state == PermitState.RETIRING) {
+                retiring--;
+                decrement(retiringByKey, permit.key);
             }
             total--;
             decrement(totalByKey, permit.key);
@@ -329,6 +362,29 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
     }
 
     /**
+     * Marks an environment as being retired. A retiring permit remains part of the physical
+     * total until teardown confirms that its container is gone; it is not reusable or counted as
+     * idle while that reconciliation is pending.
+     *
+     * @return false when the permit was already closed, otherwise true
+     */
+    boolean markRetiring(Permit permit) {
+        if (!(permit instanceof PermitImpl permitImpl) || permitImpl.owner != this) {
+            throw new IllegalArgumentException("Permit belongs to a different Lambda environment limiter");
+        }
+        lock.lock();
+        try {
+            if (permitImpl.state == PermitState.CLOSED) {
+                return false;
+            }
+            transitionUnsafe(permitImpl, PermitState.RETIRING);
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Marks a live environment as idle only if it still belongs to the acquisition that returned
      * it. Warm-pool publication and this state transition intentionally use separate locks to
      * avoid a pool/limiter lock inversion; the generation check closes the hand-off race where a
@@ -340,7 +396,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         }
         lock.lock();
         try {
-            if (permitImpl.state == PermitState.CLOSED
+            if (permitImpl.state != PermitState.ACTIVE
                     || permitImpl.generation != expectedGeneration) {
                 return false;
             }
@@ -360,6 +416,9 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         try {
             if (permitImpl.state == PermitState.CLOSED) {
                 throw new IllegalStateException("Cannot activate a closed Lambda environment permit");
+            }
+            if (permitImpl.state == PermitState.RETIRING) {
+                throw new IllegalStateException("Cannot activate a retiring Lambda environment permit");
             }
             transitionUnsafe(permitImpl, PermitState.ACTIVE);
             permitImpl.generation++;
@@ -385,19 +444,44 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         if (permitImpl.state == PermitState.CLOSED || permitImpl.state == target) {
             return;
         }
-        if (permitImpl.state == PermitState.ACTIVE) {
-            active--;
-            decrement(activeByKey, permitImpl.key);
-        } else {
-            idle--;
-            decrement(idleByKey, permitImpl.key);
+        if (permitImpl.state == PermitState.RETIRING) {
+            throw new IllegalStateException("Cannot transition a retiring Lambda environment permit");
         }
-        if (target == PermitState.ACTIVE) {
-            active++;
-            increment(activeByKey, permitImpl.key);
-        } else if (target == PermitState.IDLE) {
-            idle++;
-            increment(idleByKey, permitImpl.key);
+        switch (permitImpl.state) {
+            case ACTIVE -> {
+                active--;
+                decrement(activeByKey, permitImpl.key);
+            }
+            case IDLE -> {
+                idle--;
+                decrement(idleByKey, permitImpl.key);
+            }
+            case RETIRING -> {
+                retiring--;
+                decrement(retiringByKey, permitImpl.key);
+            }
+            case CLOSED -> {
+                return;
+            }
+        }
+        switch (target) {
+            case ACTIVE -> {
+                active++;
+                increment(activeByKey, permitImpl.key);
+            }
+            case IDLE -> {
+                idle++;
+                increment(idleByKey, permitImpl.key);
+            }
+            case RETIRING -> {
+                retiring++;
+                increment(retiringByKey, permitImpl.key);
+            }
+            case CLOSED -> {
+                // Closing is accounted for by release(), which removes the total permit.
+            }
+        }
+        if (target == PermitState.IDLE || target == PermitState.RETIRING) {
             changeSequence++;
         }
         permitImpl.state = target;
@@ -422,7 +506,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
     public Status status() {
         lock.lock();
         try {
-            return new Status(maxPhysicalEnvironments, total, active, idle, waiters.size(),
+            return new Status(maxPhysicalEnvironments, total, active, idle, retiring, waiters.size(),
                     availableUnsafe(), granted.get(), timedOut.get(), interrupted.get(), closed);
         } finally {
             lock.unlock();
@@ -435,7 +519,8 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         lock.lock();
         try {
             return new KeyStatus(key, totalByKey.getOrDefault(key, 0), activeByKey.getOrDefault(key, 0),
-                    idleByKey.getOrDefault(key, 0), queuedByKey.getOrDefault(key, 0));
+                    idleByKey.getOrDefault(key, 0), retiringByKey.getOrDefault(key, 0),
+                    queuedByKey.getOrDefault(key, 0));
         } finally {
             lock.unlock();
         }
@@ -483,8 +568,28 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         }
     }
 
+    /** Number of physical environments whose teardown has not yet been confirmed. */
+    public int retiringCount() {
+        lock.lock();
+        try {
+            return retiring;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public boolean bounded() {
         return maxPhysicalEnvironments > UNBOUNDED;
+    }
+
+    /** Returns one monotonic end-to-end deadline for a bounded acquisition attempt. */
+    long admissionDeadlineNanos() {
+        if (!bounded()) {
+            return Long.MAX_VALUE;
+        }
+        long now = System.nanoTime();
+        long deadline = now + waitNanos;
+        return deadline < now ? Long.MAX_VALUE : deadline;
     }
 
     @Override
@@ -503,6 +608,17 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
 
     private int availableUnsafe() {
         return bounded() ? Math.max(0, maxPhysicalEnvironments - total) : Integer.MAX_VALUE;
+    }
+
+    private static long remainingNanos(long deadlineNanos) {
+        if (deadlineNanos == Long.MAX_VALUE) {
+            return Long.MAX_VALUE;
+        }
+        return Math.max(0L, deadlineNanos - System.nanoTime());
+    }
+
+    private static boolean deadlineExpired(long deadlineNanos) {
+        return deadlineNanos != Long.MAX_VALUE && remainingNanos(deadlineNanos) <= 0;
     }
 
     private static String normalizeKey(String key) {
@@ -538,7 +654,7 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         void close();
     }
 
-    private enum PermitState { ACTIVE, IDLE, CLOSED }
+    private enum PermitState { ACTIVE, IDLE, RETIRING, CLOSED }
 
     /** Result of admission: either a warm resource reservation or a new-environment permit. */
     public record Admission<T>(T reusable, Permit permit) {
@@ -577,13 +693,14 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
     }
 
     /**
-     * Physical admission readback. {@code total} is always {@code active + idle}; queued is
-     * intentionally separate because waiters do not own a physical permit yet.
+     * Physical admission readback. {@code total} is always {@code active + idle + retiring};
+     * queued is intentionally separate because waiters do not own a physical permit yet.
      */
     public record Status(int configuredLimit,
                          int total,
                          int active,
                          int idle,
+                         int retiring,
                          int queued,
                          int available,
                          long granted,
@@ -596,7 +713,8 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
     }
 
     /** Physical admission readback scoped to one immutable execution-environment identity. */
-    public record KeyStatus(String environmentKey, int total, int active, int idle, int queued) {
+    public record KeyStatus(String environmentKey, int total, int active, int idle, int retiring,
+                             int queued) {
     }
 
     public static class AdmissionTimeoutException extends RuntimeException {

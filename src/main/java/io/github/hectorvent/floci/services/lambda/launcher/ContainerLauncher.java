@@ -594,7 +594,16 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * @return true if the container is still running
      */
     public boolean isAlive(ContainerHandle handle) {
-        return lifecycleManager.isContainerRunning(handle.getContainerId());
+        return liveness(handle) == Liveness.ALIVE;
+    }
+
+    @Override
+    public Liveness liveness(ContainerHandle handle) {
+        return switch (lifecycleManager.containerLiveness(handle.getContainerId())) {
+            case ALIVE -> Liveness.ALIVE;
+            case DEAD -> Liveness.DEAD;
+            case UNKNOWN -> Liveness.UNKNOWN;
+        };
     }
 
     // Cap concurrent code-volume POPULATES. Populating a large function's volume creates a helper

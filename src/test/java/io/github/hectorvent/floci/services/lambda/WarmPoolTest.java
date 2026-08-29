@@ -514,10 +514,50 @@ class WarmPoolTest {
             assertEquals(1, pool.status().total(),
                     "an unconfirmed stop must continue to own the physical slot");
             assertEquals(0, pool.status().active());
-            assertEquals(1, pool.status().idle(),
-                    "the retained permit remains a live, non-active environment");
+            assertEquals(0, pool.status().idle(),
+                    "the failed handle is retiring and must not be reported as reusable idle");
+            assertEquals(1, pool.status().retiring(),
+                    "the failed handle must remain explicitly accounted as retiring");
             assertEquals(0, pool.idleContainerCount(),
                     "the failed handle is no longer reusable while retirement is pending");
+            verify(containerLauncher, times(1)).launch(any());
+        } finally {
+            executor.shutdownNow();
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void unknownWarmLivenessRetainsPermitAndUsesOneEndToEndDeadline() throws Exception {
+        WarmPool pool = buildBoundedPool(1);
+        pool.init();
+
+        LambdaFunction fn = mock(LambdaFunction.class);
+        when(fn.getFunctionName()).thenReturn("unknown-warm");
+        when(fn.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:unknown-warm");
+        ContainerHandle stale = new ContainerHandle("cid-unknown-warm", "unknown-warm", null,
+                ContainerState.WARM);
+        ContainerHandle fresh = new ContainerHandle("cid-unknown-warm-fresh", "unknown-warm", null,
+                ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(stale, fresh);
+        when(containerLauncher.liveness(stale)).thenReturn(LambdaRuntimeLauncher.Liveness.UNKNOWN);
+        doThrow(new IllegalStateException("probe cannot confirm stop")).when(containerLauncher).stop(stale);
+
+        pool.release(pool.acquire(fn));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<ContainerHandle> waiting = executor.submit(() -> pool.acquire(fn));
+            awaitPhysicalQueued(pool, 1);
+
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class, () -> waiting.get(3, TimeUnit.SECONDS));
+            assertInstanceOf(LambdaEnvironmentLimiter.AdmissionTimeoutException.class, failure.getCause());
+            assertEquals(1, pool.status().total());
+            assertEquals(0, pool.status().active());
+            assertEquals(0, pool.status().idle());
+            assertEquals(1, pool.status().retiring());
+            assertEquals(0, pool.idleContainerCount());
             verify(containerLauncher, times(1)).launch(any());
         } finally {
             executor.shutdownNow();

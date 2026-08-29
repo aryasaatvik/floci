@@ -302,19 +302,29 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
 
     @Override
     public boolean isAlive(ContainerHandle handle) {
+        return liveness(handle) == Liveness.ALIVE;
+    }
+
+    @Override
+    public Liveness liveness(ContainerHandle handle) {
         try {
             var pod = client.getPod(namespace(), handle.getContainerId()).orElse(null);
-            return pod != null
-                    && "Running".equals(pod.path("status").path("phase").asText(null))
-                    && isAbsent(pod.path("metadata").path("deletionTimestamp"));
+            if (pod == null) {
+                return Liveness.DEAD;
+            }
+            if ("Running".equals(pod.path("status").path("phase").asText(null))
+                    && isAbsent(pod.path("metadata").path("deletionTimestamp"))) {
+                return Liveness.ALIVE;
+            }
+            return Liveness.UNKNOWN;
         } catch (Exception e) {
             // A missing pod comes back as empty above; reaching here means the API server
             // itself was unreachable. Unlike docker's local socket the API server is remote,
-            // so a transient blip must not read as "dead" — that would cull the whole warm
-            // pool at once. Assume alive; a genuinely dead pod fails the next invocation.
-            LOG.warnv("Liveness probe for pod {0} could not reach the API server, assuming "
-                    + "alive: {1}", handle.getContainerId(), e.getMessage());
-            return true;
+            // so a transient blip must not read as "dead" — that would release its physical
+            // ownership while it may still be terminating. The warm pool retires it and retries.
+            LOG.warnv("Liveness probe for pod {0} could not reach the API server; state is "
+                    + "unknown: {1}", handle.getContainerId(), e.getMessage());
+            return Liveness.UNKNOWN;
         }
     }
 
