@@ -209,6 +209,26 @@ class LambdaEnvironmentLimiterTest {
         }
     }
 
+    @Test
+    void staleIdleTransitionCannotDemoteAReactivatedEnvironment() {
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 1);
+        LambdaEnvironmentLimiter.Permit permit = limiter.acquire("function");
+        try {
+            long firstGeneration = limiter.markActive(permit);
+            assertTrue(limiter.markIdle(permit, firstGeneration));
+
+            long secondGeneration = limiter.markActive(permit);
+            assertTrue(secondGeneration > firstGeneration);
+            assertFalse(limiter.markIdle(permit, firstGeneration));
+            assertEquals(1, limiter.status().total());
+            assertEquals(1, limiter.status().active());
+            assertEquals(0, limiter.status().idle());
+        } finally {
+            permit.close();
+        }
+        assertEquals(0, limiter.status().total());
+    }
+
     private static void awaitQueued(LambdaEnvironmentLimiter limiter, int expected) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         while (limiter.queuedCount() < expected && System.nanoTime() < deadline) {
