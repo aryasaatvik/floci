@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.lifecycle;
 
 import io.github.hectorvent.floci.core.common.ServiceRegistry;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHook;
+import io.github.hectorvent.floci.services.lambda.LambdaEnvironmentLimiter;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.Path;
@@ -27,16 +28,19 @@ public class EmulatorInfoController {
 
     private final StorageFactory storageFactory;
     private final Instance<Resettable> resettables;
+    private final LambdaEnvironmentLimiter environmentLimiter;
 
     @Inject
     public EmulatorInfoController(ServiceRegistry serviceRegistry,
                                   InitLifecycleState initLifecycleState,
                                   StorageFactory storageFactory,
-                                  Instance<Resettable> resettables) {
+                                  Instance<Resettable> resettables,
+                                  LambdaEnvironmentLimiter environmentLimiter) {
         this.serviceRegistry = serviceRegistry;
         this.initLifecycleState = initLifecycleState;
         this.storageFactory = storageFactory;
         this.resettables = resettables;
+        this.environmentLimiter = environmentLimiter;
         this.version = resolveVersion();
     }
 
@@ -84,6 +88,25 @@ public class EmulatorInfoController {
         return Response.ok(Map.of()).build();
     }
 
+    /**
+     * Returns physical Lambda admission without exposing invocation or function payloads.
+     * This is intentionally available on both Floci-compatible lifecycle prefixes so local
+     * tooling can inspect the same state regardless of which health namespace it already uses.
+     */
+    @GET
+    @Path("/capacity")
+    public Response capacity() {
+        LambdaEnvironmentLimiter.Status status = environmentLimiter.status();
+        return Response.ok(new CapacityResponse(
+                status.configuredLimit(),
+                status.total(),
+                status.active(),
+                status.idle(),
+                status.retiring(),
+                status.queued(),
+                status.available())).build();
+    }
+
     @GET
     @Path("/config")
     public Response config() {
@@ -116,5 +139,15 @@ public class EmulatorInfoController {
             return env;
         }
         return "dev";
+    }
+
+    /** Stable, intentionally small JSON schema for local physical admission readback. */
+    public record CapacityResponse(int configuredLimit,
+                                   int total,
+                                   int active,
+                                   int idle,
+                                   int retiring,
+                                   int queued,
+                                   int available) {
     }
 }
