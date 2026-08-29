@@ -5,6 +5,7 @@ import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.DockerResourceIdentity;
+import io.github.hectorvent.floci.services.lambda.LambdaEnvironmentLimiter;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.BeforeEach;
@@ -17,12 +18,23 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.ArgumentMatchers.anyString;
 
 @ExtendWith(MockitoExtension.class)
 class LambdaDockerResourceReconcilerTest {
@@ -33,14 +45,21 @@ class LambdaDockerResourceReconcilerTest {
     @Mock EmulatorConfig config;
     @Mock EmulatorConfig.ServicesConfig services;
     @Mock EmulatorConfig.LambdaServiceConfig lambda;
+    @Mock LambdaEnvironmentLimiter environmentLimiter;
+    @Mock LambdaEnvironmentLimiter.Permit recoveredPermit;
 
     private LambdaDockerResourceReconciler reconciler;
 
     @BeforeEach
     void setUp() {
         when(resourceIdentity.instanceId()).thenReturn("test-instance");
+        org.mockito.Mockito.lenient().when(environmentLimiter.reserveRecovered(anyString()))
+                .thenReturn(recoveredPermit);
+        org.mockito.Mockito.lenient().when(lifecycleManager.containerLiveness(
+                        org.mockito.ArgumentMatchers.anyString()))
+                .thenReturn(ContainerLifecycleManager.ContainerLiveness.DEAD);
         reconciler = new LambdaDockerResourceReconciler(
-                lifecycleManager, functionStore, resourceIdentity, config);
+                lifecycleManager, functionStore, resourceIdentity, config, environmentLimiter);
     }
 
     @Test
@@ -103,6 +122,62 @@ class LambdaDockerResourceReconcilerTest {
 
         verify(lifecycleManager, times(1)).stopAndRemove("execution", null);
         verify(lifecycleManager, times(1)).removeVolume("stale");
+    }
+
+    @Test
+    void recoveredExecutionConsumesPhysicalCapacityBeforeTeardownCompletes() throws Exception {
+        when(config.services()).thenReturn(services);
+        when(services.lambda()).thenReturn(lambda);
+        when(lambda.maxPhysicalEnvironments()).thenReturn(OptionalInt.of(1));
+        when(lambda.physicalEnvironmentWaitTimeoutSeconds()).thenReturn(1);
+        when(lambda.containerNamePrefix()).thenReturn(Optional.empty());
+
+        LambdaEnvironmentLimiter realLimiter = new LambdaEnvironmentLimiter(config);
+        LambdaDockerResourceReconciler realReconciler = new LambdaDockerResourceReconciler(
+                lifecycleManager, functionStore, resourceIdentity, config, realLimiter);
+        Container execution = container("execution", ownedLabels(LambdaDockerResourceLabels.EXECUTION));
+        when(lifecycleManager.listContainersByLabels(
+                LambdaDockerResourceLabels.owner("test-instance")))
+                .thenReturn(List.of(execution));
+        when(functionStore.listAllAccounts()).thenReturn(List.of());
+        when(lifecycleManager.listVolumesByLabels(
+                LambdaDockerResourceLabels.ownedCodeVolume("test-instance")))
+                .thenReturn(List.of());
+
+        CountDownLatch stopStarted = new CountDownLatch(1);
+        CountDownLatch allowStop = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            stopStarted.countDown();
+            assertTrue(allowStop.await(2, TimeUnit.SECONDS), "reconciliation teardown did not proceed");
+            return null;
+        }).when(lifecycleManager).stopAndRemove("execution", null);
+        when(lifecycleManager.containerLiveness("execution"))
+                .thenReturn(ContainerLifecycleManager.ContainerLiveness.DEAD);
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> reconciliation = executor.submit(realReconciler::reconcileAtStartup);
+            assertTrue(stopStarted.await(2, TimeUnit.SECONDS), "reconciliation did not reserve execution");
+            assertEquals(1, realLimiter.status().total());
+            assertEquals(1, realLimiter.status().retiring());
+            assertEquals(0, realLimiter.status().available());
+
+            Future<LambdaEnvironmentLimiter.Permit> waiter = executor.submit(
+                    () -> realLimiter.acquireInterruptibly("new-environment"));
+            awaitQueued(realLimiter, 1);
+            assertFalse(waiter.isDone(), "new admission bypassed recovered physical ownership");
+
+            allowStop.countDown();
+            reconciliation.get(2, TimeUnit.SECONDS);
+            LambdaEnvironmentLimiter.Permit permit = waiter.get(2, TimeUnit.SECONDS);
+            permit.close();
+            assertEquals(0, realLimiter.status().total());
+        } finally {
+            allowStop.countDown();
+            executor.shutdownNow();
+            realReconciler.shutdown();
+            realLimiter.close();
+        }
     }
 
     @Test
@@ -176,5 +251,13 @@ class LambdaDockerResourceReconcilerTest {
         function.setCodeSha256(codeSha);
         function.setCodeLocalPath("/tmp/" + name);
         return function;
+    }
+
+    private static void awaitQueued(LambdaEnvironmentLimiter limiter, int expected) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        while (limiter.queuedCount() < expected && System.nanoTime() < deadline) {
+            Thread.sleep(1);
+        }
+        assertEquals(expected, limiter.queuedCount(), "expected waiter was not queued");
     }
 }

@@ -76,7 +76,8 @@ public final class ContainerStorageHelper {
     private static final java.util.Set<String> RESERVED_LABEL_KEYS =
             java.util.Set.of(
                     "floci", "floci_emulator", "floci_namespace",
-                    "io.floci.managed", "io.floci.instance", "io.floci.service", "io.floci.kind");
+                    "io.floci.managed", "io.floci.instance", "io.floci.service", "io.floci.kind",
+                    "io.floci.lambda.function", "io.floci.lambda.code", "io.floci.lambda.environment");
 
     /**
      * Labels applied to every emulator-created container and volume:

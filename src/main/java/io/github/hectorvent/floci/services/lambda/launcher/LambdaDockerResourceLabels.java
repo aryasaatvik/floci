@@ -14,6 +14,7 @@ final class LambdaDockerResourceLabels {
     static final String KIND = "io.floci.kind";
     static final String FUNCTION = "io.floci.lambda.function";
     static final String CODE = "io.floci.lambda.code";
+    static final String ENVIRONMENT = "io.floci.lambda.environment";
 
     static final String EXECUTION = "execution";
     static final String CODE_VOLUME = "code";
@@ -40,6 +41,7 @@ final class LambdaDockerResourceLabels {
         labels.put(KIND, kind);
         labels.put(FUNCTION, function.getFunctionName());
         labels.put(CODE, ContainerLauncher.codeIdentity(function));
+        labels.put(ENVIRONMENT, ContainerLauncher.executionEnvironmentKey(function));
         return Map.copyOf(labels);
     }
 }

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
+import io.github.hectorvent.floci.services.lambda.launcher.ContainerLauncher;
 import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
@@ -768,11 +769,7 @@ public class WarmPool implements ContainerTeardown {
     }
 
     private static String executionEnvironmentKey(LambdaFunction fn) {
-        String functionArn = fn.getFunctionArn();
-        if (functionArn != null && !functionArn.isBlank()) {
-            return functionArn;
-        }
-        return accountId(fn) + ":" + fn.getFunctionName() + ":" + fn.getVersion();
+        return ContainerLauncher.executionEnvironmentKey(fn);
     }
 
     private static FunctionPoolKey functionPoolKey(LambdaFunction fn) {

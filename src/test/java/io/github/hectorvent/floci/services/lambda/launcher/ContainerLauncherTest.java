@@ -234,17 +234,19 @@ class ContainerLauncherTest {
         launcher.launch(fn);
 
         ContainerSpec spec = captureRealContainerSpec();
-        assertEquals(Map.of(
-                "io.floci", "aws",
-                "io.floci.service", "lambda",
-                "io.floci.resource-id", "standard-fn",
-                "io.floci.account", "222222222222",
-                "io.floci.region", "us-west-2",
-                "io.floci.managed", "true",
-                "io.floci.instance", "test-instance",
-                "io.floci.kind", "execution",
-                "io.floci.lambda.function", "standard-fn",
-                "io.floci.lambda.code", "0"),
+        assertEquals(Map.ofEntries(
+                Map.entry("io.floci", "aws"),
+                Map.entry("io.floci.service", "lambda"),
+                Map.entry("io.floci.resource-id", "standard-fn"),
+                Map.entry("io.floci.account", "222222222222"),
+                Map.entry("io.floci.region", "us-west-2"),
+                Map.entry("io.floci.managed", "true"),
+                Map.entry("io.floci.instance", "test-instance"),
+                Map.entry("io.floci.kind", "execution"),
+                Map.entry("io.floci.lambda.function", "standard-fn"),
+                Map.entry("io.floci.lambda.code", "0"),
+                Map.entry("io.floci.lambda.environment",
+                        "arn:aws:lambda:us-west-2:222222222222:function:standard-fn")),
                 spec.labels());
     }
 

@@ -325,6 +325,33 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         return new PermitImpl(this, key);
     }
 
+    /**
+     * Reserves a physical environment discovered during process-start reconciliation.
+     *
+     * <p>The returned permit starts in {@code RETIRING}: a recovered Docker container is not
+     * attached to this process's warm pool and therefore cannot be reused safely. Keeping the
+     * permit until Docker confirms removal makes a process restart fail closed: a surviving
+     * container counts against the same physical cap as a newly launched one, even while its
+     * ownership cleanup is retried.
+     */
+    public Permit reserveRecovered(String environmentKey) {
+        String key = normalizeKey(environmentKey);
+        lock.lock();
+        try {
+            ensureOpen(key);
+            PermitImpl permit = new PermitImpl(this, key);
+            permit.state = PermitState.RETIRING;
+            total++;
+            retiring++;
+            increment(totalByKey, key);
+            increment(retiringByKey, key);
+            changeSequence++;
+            return permit;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private void release(PermitImpl permit) {
         lock.lock();
         try {

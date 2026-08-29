@@ -1097,6 +1097,31 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 : codeIdentity;
     }
 
+    /**
+     * Stable physical-environment identity shared by Docker ownership labels and admission
+     * readback. Prefer the Lambda ARN when available; the fallback keeps account and version
+     * boundaries explicit for test fixtures and partially hydrated persisted functions.
+     */
+    public static String executionEnvironmentKey(LambdaFunction fn) {
+        String functionArn = fn.getFunctionArn();
+        if (functionArn != null && !functionArn.isBlank()) {
+            return functionArn;
+        }
+        String accountId = fn.getAccountId();
+        if (accountId == null || accountId.isBlank()) {
+            accountId = "000000000000";
+        }
+        String functionName = fn.getFunctionName();
+        if (functionName == null || functionName.isBlank()) {
+            functionName = "unknown";
+        }
+        String version = fn.getVersion();
+        if (version == null || version.isBlank()) {
+            version = "$LATEST";
+        }
+        return accountId + ":" + functionName + ":" + version;
+    }
+
     private static String shortIdentityHash(String instanceId) {
         try {
             byte[] digest = MessageDigest.getInstance("SHA-256")
