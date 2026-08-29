@@ -1743,8 +1743,9 @@ public interface EmulatorConfig {
         /**
          * Optional hard ceiling for physical Lambda execution environments. When absent,
          * Floci keeps its historical unbounded Docker-environment behavior; when present,
-         * invocation admission is queued fairly behind this number of concurrently running
-         * environments. The logical Lambda concurrency limit remains independent.
+         * live environments (active plus retained warm). When all environments are busy,
+         * invocation admission is queued fairly behind this number. The logical Lambda
+         * concurrency limit remains independent.
          *
          * <p>Env var: FLOCI_SERVICES_LAMBDA_MAX_PHYSICAL_ENVIRONMENTS
          */

@@ -199,7 +199,7 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_CODE_PATH` | `./data/lambda-code` | Directory where Lambda ZIP files are stored |
 | `FLOCI_SERVICES_LAMBDA_POLL_INTERVAL_MS` | `1000` | Event-source mapping poll interval (milliseconds) |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS` | `300` | Idle container shutdown timeout (seconds) |
-| `FLOCI_SERVICES_LAMBDA_MAX_PHYSICAL_ENVIRONMENTS` | *(unset)* | Optional cap on concurrently running Docker execution environments. When unset, the historical unbounded behavior is preserved |
+| `FLOCI_SERVICES_LAMBDA_MAX_PHYSICAL_ENVIRONMENTS` | *(unset)* | Optional cap on live Docker execution environments (active plus retained warm). When unset, the historical unbounded behavior is preserved |
 | `FLOCI_SERVICES_LAMBDA_PHYSICAL_ENVIRONMENT_WAIT_TIMEOUT_SECONDS` | `15` | Maximum fair-queue wait for a physical environment slot when the cap is enabled; this wait is separate from the function timeout |
 | `FLOCI_SERVICES_LAMBDA_REGION_CONCURRENCY_LIMIT` | `1000` | Maximum concurrent executions per region |
 | `FLOCI_SERVICES_LAMBDA_UNRESERVED_CONCURRENCY_MIN` | `100` | Minimum unreserved capacity `PutFunctionConcurrency` must leave |
@@ -214,6 +214,11 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_LABELS` | *(unset)* | Extra pod labels as comma-separated `key=value` entries |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_FLOCI_ADDRESS` | *(unset)* | Host/IP pods use to reach Floci; auto-detected when Floci runs in-cluster |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_INIT_IMAGE` | `busybox:1.36` | Init-container image that downloads function code (needs `sh`, `wget`, `unzip`) |
+
+When a physical cap is configured, admission status reports the live physical total split into
+active and retained-warm environments, plus queued waiters. Reusing a warm environment transfers
+its existing lifetime permit; a new environment is admitted only after capacity is available or
+an older idle environment is retired.
 
 !!! note "Changing the container name prefix"
     Code volumes are resolved by name, and a Floci process only manages resources under its
