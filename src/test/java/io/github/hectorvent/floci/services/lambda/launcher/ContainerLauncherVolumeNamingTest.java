@@ -85,6 +85,20 @@ class ContainerLauncherVolumeNamingTest {
     }
 
     @Test
+    void executionEnvironmentKeyUsesArnOrStableFallback() {
+        LambdaFunction arnFunction = fnWithSha("arn-fn", "sha");
+        arnFunction.setFunctionArn("arn:aws:lambda:us-east-1:111111111111:function:arn-fn");
+        assertEquals(arnFunction.getFunctionArn(),
+                ContainerLauncher.executionEnvironmentKey(arnFunction));
+
+        LambdaFunction fallbackFunction = fnWithSha("fallback-fn", "sha");
+        fallbackFunction.setAccountId("222222222222");
+        fallbackFunction.setVersion("7");
+        assertEquals("222222222222:fallback-fn:7",
+                ContainerLauncher.executionEnvironmentKey(fallbackFunction));
+    }
+
+    @Test
     void fallsBackToLastModifiedWhenShaMissing() {
         LambdaFunction nullSha = new LambdaFunction();
         nullSha.setFunctionName("no-sha-fn");
