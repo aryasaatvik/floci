@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -53,10 +54,19 @@ public class WarmPool implements ContainerTeardown {
     private final int maxPoolSizePerFunction;
     private final ConcurrentHashMap<FunctionPoolKey, PoolState> poolStates = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<ContainerHandle, Lease> activeLeases = new ConcurrentHashMap<>();
+    /** Permits retained for handles whose teardown has not yet been confirmed. */
+    private final ConcurrentHashMap<ContainerHandle, LambdaEnvironmentLimiter.Permit> pendingRetirements
+            = new ConcurrentHashMap<>();
     private final AtomicInteger idleContainerCount = new AtomicInteger();
     private final AtomicLong idleSequence = new AtomicLong();
+    private final ExecutorService retirementExecutor = Executors.newCachedThreadPool(
+            r -> { Thread t = new Thread(r, "warm-pool-retirement"); t.setDaemon(true); return t; });
     private final ScheduledExecutorService evictionScheduler = Executors.newSingleThreadScheduledExecutor(
             r -> { Thread t = new Thread(r, "warm-pool-evictor"); t.setDaemon(true); return t; });
+    /** Serializes the terminal draining transition with warm-pool publication. */
+    private final Object lifecycleLock = new Object();
+    /** Once set, every active release is a retirement, never a warm-pool publication. */
+    private volatile boolean draining;
 
     private record FunctionPoolKey(String accountId, String region, String functionName) {
     }
@@ -131,15 +141,22 @@ public class WarmPool implements ContainerTeardown {
      */
     @Override
     public void stopManagedContainers() {
+        synchronized (lifecycleLock) {
+            draining = true;
+        }
         environmentLimiter.close();
         drainAll();
     }
 
     @PreDestroy
     void shutdown() {
+        synchronized (lifecycleLock) {
+            draining = true;
+        }
         evictionScheduler.shutdownNow();
         environmentLimiter.close();
         drainAll();
+        retirementExecutor.shutdownNow();
     }
 
     /**
@@ -232,8 +249,9 @@ public class WarmPool implements ContainerTeardown {
 
     /**
      * Removes one matching idle handle while the limiter serializes admission. If the cap is full
-     * and no matching handle exists, the oldest unrelated idle lease is stopped synchronously;
-     * its permit is then released before the limiter grants the waiting caller a new slot.
+     * and no matching handle exists, the oldest unrelated idle lease is removed from the pool and
+     * retired asynchronously. Its permit remains owned until teardown confirms that the handle
+     * is gone, so the limiter never grants a slot for a container that may still be running.
      */
     private IdleLease takeIdleOrRetire(PoolState poolState, String environmentKey) {
         synchronized (poolState) {
@@ -255,11 +273,11 @@ public class WarmPool implements ContainerTeardown {
             if (victim != null) {
                 LOG.infov("Retiring idle container {0} to admit a new Lambda environment",
                         victim.handle().getContainerId());
-                // This callback executes under the limiter's reentrant admission lock. Closing
-                // the victim's permit re-enters that lock, releases capacity immediately, and
-                // lets the current FIFO waiter receive the slot without re-queuing behind later
-                // callers.
-                stopAndRelease(victim);
+                // This callback executes under the limiter's admission lock. Docker teardown can
+                // block well beyond the admission budget, so never perform it inline here. The
+                // permit is closed by the retirement task only after stop has returned (or a
+                // failed stop has been reconciled as no longer alive).
+                scheduleRetirement(victim);
             }
         }
         return null;
@@ -337,6 +355,13 @@ public class WarmPool implements ContainerTeardown {
     public void release(ContainerHandle handle) {
         Lease lease = activeLeases.remove(handle);
         boolean ephemeral = config != null && config.services().lambda().ephemeral();
+        // Shutdown closes admission and drains already-idle handles, but an invocation can still
+        // finish afterward. The draining flag is checked again under the pool-state lock below so
+        // this late release can never publish a live handle after drainAll() has taken its snapshot.
+        if (draining) {
+            stopAndRelease(handle, lease);
+            return;
+        }
         // An extension reporting init/exit error is fatal to the execution environment in real
         // AWS. RuntimeApiServer already refuses new work at that point; the container is torn down
         // here rather than at fault time so the invocation that was in flight when the extension
@@ -370,22 +395,37 @@ public class WarmPool implements ContainerTeardown {
 
         boolean stale;
         boolean returned;
-        synchronized (lease.poolState()) {
-            stale = lease.epoch() != lease.poolState().epochByEnvironment
-                    .getOrDefault(lease.environmentKey(), 0L);
-            returned = !stale && idleSize(lease.poolState()) < maxPoolSizePerFunction;
-            if (returned) {
-                handle.setState(ContainerState.WARM);
-                handle.touchLastUsed();
-                lease.poolState().idleByEnvironment
-                        .computeIfAbsent(lease.environmentKey(), ignored -> new ArrayDeque<>())
-                        .addFirst(new IdleLease(handle, lease.environmentPermit(), lease.epoch(),
-                                lease.generation(),
-                                idleSequence.incrementAndGet()));
-                idleContainerCount.incrementAndGet();
+        boolean releaseDuringDrain;
+        // Hold lifecycleLock while publishing the idle handle. A concurrent managed drain either
+        // wins first (and this release retires directly) or snapshots the newly published handle
+        // after setting draining=true; it cannot miss a late release between those states.
+        synchronized (lifecycleLock) {
+            releaseDuringDrain = draining;
+            if (releaseDuringDrain) {
+                stale = false;
+                returned = false;
+            } else {
+                synchronized (lease.poolState()) {
+                    stale = lease.epoch() != lease.poolState().epochByEnvironment
+                            .getOrDefault(lease.environmentKey(), 0L);
+                    returned = !stale && idleSize(lease.poolState()) < maxPoolSizePerFunction;
+                    if (returned) {
+                        handle.setState(ContainerState.WARM);
+                        handle.touchLastUsed();
+                        lease.poolState().idleByEnvironment
+                                .computeIfAbsent(lease.environmentKey(), ignored -> new ArrayDeque<>())
+                                .addFirst(new IdleLease(handle, lease.environmentPermit(), lease.epoch(),
+                                        lease.generation(),
+                                        idleSequence.incrementAndGet()));
+                        idleContainerCount.incrementAndGet();
+                    }
+                }
             }
         }
-        if (stale) {
+        if (releaseDuringDrain) {
+            LOG.debugv("Warm pool is draining; stopping late container {0}", handle.getContainerId());
+            stopAndRelease(handle, lease);
+        } else if (stale) {
             LOG.debugv("Pool was invalidated while container {0} was busy; stopping it",
                     handle.getContainerId());
             stopAndRelease(handle, lease);
@@ -620,29 +660,106 @@ public class WarmPool implements ContainerTeardown {
         return size;
     }
 
-    private void stopAndRelease(IdleLease lease) {
+    /**
+     * Schedules a retirement selected while the limiter lock is held. Teardown is intentionally
+     * outside that lock: Docker and Kubernetes stop operations can block, while other waiters must
+     * continue to observe their own bounded deadlines.
+     */
+    private void scheduleRetirement(IdleLease lease) {
         try {
-            stopQuietly(lease.handle());
-        } finally {
-            lease.environmentPermit().close();
+            retirementExecutor.execute(() -> stopAndRelease(lease));
+        } catch (RejectedExecutionException e) {
+            // Retain the permit when the executor is already shutting down. Admission is closed
+            // during the only normal path to this branch, and retaining ownership is safer than
+            // allowing a still-running handle to fall outside the physical cap.
+            LOG.warnv("Could not schedule retirement for container {0}; retaining its physical permit",
+                    lease.handle().getContainerId());
         }
     }
 
+    private void stopAndRelease(IdleLease lease) {
+        stopAndRelease(lease.handle(), lease.environmentPermit());
+    }
+
     private void stopAndRelease(ContainerHandle handle, LambdaEnvironmentLimiter.Permit permit) {
-        try {
+        if (permit == null) {
             stopQuietly(handle);
-        } finally {
+            return;
+        }
+        if (stopConfirmed(handle)) {
+            pendingRetirements.remove(handle, permit);
             permit.close();
+        } else {
+            retainAndRetryRetirement(handle, permit);
         }
     }
 
     private void stopAndRelease(ContainerHandle handle, Lease lease) {
-        try {
+        if (lease == null) {
             stopQuietly(handle);
-        } finally {
-            if (lease != null) {
-                lease.environmentPermit().close();
+            return;
+        }
+        stopAndRelease(handle, lease.environmentPermit());
+    }
+
+    /**
+     * Teardown is confirmed only when the launcher reports the handle is no longer alive. The
+     * launcher interface is void-returning and concrete implementations may absorb Docker/API
+     * deletion failures, so a normal return alone cannot justify releasing a lifetime permit.
+     * A failed or inconclusive probe retains ownership and is retried asynchronously.
+     */
+    private boolean stopConfirmed(ContainerHandle handle) {
+        try {
+            lambdaRuntimeLauncher.stop(handle);
+        } catch (Exception stopFailure) {
+            LOG.warnv("Error stopping container {0}: {1}", handle.getContainerId(),
+                    stopFailure.getMessage());
+            // Continue to the liveness probe: a stop that throws can still have removed the
+            // handle, in which case the lifetime permit is safe to release.
+        }
+        try {
+            boolean alive = lambdaRuntimeLauncher.isAlive(handle);
+            if (!alive) {
+                return true;
             }
+            LOG.warnv("Container {0} remains alive after teardown; retaining its physical permit",
+                    handle.getContainerId());
+        } catch (Exception probeFailure) {
+            LOG.warnv("Could not reconcile container {0} after teardown; retaining its physical permit: {1}",
+                    handle.getContainerId(), probeFailure.getMessage());
+        }
+        return false;
+    }
+
+    private void retainAndRetryRetirement(ContainerHandle handle, LambdaEnvironmentLimiter.Permit permit) {
+        if (pendingRetirements.putIfAbsent(handle, permit) != null) {
+            return;
+        }
+        try {
+            retirementExecutor.execute(() -> retryRetirement(handle, permit));
+        } catch (RejectedExecutionException e) {
+            // Keep the entry and permit. A later reconciler/lifecycle pass can inspect the
+            // ownership; freeing it here would make the physical cap a lie.
+            LOG.warnv("Could not schedule retirement retry for container {0}; retaining its physical permit",
+                    handle.getContainerId());
+        }
+    }
+
+    private void retryRetirement(ContainerHandle handle, LambdaEnvironmentLimiter.Permit permit) {
+        try {
+            while (pendingRetirements.get(handle) == permit) {
+                if (stopConfirmed(handle)) {
+                    if (pendingRetirements.remove(handle, permit)) {
+                        permit.close();
+                    }
+                    return;
+                }
+                Thread.sleep(250);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            // Leave ownership in pendingRetirements. shutdownNow() may interrupt this worker,
+            // but it must not turn an unconfirmed teardown into available capacity.
         }
     }
 

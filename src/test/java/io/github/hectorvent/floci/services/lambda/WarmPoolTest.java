@@ -14,15 +14,20 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import java.util.OptionalInt;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -138,6 +143,7 @@ class WarmPoolTest {
         // Re-acquire both: h2 was released last so it's at the front of the deque
         ContainerHandle toDestroy = pool.acquire(fn);
         ContainerHandle survivor = pool.acquire(fn);
+        lenient().when(containerLauncher.isAlive(toDestroy)).thenReturn(false);
 
         pool.destroyHandle(toDestroy);
         verify(containerLauncher, times(1)).stop(toDestroy);
@@ -176,6 +182,7 @@ class WarmPoolTest {
         // containerLauncher.launch should only have been called once (cold start)
         verify(containerLauncher, times(1)).launch(any());
 
+        lenient().when(containerLauncher.isAlive(handle)).thenReturn(false);
         pool.shutdown();
     }
 
@@ -239,11 +246,15 @@ class WarmPoolTest {
         assertSame(pooled, seeded);
         pool.release(seeded);
 
-        // The extension now faults while the container sits idle in the pool. isAlive() is stubbed
-        // true so the container is unambiguously still running: if the faulted check were removed,
-        // this handle would be considered reusable and handed straight back out.
+        // The extension now faults while the container sits idle in the pool. It is discarded
+        // before the liveness probe, so a failed stop can still be reconciled as gone below.
         when(server.isFaulted()).thenReturn(true);
-        lenient().when(containerLauncher.isAlive(pooled)).thenReturn(true);
+        doAnswer(invocation -> {
+            pooled.setState(ContainerState.STOPPED);
+            return null;
+        }).when(containerLauncher).stop(pooled);
+        lenient().when(containerLauncher.isAlive(pooled))
+                .thenAnswer(invocation -> pooled.getState() != ContainerState.STOPPED);
 
         ContainerHandle acquired = pool.acquire(fn);
         assertSame(fresh, acquired);
@@ -289,6 +300,8 @@ class WarmPoolTest {
 
         pool.release(reacquiredLatest);
         pool.release(reacquiredVersion);
+        lenient().when(containerLauncher.isAlive(latestHandle)).thenReturn(false);
+        lenient().when(containerLauncher.isAlive(versionHandle)).thenReturn(false);
         pool.shutdown();
     }
 
@@ -320,6 +333,8 @@ class WarmPoolTest {
 
         pool.release(handleA);
         pool.release(handleB);
+        lenient().when(containerLauncher.isAlive(handleA)).thenReturn(false);
+        lenient().when(containerLauncher.isAlive(handleB)).thenReturn(false);
         pool.shutdown();
     }
 
@@ -438,6 +453,126 @@ class WarmPoolTest {
         pool.shutdown();
     }
 
+    @Test
+    void lateActiveReleaseAfterManagedDrainIsRetiredInsteadOfRepooling() {
+        WarmPool pool = buildBoundedPool(1);
+        pool.init();
+
+        LambdaFunction fn = mock(LambdaFunction.class);
+        when(fn.getFunctionName()).thenReturn("late-drain-fn");
+        when(fn.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:late-drain-fn");
+        ContainerHandle handle = new ContainerHandle("cid-late-drain", "late-drain-fn", null,
+                ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(handle);
+
+        ContainerHandle active = pool.acquire(fn);
+        assertEquals(1, pool.status().active());
+
+        pool.stopManagedContainers();
+        pool.release(active);
+
+        verify(containerLauncher).stop(handle);
+        assertEquals(0, pool.status().total());
+        assertEquals(0, pool.status().active());
+        assertEquals(0, pool.status().idle());
+        assertEquals(0, pool.idleContainerCount());
+        pool.shutdown();
+    }
+
+    @Test
+    void failedRetirementRetainsPhysicalPermitAndPreventsCapOverrun() throws Exception {
+        WarmPool pool = buildBoundedPool(1);
+        pool.init();
+
+        LambdaFunction firstFn = mock(LambdaFunction.class);
+        LambdaFunction secondFn = mock(LambdaFunction.class);
+        when(firstFn.getFunctionName()).thenReturn("failed-retirement-first");
+        when(secondFn.getFunctionName()).thenReturn("failed-retirement-second");
+        when(firstFn.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:failed-retirement-first");
+        when(secondFn.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:failed-retirement-second");
+        ContainerHandle first = new ContainerHandle("cid-failed-retirement-first",
+                "failed-retirement-first", null, ContainerState.WARM);
+        ContainerHandle second = new ContainerHandle("cid-failed-retirement-second",
+                "failed-retirement-second", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(first, second);
+
+        pool.release(pool.acquire(firstFn));
+        doThrow(new IllegalStateException("simulated stop failure")).when(containerLauncher).stop(first);
+        when(containerLauncher.isAlive(first)).thenReturn(true);
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<ContainerHandle> waiting = executor.submit(() -> pool.acquire(secondFn));
+            awaitPhysicalQueued(pool, 1);
+
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class, () -> waiting.get(3, TimeUnit.SECONDS));
+            assertInstanceOf(LambdaEnvironmentLimiter.AdmissionTimeoutException.class, failure.getCause());
+            assertEquals(1, pool.status().total(),
+                    "an unconfirmed stop must continue to own the physical slot");
+            assertEquals(0, pool.status().active());
+            assertEquals(1, pool.status().idle(),
+                    "the retained permit remains a live, non-active environment");
+            assertEquals(0, pool.idleContainerCount(),
+                    "the failed handle is no longer reusable while retirement is pending");
+            verify(containerLauncher, times(1)).launch(any());
+        } finally {
+            executor.shutdownNow();
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void blockedRetirementDoesNotHoldLimiterLockPastAdmissionDeadline() throws Exception {
+        WarmPool pool = buildBoundedPool(1);
+        pool.init();
+
+        LambdaFunction firstFn = mock(LambdaFunction.class);
+        LambdaFunction secondFn = mock(LambdaFunction.class);
+        when(firstFn.getFunctionName()).thenReturn("blocked-retirement-first");
+        when(secondFn.getFunctionName()).thenReturn("blocked-retirement-second");
+        when(firstFn.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:blocked-retirement-first");
+        when(secondFn.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:blocked-retirement-second");
+        ContainerHandle first = new ContainerHandle("cid-blocked-retirement-first",
+                "blocked-retirement-first", null, ContainerState.WARM);
+        ContainerHandle second = new ContainerHandle("cid-blocked-retirement-second",
+                "blocked-retirement-second", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(first, second);
+        pool.release(pool.acquire(firstFn));
+
+        CountDownLatch stopStarted = new CountDownLatch(1);
+        CountDownLatch allowStop = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            stopStarted.countDown();
+            try {
+                assertTrue(allowStop.await(5, TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return null;
+        }).when(containerLauncher).stop(first);
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<ContainerHandle> waiting = executor.submit(() -> pool.acquire(secondFn));
+            assertTrue(stopStarted.await(2, TimeUnit.SECONDS), "victim retirement did not start");
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class, () -> waiting.get(2, TimeUnit.SECONDS));
+            assertInstanceOf(LambdaEnvironmentLimiter.AdmissionTimeoutException.class, failure.getCause());
+            assertEquals(1, pool.status().total(),
+                    "blocked teardown must retain ownership while the waiter times out");
+        } finally {
+            allowStop.countDown();
+            executor.shutdownNow();
+            pool.shutdown();
+        }
+    }
+
     private static void awaitPhysicalQueued(WarmPool pool, int expected) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
         while (pool.status().queued() < expected && System.nanoTime() < deadline) {
@@ -492,6 +627,7 @@ class WarmPoolTest {
         pool.release(pool.acquire(latest));
         pool.release(pool.acquire(version));
 
+        lenient().when(containerLauncher.isAlive(latestHandle)).thenReturn(false);
         pool.drainEnvironment(latest);
 
         verify(containerLauncher).stop(latestHandle);

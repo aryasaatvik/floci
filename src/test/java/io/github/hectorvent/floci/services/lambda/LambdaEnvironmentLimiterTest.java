@@ -9,6 +9,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -109,6 +110,81 @@ class LambdaEnvironmentLimiterTest {
             }
         } finally {
             holder.close();
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    void earlierDifferentKeyWaiterCannotBeBypassedByWarmReuse() throws Exception {
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 10);
+        LambdaEnvironmentLimiter.Permit holder = limiter.acquire("holder");
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        CountDownLatch firstGranted = new CountDownLatch(1);
+        CountDownLatch allowFirstToFinish = new CountDownLatch(1);
+        AtomicBoolean secondWarmCallbackCalled = new AtomicBoolean();
+        try {
+            Future<?> first = workers.submit(() -> {
+                try (LambdaEnvironmentLimiter.Permit ignored = limiter.acquireInterruptibly("first")) {
+                    firstGranted.countDown();
+                    assertTrue(allowFirstToFinish.await(5, TimeUnit.SECONDS));
+                }
+                return null;
+            });
+            awaitQueued(limiter, 1);
+
+            Future<LambdaEnvironmentLimiter.Admission<String>> second = workers.submit(() ->
+                    limiter.acquireInterruptibly("second", () -> {
+                        secondWarmCallbackCalled.set(true);
+                        return "warm-second";
+                    }));
+            awaitQueued(limiter, 2);
+
+            assertFalse(secondWarmCallbackCalled.get(),
+                    "later waiter's warm callback ran before the FIFO head completed");
+
+            holder.close();
+            assertTrue(firstGranted.await(2, TimeUnit.SECONDS), "first waiter was not granted");
+
+            allowFirstToFinish.countDown();
+            first.get(2, TimeUnit.SECONDS);
+            assertEquals("warm-second", second.get(2, TimeUnit.SECONDS).reusable());
+        } finally {
+            allowFirstToFinish.countDown();
+            holder.close();
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    void lockAcquisitionConsumesAdmissionDeadline() throws Exception {
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 1);
+        CountDownLatch callbackStarted = new CountDownLatch(1);
+        CountDownLatch releaseCallback = new CountDownLatch(1);
+        ExecutorService workers = Executors.newSingleThreadExecutor();
+        try {
+            Future<LambdaEnvironmentLimiter.Admission<String>> slow = workers.submit(() ->
+                    limiter.acquireInterruptibly("slow", () -> {
+                        callbackStarted.countDown();
+                        try {
+                            assertTrue(releaseCallback.await(5, TimeUnit.SECONDS));
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(e);
+                        }
+                        return null;
+                    }));
+            assertTrue(callbackStarted.await(2, TimeUnit.SECONDS), "limiter callback did not start");
+
+            LambdaEnvironmentLimiter.AdmissionTimeoutException timeout = assertThrows(
+                    LambdaEnvironmentLimiter.AdmissionTimeoutException.class,
+                    () -> limiter.acquireInterruptibly("blocked", () -> null));
+            assertEquals("blocked", timeout.environmentKey());
+            releaseCallback.countDown();
+            slow.get(2, TimeUnit.SECONDS).permit().close();
+            assertEquals(0, limiter.status().queued(), "lock wait must not leave a queue entry");
+            assertEquals(1, limiter.status().timedOut());
+        } finally {
+            releaseCallback.countDown();
             workers.shutdownNow();
         }
     }
