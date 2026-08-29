@@ -19,12 +19,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.OptionalInt;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -63,6 +65,9 @@ public class WarmPool implements ContainerTeardown {
             r -> { Thread t = new Thread(r, "warm-pool-retirement"); t.setDaemon(true); return t; });
     private final ScheduledExecutorService evictionScheduler = Executors.newSingleThreadScheduledExecutor(
             r -> { Thread t = new Thread(r, "warm-pool-evictor"); t.setDaemon(true); return t; });
+    /** Bounds lifecycle probes so an overloaded Docker/API server cannot consume admission budget. */
+    private final ExecutorService livenessProbeExecutor = Executors.newCachedThreadPool(
+            r -> { Thread t = new Thread(r, "warm-pool-liveness"); t.setDaemon(true); return t; });
     /** Serializes the terminal draining transition with warm-pool publication. */
     private final Object lifecycleLock = new Object();
     /** Once set, every active release is a retirement, never a warm-pool publication. */
@@ -155,6 +160,7 @@ public class WarmPool implements ContainerTeardown {
         }
         evictionScheduler.shutdownNow();
         environmentLimiter.close();
+        livenessProbeExecutor.shutdownNow();
         drainAll();
         retirementExecutor.shutdownNow();
     }
@@ -192,7 +198,8 @@ public class WarmPool implements ContainerTeardown {
                     continue;
                 }
                 try {
-                    if (isUsableWarmHandle(handle, fn) != LambdaRuntimeLauncher.Liveness.ALIVE) {
+                    if (isUsableWarmHandle(handle, fn, admissionDeadlineNanos)
+                            != LambdaRuntimeLauncher.Liveness.ALIVE) {
                         retireAfterAdmission(idleLease);
                         continue;
                     }
@@ -287,7 +294,9 @@ public class WarmPool implements ContainerTeardown {
         return null;
     }
 
-    private LambdaRuntimeLauncher.Liveness isUsableWarmHandle(ContainerHandle handle, LambdaFunction fn) {
+    private LambdaRuntimeLauncher.Liveness isUsableWarmHandle(ContainerHandle handle,
+                                                               LambdaFunction fn,
+                                                               long admissionDeadlineNanos) {
         // A container whose extension reported a fatal error is still *running*, so the
         // liveness probe alone would hand it back out. Skip it for the same reason a dead
         // one is skipped: it can no longer serve invocations correctly.
@@ -298,7 +307,7 @@ public class WarmPool implements ContainerTeardown {
                     handle.getContainerId(), fn.getFunctionName());
             return LambdaRuntimeLauncher.Liveness.DEAD;
         }
-        LambdaRuntimeLauncher.Liveness liveness = liveness(handle);
+        LambdaRuntimeLauncher.Liveness liveness = liveness(handle, admissionDeadlineNanos);
         if (liveness == LambdaRuntimeLauncher.Liveness.DEAD) {
             LOG.infov("Discarding dead pooled container {0} for function {1}",
                     handle.getContainerId(), fn.getFunctionName());
@@ -333,6 +342,51 @@ public class WarmPool implements ContainerTeardown {
         } catch (RuntimeException | Error probeFailure) {
             LOG.warnv("Could not probe liveness for container {0}; state is unknown: {1}",
                     handle.getContainerId(), probeFailure.getMessage());
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        }
+    }
+
+    /**
+     * Probes a warm handle without allowing Docker or a remote Kubernetes API to consume the
+     * caller's entire admission budget. Cancellation is best effort at the underlying client,
+     * but the invocation thread always returns by the absolute deadline and UNKNOWN retains the
+     * physical permit until teardown reconciliation succeeds.
+     */
+    private LambdaRuntimeLauncher.Liveness liveness(ContainerHandle handle, long deadlineNanos) {
+        long remaining = environmentLimiter.remainingNanos(deadlineNanos);
+        if (remaining <= 0) {
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        }
+        if (!environmentLimiter.bounded()) {
+            return liveness(handle);
+        }
+
+        Future<LambdaRuntimeLauncher.Liveness> probe;
+        try {
+            probe = livenessProbeExecutor.submit(() -> liveness(handle));
+        } catch (RejectedExecutionException e) {
+            LOG.warnv("Could not schedule liveness probe for container {0}; state is unknown: {1}",
+                    handle.getContainerId(), e.getMessage());
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        }
+        try {
+            LambdaRuntimeLauncher.Liveness observed = probe.get(remaining, TimeUnit.NANOSECONDS);
+            // A fast probe may complete exactly as the budget expires. Do not activate a warm
+            // handle after its acquisition deadline, even if the observation itself was ALIVE.
+            return environmentLimiter.remainingNanos(deadlineNanos) > 0 && observed != null
+                    ? observed : LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        } catch (TimeoutException e) {
+            probe.cancel(true);
+            LOG.warnv("Liveness probe for container {0} exceeded the admission deadline; state is unknown",
+                    handle.getContainerId());
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        } catch (InterruptedException e) {
+            probe.cancel(true);
+            Thread.currentThread().interrupt();
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        } catch (ExecutionException e) {
+            LOG.warnv("Liveness probe for container {0} failed; state is unknown: {1}",
+                    handle.getContainerId(), e.getCause() == null ? e.getMessage() : e.getCause().getMessage());
             return LambdaRuntimeLauncher.Liveness.UNKNOWN;
         }
     }

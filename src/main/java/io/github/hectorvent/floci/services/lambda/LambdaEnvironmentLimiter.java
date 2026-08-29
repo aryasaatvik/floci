@@ -592,6 +592,12 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         return deadline < now ? Long.MAX_VALUE : deadline;
     }
 
+    /** Returns the time remaining for a previously-created bounded admission deadline. */
+    long remainingNanos(long deadlineNanos) {
+        return deadlineNanos == Long.MAX_VALUE ? Long.MAX_VALUE
+                : Math.max(0L, deadlineNanos - System.nanoTime());
+    }
+
     @Override
     public void close() {
         lock.lock();
@@ -610,15 +616,8 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         return bounded() ? Math.max(0, maxPhysicalEnvironments - total) : Integer.MAX_VALUE;
     }
 
-    private static long remainingNanos(long deadlineNanos) {
-        if (deadlineNanos == Long.MAX_VALUE) {
-            return Long.MAX_VALUE;
-        }
-        return Math.max(0L, deadlineNanos - System.nanoTime());
-    }
-
-    private static boolean deadlineExpired(long deadlineNanos) {
-        return deadlineNanos != Long.MAX_VALUE && remainingNanos(deadlineNanos) <= 0;
+    private boolean deadlineExpired(long deadlineNanos) {
+        return remainingNanos(deadlineNanos) <= 0;
     }
 
     private static String normalizeKey(String key) {

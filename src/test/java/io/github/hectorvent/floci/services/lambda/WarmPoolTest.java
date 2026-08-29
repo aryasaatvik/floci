@@ -18,6 +18,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -560,6 +561,67 @@ class WarmPoolTest {
             assertEquals(0, pool.idleContainerCount());
             verify(containerLauncher, times(1)).launch(any());
         } finally {
+            executor.shutdownNow();
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void blockingWarmLivenessProbeReturnsByAdmissionDeadline() throws Exception {
+        WarmPool pool = buildBoundedPool(1);
+        pool.init();
+
+        LambdaFunction fn = mock(LambdaFunction.class);
+        when(fn.getFunctionName()).thenReturn("blocking-probe");
+        when(fn.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:blocking-probe");
+        ContainerHandle stale = new ContainerHandle("cid-blocking-probe", "blocking-probe", null,
+                ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(stale);
+
+        CountDownLatch probeStarted = new CountDownLatch(1);
+        CountDownLatch releaseProbe = new CountDownLatch(1);
+        AtomicInteger probeCount = new AtomicInteger();
+        when(containerLauncher.liveness(stale)).thenAnswer(invocation -> {
+            if (probeCount.getAndIncrement() == 0) {
+                probeStarted.countDown();
+                // Simulate an inspect call that ignores interruption. WarmPool must still return
+                // by its deadline, while the cancelled probe retains the permit as UNKNOWN.
+                while (true) {
+                    try {
+                        releaseProbe.await();
+                        return LambdaRuntimeLauncher.Liveness.ALIVE;
+                    } catch (InterruptedException ignored) {
+                        // Keep waiting until the test releases the simulated daemon call.
+                    }
+                }
+            }
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        });
+
+        pool.release(pool.acquire(fn));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        long startedAt = System.nanoTime();
+        try {
+            Future<ContainerHandle> waiting = executor.submit(() -> pool.acquire(fn));
+            assertTrue(probeStarted.await(2, TimeUnit.SECONDS),
+                    "blocking liveness probe did not start");
+
+            ExecutionException failure = assertThrows(
+                    ExecutionException.class, () -> waiting.get(3, TimeUnit.SECONDS));
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+            assertInstanceOf(LambdaEnvironmentLimiter.AdmissionTimeoutException.class,
+                    failure.getCause());
+            assertTrue(elapsedMillis < 2500,
+                    "warm admission exceeded its one-second budget: " + elapsedMillis + "ms");
+            assertEquals(1, pool.status().total());
+            assertEquals(0, pool.status().active());
+            assertEquals(0, pool.status().idle());
+            assertEquals(1, pool.status().retiring());
+            assertEquals(0, pool.idleContainerCount());
+            verify(containerLauncher, times(1)).launch(any());
+        } finally {
+            releaseProbe.countDown();
             executor.shutdownNow();
             pool.shutdown();
         }
