@@ -10,6 +10,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -97,6 +100,29 @@ class EmulatorInfoControllerIntegrationTest {
     @ValueSource(strings = {"/_floci/diagnose", "/_localstack/diagnose"})
     void diagnose_returns200OnBothPaths(String path) {
         given().when().get(path).then().statusCode(200).contentType("application/json");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/_floci/capacity", "/_localstack/capacity"})
+    void capacity_returnsPhysicalAdmissionSchemaOnBothPaths(String path) throws Exception {
+        String body = given()
+            .when().get(path)
+            .then()
+                .statusCode(200)
+                .contentType("application/json")
+                .extract().body().asString();
+
+        JsonNode tree = MAPPER.readTree(body);
+        assertEquals(Set.of("configuredLimit", "total", "active", "idle", "retiring", "queued", "available"),
+                tree.properties().stream().map(Map.Entry::getKey).collect(Collectors.toSet()));
+
+        for (String field : Set.of("configuredLimit", "total", "active", "idle", "retiring", "queued", "available")) {
+            assertTrue(tree.get(field).isInt(), field + " must be an integer");
+            assertTrue(tree.get(field).asInt() >= 0, field + " must not be negative");
+        }
+        assertEquals(tree.get("total").asInt(),
+                tree.get("active").asInt() + tree.get("idle").asInt() + tree.get("retiring").asInt(),
+                "total must account for active, idle, and retiring environments");
     }
 
     @ParameterizedTest
