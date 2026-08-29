@@ -33,6 +33,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -582,21 +583,33 @@ class WarmPoolTest {
         CountDownLatch probeStarted = new CountDownLatch(1);
         CountDownLatch releaseProbe = new CountDownLatch(1);
         AtomicInteger probeCount = new AtomicInteger();
+        AtomicInteger concurrentProbes = new AtomicInteger();
+        AtomicInteger maxConcurrentProbes = new AtomicInteger();
         when(containerLauncher.liveness(stale)).thenAnswer(invocation -> {
+            int concurrent = concurrentProbes.incrementAndGet();
+            maxConcurrentProbes.accumulateAndGet(concurrent, Math::max);
             if (probeCount.getAndIncrement() == 0) {
                 probeStarted.countDown();
                 // Simulate an inspect call that ignores interruption. WarmPool must still return
                 // by its deadline, while the cancelled probe retains the permit as UNKNOWN.
-                while (true) {
-                    try {
-                        releaseProbe.await();
-                        return LambdaRuntimeLauncher.Liveness.ALIVE;
-                    } catch (InterruptedException ignored) {
-                        // Keep waiting until the test releases the simulated daemon call.
+                try {
+                    while (true) {
+                        try {
+                            releaseProbe.await();
+                            return LambdaRuntimeLauncher.Liveness.ALIVE;
+                        } catch (InterruptedException ignored) {
+                            // Keep waiting until the test releases the simulated daemon call.
+                        }
                     }
+                } finally {
+                    concurrentProbes.decrementAndGet();
                 }
             }
-            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+            try {
+                return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+            } finally {
+                concurrentProbes.decrementAndGet();
+            }
         });
 
         pool.release(pool.acquire(fn));
@@ -614,12 +627,19 @@ class WarmPoolTest {
                     failure.getCause());
             assertTrue(elapsedMillis < 2500,
                     "warm admission exceeded its one-second budget: " + elapsedMillis + "ms");
+            assertEquals(1, probeCount.get(),
+                    "retirement must not start a second probe while the first is unresolved");
+            assertEquals(1, maxConcurrentProbes.get(),
+                    "a handle must have at most one concurrent liveness probe");
+            verify(containerLauncher, never()).stop(stale);
             assertEquals(1, pool.status().total());
             assertEquals(0, pool.status().active());
             assertEquals(0, pool.status().idle());
             assertEquals(1, pool.status().retiring());
             assertEquals(0, pool.idleContainerCount());
             verify(containerLauncher, times(1)).launch(any());
+            releaseProbe.countDown();
+            verify(containerLauncher, timeout(2000)).stop(stale);
         } finally {
             releaseProbe.countDown();
             executor.shutdownNow();

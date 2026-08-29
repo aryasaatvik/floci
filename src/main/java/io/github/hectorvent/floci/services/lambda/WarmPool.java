@@ -18,6 +18,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalInt;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -49,6 +50,12 @@ public class WarmPool implements ContainerTeardown {
     private static final Logger LOG = Logger.getLogger(WarmPool.class);
 
     private static final int DEFAULT_MAX_POOL_SIZE = Math.max(4, Runtime.getRuntime().availableProcessors());
+    /**
+     * Gives a newly scheduled retirement probe a small bounded window to observe the normal,
+     * fast Docker response. An unresolved probe remains shared and blocks a second stop/probe;
+     * the window must stay finite because the Docker client may be blocked for several minutes.
+     */
+    private static final long RETIREMENT_PROBE_WAIT_MILLIS = 100;
 
     private final LambdaRuntimeLauncher lambdaRuntimeLauncher;
     private final EmulatorConfig config;
@@ -58,6 +65,9 @@ public class WarmPool implements ContainerTeardown {
     private final ConcurrentHashMap<ContainerHandle, Lease> activeLeases = new ConcurrentHashMap<>();
     /** Permits retained for handles whose teardown has not yet been confirmed. */
     private final ConcurrentHashMap<ContainerHandle, LambdaEnvironmentLimiter.Permit> pendingRetirements
+            = new ConcurrentHashMap<>();
+    /** One lifecycle probe per handle; retained until a cancelled underlying call actually exits. */
+    private final ConcurrentHashMap<ContainerHandle, LivenessProbe> livenessProbes
             = new ConcurrentHashMap<>();
     private final AtomicInteger idleContainerCount = new AtomicInteger();
     private final AtomicLong idleSequence = new AtomicLong();
@@ -93,6 +103,18 @@ public class WarmPool implements ContainerTeardown {
                          String environmentKey,
                          LambdaEnvironmentLimiter.Permit environmentPermit,
                          long generation) {
+    }
+
+    private static final class LivenessProbe {
+        private final CompletableFuture<LambdaRuntimeLauncher.Liveness> result = new CompletableFuture<>();
+        private volatile Future<?> task;
+
+        private void cancel() {
+            Future<?> currentTask = task;
+            if (currentTask != null) {
+                currentTask.cancel(true);
+            }
+        }
     }
 
     @Inject
@@ -161,6 +183,7 @@ public class WarmPool implements ContainerTeardown {
         evictionScheduler.shutdownNow();
         environmentLimiter.close();
         livenessProbeExecutor.shutdownNow();
+        livenessProbes.values().forEach(LivenessProbe::cancel);
         drainAll();
         retirementExecutor.shutdownNow();
     }
@@ -324,7 +347,7 @@ public class WarmPool implements ContainerTeardown {
      * focused tests, so fall back to the old boolean probe there; real launchers implement
      * {@link LambdaRuntimeLauncher#liveness(ContainerHandle)} directly.
      */
-    private LambdaRuntimeLauncher.Liveness liveness(ContainerHandle handle) {
+    private LambdaRuntimeLauncher.Liveness probeLiveness(ContainerHandle handle) {
         try {
             LambdaRuntimeLauncher.Liveness observed = lambdaRuntimeLauncher.liveness(handle);
             if (observed != null) {
@@ -347,6 +370,40 @@ public class WarmPool implements ContainerTeardown {
     }
 
     /**
+     * Starts or joins the one in-flight lifecycle probe for a handle. The map entry is removed
+     * only by the probe task's finally block, after the underlying launcher call has actually
+     * returned; a Future cancellation that is ignored by Docker therefore cannot permit a second
+     * probe to overlap it.
+     */
+    private LivenessProbe livenessProbe(ContainerHandle handle) {
+        LivenessProbe existing = livenessProbes.get(handle);
+        if (existing != null) {
+            return existing;
+        }
+
+        LivenessProbe candidate = new LivenessProbe();
+        existing = livenessProbes.putIfAbsent(handle, candidate);
+        if (existing != null) {
+            return existing;
+        }
+        try {
+            candidate.task = livenessProbeExecutor.submit(() -> {
+                try {
+                    candidate.result.complete(probeLiveness(handle));
+                } catch (Throwable probeFailure) {
+                    candidate.result.completeExceptionally(probeFailure);
+                } finally {
+                    livenessProbes.remove(handle, candidate);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            candidate.result.complete(LambdaRuntimeLauncher.Liveness.UNKNOWN);
+            livenessProbes.remove(handle, candidate);
+        }
+        return candidate;
+    }
+
+    /**
      * Probes a warm handle without allowing Docker or a remote Kubernetes API to consume the
      * caller's entire admission budget. Cancellation is best effort at the underlying client,
      * but the invocation thread always returns by the absolute deadline and UNKNOWN retains the
@@ -358,35 +415,75 @@ public class WarmPool implements ContainerTeardown {
             return LambdaRuntimeLauncher.Liveness.UNKNOWN;
         }
         if (!environmentLimiter.bounded()) {
-            return liveness(handle);
+            return probeLiveness(handle);
         }
 
-        Future<LambdaRuntimeLauncher.Liveness> probe;
         try {
-            probe = livenessProbeExecutor.submit(() -> liveness(handle));
-        } catch (RejectedExecutionException e) {
+            LivenessProbe sharedProbe = livenessProbe(handle);
+            return awaitLivenessProbe(handle, sharedProbe, deadlineNanos, remaining);
+        } catch (RuntimeException e) {
             LOG.warnv("Could not schedule liveness probe for container {0}; state is unknown: {1}",
                     handle.getContainerId(), e.getMessage());
             return LambdaRuntimeLauncher.Liveness.UNKNOWN;
         }
+    }
+
+    private LambdaRuntimeLauncher.Liveness awaitLivenessProbe(ContainerHandle handle,
+                                                               LivenessProbe probe,
+                                                               long deadlineNanos,
+                                                               long remaining) {
         try {
-            LambdaRuntimeLauncher.Liveness observed = probe.get(remaining, TimeUnit.NANOSECONDS);
+            LambdaRuntimeLauncher.Liveness observed = probe.result.get(remaining, TimeUnit.NANOSECONDS);
             // A fast probe may complete exactly as the budget expires. Do not activate a warm
             // handle after its acquisition deadline, even if the observation itself was ALIVE.
             return environmentLimiter.remainingNanos(deadlineNanos) > 0 && observed != null
                     ? observed : LambdaRuntimeLauncher.Liveness.UNKNOWN;
         } catch (TimeoutException e) {
-            probe.cancel(true);
+            // Keep the shared state until the underlying call exits. Docker-java can ignore the
+            // interruption, and removing it here would let retirement start a second inspect.
+            probe.cancel();
             LOG.warnv("Liveness probe for container {0} exceeded the admission deadline; state is unknown",
                     handle.getContainerId());
             return LambdaRuntimeLauncher.Liveness.UNKNOWN;
         } catch (InterruptedException e) {
-            probe.cancel(true);
+            probe.cancel();
             Thread.currentThread().interrupt();
             return LambdaRuntimeLauncher.Liveness.UNKNOWN;
         } catch (ExecutionException e) {
             LOG.warnv("Liveness probe for container {0} failed; state is unknown: {1}",
                     handle.getContainerId(), e.getCause() == null ? e.getMessage() : e.getCause().getMessage());
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        }
+    }
+
+    /**
+     * Reads a shared probe for retirement, allowing a normal fast Docker/API response to settle.
+     * If the response does not settle within the short bounded window, the unresolved shared
+     * probe is retained. A later retry observes that same probe and the pre-stop gate prevents
+     * another stop or liveness request from overlapping it.
+     */
+    private LambdaRuntimeLauncher.Liveness livenessForRetirement(ContainerHandle handle) {
+        // The physical limiter is opt-in. Keep the historical synchronous teardown probe when
+        // no cap is configured; only bounded admission needs the shared, time-limited probe path
+        // to prevent a Docker response from holding up an invocation's admission budget.
+        if (!environmentLimiter.bounded()) {
+            return probeLiveness(handle);
+        }
+        LivenessProbe probe = livenessProbe(handle);
+        try {
+            return probe.result.get(RETIREMENT_PROBE_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        } catch (ExecutionException e) {
+            LOG.warnv("Could not reconcile container {0} liveness result; state is unknown: {1}",
+                    handle.getContainerId(), e.getCause() == null ? e.getMessage() : e.getCause().getMessage());
+            return LambdaRuntimeLauncher.Liveness.UNKNOWN;
+        } catch (RuntimeException probeFailure) {
+            LOG.warnv("Could not reconcile container {0} liveness result; state is unknown: {1}",
+                    handle.getContainerId(), probeFailure.getMessage());
             return LambdaRuntimeLauncher.Liveness.UNKNOWN;
         }
     }
@@ -830,6 +927,13 @@ public class WarmPool implements ContainerTeardown {
     }
 
     private boolean stopConfirmed(ContainerHandle handle) {
+        LivenessProbe pendingProbe = livenessProbes.get(handle);
+        if (pendingProbe != null && !pendingProbe.result.isDone()) {
+            // A timed acquisition probe may ignore cancellation (for example, Docker-java can
+            // remain blocked on its response timeout). Do not stop the same handle underneath
+            // that unresolved call; retry after its single-flight probe has actually completed.
+            return false;
+        }
         try {
             lambdaRuntimeLauncher.stop(handle);
         } catch (Exception stopFailure) {
@@ -839,7 +943,7 @@ public class WarmPool implements ContainerTeardown {
             // handle, in which case the lifetime permit is safe to release.
         }
         try {
-            LambdaRuntimeLauncher.Liveness liveness = liveness(handle);
+            LambdaRuntimeLauncher.Liveness liveness = livenessForRetirement(handle);
             if (liveness == LambdaRuntimeLauncher.Liveness.DEAD) {
                 return true;
             }
