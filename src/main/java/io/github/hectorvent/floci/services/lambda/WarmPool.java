@@ -64,6 +64,7 @@ public class WarmPool implements ContainerTeardown {
     private record IdleLease(ContainerHandle handle,
                              LambdaEnvironmentLimiter.Permit environmentPermit,
                              long epoch,
+                             long generation,
                              long sequence) {
     }
 
@@ -75,7 +76,8 @@ public class WarmPool implements ContainerTeardown {
     private record Lease(PoolState poolState,
                          long epoch,
                          String environmentKey,
-                         LambdaEnvironmentLimiter.Permit environmentPermit) {
+                         LambdaEnvironmentLimiter.Permit environmentPermit,
+                         long generation) {
     }
 
     @Inject
@@ -177,12 +179,22 @@ public class WarmPool implements ContainerTeardown {
                     stopAndRelease(idleLease);
                     throw e;
                 }
-                environmentLimiter.markActive(idleLease.environmentPermit());
-                activeLeases.put(handle, new Lease(poolState, idleLease.epoch(),
-                        environmentKey, idleLease.environmentPermit()));
-                handle.setState(ContainerState.BUSY);
-                LOG.debugv("Reusing warm container for function: {0}", fn.getFunctionName());
-                return handle;
+                Lease lease = null;
+                try {
+                    long generation = environmentLimiter.markActive(idleLease.environmentPermit());
+                    lease = new Lease(poolState, idleLease.epoch(), environmentKey,
+                            idleLease.environmentPermit(), generation);
+                    activeLeases.put(handle, lease);
+                    handle.setState(ContainerState.BUSY);
+                    LOG.debugv("Reusing warm container for function: {0}", fn.getFunctionName());
+                    return handle;
+                } catch (RuntimeException | Error e) {
+                    if (lease != null) {
+                        activeLeases.remove(handle, lease);
+                    }
+                    stopAndRelease(idleLease);
+                    throw e;
+                }
             }
 
             LambdaEnvironmentLimiter.Permit environmentPermit = admission.permit();
@@ -190,15 +202,29 @@ public class WarmPool implements ContainerTeardown {
             synchronized (poolState) {
                 leaseEpoch = poolState.epochByEnvironment.computeIfAbsent(environmentKey, ignored -> 0L);
             }
+            ContainerHandle handle = null;
+            Lease lease = null;
             try {
                 LOG.debugv(ephemeral ? "Ephemeral start for function: {0}" : "Cold start for function: {0}",
                         fn.getFunctionName());
-                ContainerHandle handle = lambdaRuntimeLauncher.launch(fn);
-                activeLeases.put(handle, new Lease(poolState, leaseEpoch, environmentKey, environmentPermit));
+                handle = lambdaRuntimeLauncher.launch(fn);
+                long generation = environmentLimiter.markActive(environmentPermit);
+                lease = new Lease(poolState, leaseEpoch, environmentKey, environmentPermit, generation);
+                activeLeases.put(handle, lease);
                 handle.setState(ContainerState.BUSY);
                 return handle;
             } catch (RuntimeException | Error e) {
-                environmentPermit.close();
+                // A launcher may have created a handle before a later setup operation failed.
+                // Stop that handle as well as releasing its lifetime permit so a partial launch
+                // cannot remain live outside the pool.
+                if (lease != null) {
+                    activeLeases.remove(handle, lease);
+                }
+                if (handle != null) {
+                    stopAndRelease(handle, environmentPermit);
+                } else {
+                    environmentPermit.close();
+                }
                 throw e;
             }
         }
@@ -354,6 +380,7 @@ public class WarmPool implements ContainerTeardown {
                 lease.poolState().idleByEnvironment
                         .computeIfAbsent(lease.environmentKey(), ignored -> new ArrayDeque<>())
                         .addFirst(new IdleLease(handle, lease.environmentPermit(), lease.epoch(),
+                                lease.generation(),
                                 idleSequence.incrementAndGet()));
                 idleContainerCount.incrementAndGet();
             }
@@ -363,9 +390,16 @@ public class WarmPool implements ContainerTeardown {
                     handle.getContainerId());
             stopAndRelease(handle, lease);
         } else if (returned) {
-            environmentLimiter.markIdle(lease.environmentPermit());
-            environmentLimiter.signalReusable(lease.environmentKey());
-            LOG.debugv("Released container back to pool for function: {0}", handle.getFunctionName());
+            if (environmentLimiter.markIdle(lease.environmentPermit(), lease.generation())) {
+                environmentLimiter.signalReusable(lease.environmentKey());
+                LOG.debugv("Released container back to pool for function: {0}", handle.getFunctionName());
+            } else {
+                // A concurrent acquire may have reclaimed the just-published handle before this
+                // release updated the physical readback. Its generation is newer, so leave the
+                // permit active and do not wake unrelated waiters for a resource they cannot use.
+                LOG.debugv("Container {0} was reclaimed before its release became idle",
+                        handle.getContainerId());
+            }
         } else {
             LOG.debugv("Pool full for function {0}, stopping excess container", handle.getFunctionName());
             stopAndRelease(handle, lease);
@@ -591,6 +625,14 @@ public class WarmPool implements ContainerTeardown {
             stopQuietly(lease.handle());
         } finally {
             lease.environmentPermit().close();
+        }
+    }
+
+    private void stopAndRelease(ContainerHandle handle, LambdaEnvironmentLimiter.Permit permit) {
+        try {
+            stopQuietly(handle);
+        } finally {
+            permit.close();
         }
     }
 

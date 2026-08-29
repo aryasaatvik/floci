@@ -287,9 +287,45 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         transition(permit, PermitState.IDLE);
     }
 
+    /**
+     * Marks a live environment as idle only if it still belongs to the acquisition that returned
+     * it. Warm-pool publication and this state transition intentionally use separate locks to
+     * avoid a pool/limiter lock inversion; the generation check closes the hand-off race where a
+     * second invocation can reclaim the handle before the first release marks its permit idle.
+     */
+    boolean markIdle(Permit permit, long expectedGeneration) {
+        if (!(permit instanceof PermitImpl permitImpl) || permitImpl.owner != this) {
+            throw new IllegalArgumentException("Permit belongs to a different Lambda environment limiter");
+        }
+        lock.lock();
+        try {
+            if (permitImpl.state == PermitState.CLOSED
+                    || permitImpl.generation != expectedGeneration) {
+                return false;
+            }
+            transitionUnsafe(permitImpl, PermitState.IDLE);
+            return true;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     /** Marks a retained warm environment as actively serving an invocation. */
-    void markActive(Permit permit) {
-        transition(permit, PermitState.ACTIVE);
+    long markActive(Permit permit) {
+        if (!(permit instanceof PermitImpl permitImpl) || permitImpl.owner != this) {
+            throw new IllegalArgumentException("Permit belongs to a different Lambda environment limiter");
+        }
+        lock.lock();
+        try {
+            if (permitImpl.state == PermitState.CLOSED) {
+                throw new IllegalStateException("Cannot activate a closed Lambda environment permit");
+            }
+            transitionUnsafe(permitImpl, PermitState.ACTIVE);
+            permitImpl.generation++;
+            return permitImpl.generation;
+        } finally {
+            lock.unlock();
+        }
     }
 
     private void transition(Permit permit, PermitState target) {
@@ -298,27 +334,31 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         }
         lock.lock();
         try {
-            if (permitImpl.state == PermitState.CLOSED || permitImpl.state == target) {
-                return;
-            }
-            if (permitImpl.state == PermitState.ACTIVE) {
-                active--;
-                decrement(activeByKey, permitImpl.key);
-            } else {
-                idle--;
-                decrement(idleByKey, permitImpl.key);
-            }
-            if (target == PermitState.ACTIVE) {
-                active++;
-                increment(activeByKey, permitImpl.key);
-            } else if (target == PermitState.IDLE) {
-                idle++;
-                increment(idleByKey, permitImpl.key);
-            }
-            permitImpl.state = target;
+            transitionUnsafe(permitImpl, target);
         } finally {
             lock.unlock();
         }
+    }
+
+    private void transitionUnsafe(PermitImpl permitImpl, PermitState target) {
+        if (permitImpl.state == PermitState.CLOSED || permitImpl.state == target) {
+            return;
+        }
+        if (permitImpl.state == PermitState.ACTIVE) {
+            active--;
+            decrement(activeByKey, permitImpl.key);
+        } else {
+            idle--;
+            decrement(idleByKey, permitImpl.key);
+        }
+        if (target == PermitState.ACTIVE) {
+            active++;
+            increment(activeByKey, permitImpl.key);
+        } else if (target == PermitState.IDLE) {
+            idle++;
+            increment(idleByKey, permitImpl.key);
+        }
+        permitImpl.state = target;
     }
 
     private void ensureOpen(String key) {
@@ -477,6 +517,8 @@ public class LambdaEnvironmentLimiter implements AutoCloseable {
         private final String key;
         private final AtomicBoolean closed = new AtomicBoolean();
         private PermitState state = PermitState.ACTIVE;
+        /** Incremented for every activation so a stale release cannot change a newer lease. */
+        private long generation;
 
         private PermitImpl(LambdaEnvironmentLimiter owner, String key) {
             this.owner = owner;
