@@ -18,6 +18,7 @@ public class ContainerHandle {
     private final String executionRoleAccessKeyId;
     private final String executionRoleSessionAccountId;
     private volatile ContainerState state;
+    private volatile boolean livenessKnownAlive;
     private volatile long lastUsedMs;
     private Closeable logStream;
 
@@ -56,6 +57,15 @@ public class ContainerHandle {
     public void touchLastUsed() { this.lastUsedMs = System.currentTimeMillis(); }
     public ContainerState getState() { return state; }
     public void setState(ContainerState state) { this.state = state; }
+
+    /**
+     * Returns whether the last successful invocation or lifecycle probe established that this
+     * handle's execution environment was alive. The bounded warm pool uses this to avoid putting
+     * a Docker inspect on every healthy reuse; an invocation failure still invalidates the handle.
+     */
+    public boolean isLivenessKnownAlive() { return livenessKnownAlive; }
+    public void markLivenessKnownAlive() { this.livenessKnownAlive = true; }
+    public void invalidateLiveness() { this.livenessKnownAlive = false; }
 
     public Closeable getLogStream() { return logStream; }
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
