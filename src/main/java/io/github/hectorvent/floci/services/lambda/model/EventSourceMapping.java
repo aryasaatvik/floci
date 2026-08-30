@@ -31,6 +31,7 @@ public class EventSourceMapping {
     private ScalingConfig scalingConfig;
     private Boolean bisectBatchOnFunctionError;
     private DestinationConfig destinationConfig;
+    private Map<String, String> tags = new HashMap<>();
 
     public EventSourceMapping() {
     }
@@ -113,6 +114,14 @@ public class EventSourceMapping {
 
     public void setDestinationConfig(DestinationConfig destinationConfig) {
         this.destinationConfig = destinationConfig;
+    }
+
+    public Map<String, String> getTags() {
+        return tags;
+    }
+
+    public void setTags(Map<String, String> tags) {
+        this.tags = tags != null ? tags : new HashMap<>();
     }
 
     @RegisterForReflection
