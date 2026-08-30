@@ -331,7 +331,15 @@ public class WarmPool implements ContainerTeardown {
                     handle.getContainerId(), fn.getFunctionName());
             return LambdaRuntimeLauncher.Liveness.DEAD;
         }
+        if (environmentLimiter.bounded() && handle.isLivenessKnownAlive()) {
+            return LambdaRuntimeLauncher.Liveness.ALIVE;
+        }
         LambdaRuntimeLauncher.Liveness liveness = liveness(handle, admissionDeadlineNanos);
+        if (liveness == LambdaRuntimeLauncher.Liveness.ALIVE) {
+            handle.markLivenessKnownAlive();
+        } else {
+            handle.invalidateLiveness();
+        }
         if (liveness == LambdaRuntimeLauncher.Liveness.DEAD) {
             LOG.infov("Discarding dead pooled container {0} for function {1}",
                     handle.getContainerId(), fn.getFunctionName());
@@ -596,6 +604,7 @@ public class WarmPool implements ContainerTeardown {
                             .getOrDefault(lease.environmentKey(), 0L);
                     returned = !stale && idleSize(lease.poolState()) < maxPoolSizePerFunction;
                     if (returned) {
+                        handle.markLivenessKnownAlive();
                         handle.setState(ContainerState.WARM);
                         handle.touchLastUsed();
                         lease.poolState().idleByEnvironment
@@ -650,6 +659,7 @@ public class WarmPool implements ContainerTeardown {
     public void destroyHandle(ContainerHandle handle) {
         LOG.debugv("Destroying timed-out container {0} for function {1}",
                 handle.getContainerId(), handle.getFunctionName());
+        handle.invalidateLiveness();
         Lease lease = activeLeases.remove(handle);
         stopAndRelease(handle, lease);
     }
@@ -904,6 +914,7 @@ public class WarmPool implements ContainerTeardown {
      * A failed or inconclusive probe retains ownership and is retried asynchronously.
      */
     private boolean registerRetirement(ContainerHandle handle, LambdaEnvironmentLimiter.Permit permit) {
+        handle.invalidateLiveness();
         if (!environmentLimiter.markRetiring(permit)) {
             return false;
         }

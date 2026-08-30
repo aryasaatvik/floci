@@ -11,6 +11,8 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.OptionalInt;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -54,6 +56,10 @@ class WarmPoolTest {
     }
 
     private WarmPool buildBoundedPool(int maxPhysicalEnvironments) {
+        return buildBoundedPool(maxPhysicalEnvironments, 1);
+    }
+
+    private WarmPool buildBoundedPool(int maxPhysicalEnvironments, int waitSeconds) {
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
         when(config.services()).thenReturn(services);
@@ -62,7 +68,7 @@ class WarmPoolTest {
         when(lambda.containerIdleTimeoutSeconds()).thenReturn(0);
         when(lambda.maxPhysicalEnvironments()).thenReturn(OptionalInt.of(maxPhysicalEnvironments));
         return new WarmPool(containerLauncher, config,
-                new LambdaEnvironmentLimiter(maxPhysicalEnvironments, 1));
+                new LambdaEnvironmentLimiter(maxPhysicalEnvironments, waitSeconds));
     }
 
     @Test
@@ -547,6 +553,7 @@ class WarmPoolTest {
         doThrow(new IllegalStateException("probe cannot confirm stop")).when(containerLauncher).stop(stale);
 
         pool.release(pool.acquire(fn));
+        stale.invalidateLiveness();
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try {
             Future<ContainerHandle> waiting = executor.submit(() -> pool.acquire(fn));
@@ -613,6 +620,7 @@ class WarmPoolTest {
         });
 
         pool.release(pool.acquire(fn));
+        stale.invalidateLiveness();
         ExecutorService executor = Executors.newSingleThreadExecutor();
         long startedAt = System.nanoTime();
         try {
@@ -892,6 +900,69 @@ class WarmPoolTest {
             verify(containerLauncher, times(2)).launch(any());
         } finally {
             finishLaunch.countDown();
+            executor.shutdownNow();
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void boundedWarmBurstReusesKnownHealthyHandlesWithoutLivenessProbes() throws Exception {
+        WarmPool pool = buildBoundedPool(4, 20);
+        pool.init();
+
+        LambdaFunction fn = mock(LambdaFunction.class);
+        when(fn.getFunctionName()).thenReturn("bounded-warm-burst");
+        when(fn.getFunctionArn()).thenReturn(
+                "arn:aws:lambda:us-east-1:000000000000:function:bounded-warm-burst");
+
+        List<ContainerHandle> handles = List.of(
+                new ContainerHandle("cid-burst-1", "bounded-warm-burst", null, ContainerState.WARM),
+                new ContainerHandle("cid-burst-2", "bounded-warm-burst", null, ContainerState.WARM),
+                new ContainerHandle("cid-burst-3", "bounded-warm-burst", null, ContainerState.WARM),
+                new ContainerHandle("cid-burst-4", "bounded-warm-burst", null, ContainerState.WARM));
+        when(containerLauncher.launch(any())).thenReturn(
+                handles.get(0), handles.get(1), handles.get(2), handles.get(3));
+
+        AtomicInteger livenessCalls = new AtomicInteger();
+        lenient().when(containerLauncher.liveness(any())).thenAnswer(invocation -> {
+            livenessCalls.incrementAndGet();
+            return LambdaRuntimeLauncher.Liveness.ALIVE;
+        });
+
+        for (int i = 0; i < handles.size(); i++) {
+            pool.release(pool.acquire(fn));
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(20);
+        CountDownLatch ready = new CountDownLatch(20);
+        CountDownLatch start = new CountDownLatch(1);
+        List<Future<ContainerHandle>> acquisitions = new ArrayList<>();
+        long burstStartedAt = System.nanoTime();
+        try {
+            for (int i = 0; i < 20; i++) {
+                acquisitions.add(executor.submit(() -> {
+                    ready.countDown();
+                    assertTrue(start.await(5, TimeUnit.SECONDS));
+                    ContainerHandle acquired = pool.acquire(fn);
+                    pool.release(acquired);
+                    return acquired;
+                }));
+            }
+            assertTrue(ready.await(5, TimeUnit.SECONDS), "bounded burst did not start");
+            start.countDown();
+            for (Future<ContainerHandle> acquisition : acquisitions) {
+                assertTrue(handles.contains(acquisition.get(5, TimeUnit.SECONDS)));
+            }
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - burstStartedAt);
+            System.out.printf(
+                    "bounded warm burst: elapsedMs=%d livenessCalls=%d physicalTotal=%d%n",
+                    elapsedMs, livenessCalls.get(), pool.status().total());
+            assertTrue(elapsedMs <= 5_000, "bounded warm burst exceeded the 5s invariant");
+            assertEquals(0, livenessCalls.get());
+            assertEquals(4, pool.status().total());
+            verify(containerLauncher, times(4)).launch(any());
+        } finally {
+            start.countDown();
             executor.shutdownNow();
             pool.shutdown();
         }
