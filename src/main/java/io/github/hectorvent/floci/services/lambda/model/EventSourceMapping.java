@@ -37,6 +37,7 @@ public class EventSourceMapping {
     private Map<String, Object> selfManagedEventSource;
     private List<String> topics = new ArrayList<>();
     private List<Map<String, Object>> sourceAccessConfigurations = new ArrayList<>();
+    private Map<String, String> tags = new HashMap<>();
 
     public EventSourceMapping() {
     }
@@ -133,6 +134,14 @@ public class EventSourceMapping {
 
     public void setDestinationConfig(DestinationConfig destinationConfig) {
         this.destinationConfig = destinationConfig;
+    }
+
+    public Map<String, String> getTags() {
+        return tags;
+    }
+
+    public void setTags(Map<String, String> tags) {
+        this.tags = tags != null ? tags : new HashMap<>();
     }
 
     public FilterCriteria getFilterCriteria() {
