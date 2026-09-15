@@ -8,6 +8,10 @@ COPY pom.xml .
 RUN mvn dependency:go-offline -q
 
 COPY src/ src/
+# The Cedar sidecar sources are added as a test source root by build-helper, and
+# `-DskipTests` still compiles tests, so the image build needs them present even
+# though neither the tests nor the sidecar ship in this runtime image.
+COPY sidecars/ sidecars/
 RUN mvn clean package -DskipTests -q
 
 # Stage 2: Runtime
