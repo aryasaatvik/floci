@@ -505,7 +505,7 @@ public class AwsQueryController {
 
     private static final Set<String> CLOUDWATCH_ACTIONS = Set.of(
             "PutMetricData", "ListMetrics", "GetMetricStatistics", "GetMetricData",
-            "PutMetricAlarm", "DescribeAlarms", "DeleteAlarms", "SetAlarmState",
+            "PutMetricAlarm", "PutCompositeAlarm", "DescribeAlarms", "DeleteAlarms", "SetAlarmState",
             "ListTagsForResource", "TagResource", "UntagResource",
             "PutDashboard", "GetDashboard", "ListDashboards", "DeleteDashboards",
             "PutMetricStream", "GetMetricStream", "ListMetricStreams", "DeleteMetricStream",

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -173,5 +174,134 @@ class CloudWatchMetricsJsonHandlerTest {
                 EPOCH_NOW.minusSeconds(10), EPOCH_NOW.plusSeconds(10), 60);
         assertEquals(0, oldResult.get("Datapoints").size(),
                 "metric from 24h ago must not be returned for a 20-second window around now");
+    }
+
+    // ──────────────────────────── Composite alarms ────────────────────────────
+
+    private Response putCompositeAlarm(String name, String rule) {
+        ObjectNode req = MAPPER.createObjectNode();
+        req.put("AlarmName", name);
+        req.put("AlarmRule", rule);
+        req.put("AlarmDescription", "composite " + name);
+        req.put("ActionsEnabled", true);
+        req.putArray("AlarmActions").add("arn:aws:sns:us-east-1:000000000000:topic");
+        req.putArray("InsufficientDataActions").add("arn:aws:sns:us-east-1:000000000000:topic");
+        req.putArray("Tags").addObject().put("Key", "env").put("Value", "test");
+        return handler.handle("PutCompositeAlarm", req, REGION);
+    }
+
+    private ObjectNode describeComposite(String name) {
+        ObjectNode req = MAPPER.createObjectNode();
+        req.putArray("AlarmNames").add(name);
+        req.putArray("AlarmTypes").add("CompositeAlarm");
+        Response resp = handler.handle("DescribeAlarms", req, REGION);
+        assertEquals(200, resp.getStatus());
+        return (ObjectNode) resp.getEntity();
+    }
+
+    @Test
+    void putCompositeAlarm_thenDescribeWithAlarmTypes_returnsInsufficientDataComposite() {
+        assertEquals(200, putCompositeAlarm("CompositeOne",
+                "ALARM(\"MetricOne\") OR ALARM(\"MetricTwo\")").getStatus());
+
+        ObjectNode body = describeComposite("CompositeOne");
+        assertTrue(body.has("CompositeAlarms"), "AlarmTypes filter must yield a CompositeAlarms array");
+        assertTrue(!body.has("MetricAlarms"), "composite-only filter must not emit MetricAlarms");
+        JsonNode composite = body.get("CompositeAlarms").get(0);
+        assertEquals("CompositeOne", composite.get("AlarmName").asText());
+        assertEquals("ALARM(\"MetricOne\") OR ALARM(\"MetricTwo\")", composite.get("AlarmRule").asText());
+        assertEquals("INSUFFICIENT_DATA", composite.get("StateValue").asText());
+        assertTrue(composite.get("AlarmArn").asText().endsWith(":alarm:CompositeOne"));
+        assertEquals("arn:aws:sns:us-east-1:000000000000:topic",
+                composite.path("AlarmActions").get(0).asText());
+        assertTrue(composite.get("StateUpdatedTimestamp").asLong() > 0);
+    }
+
+    @Test
+    void describeAlarms_withoutAlarmTypes_reportsCompositeAndMetricTogether() {
+        putCompositeAlarm("CompositeOne", "ALARM(\"MetricOne\")");
+        ObjectNode putAlarmReq = MAPPER.createObjectNode();
+        putAlarmReq.put("AlarmName", "MetricOne");
+        putAlarmReq.put("MetricName", "M");
+        putAlarmReq.put("Namespace", "NS");
+        assertEquals(200, handler.handle("PutMetricAlarm", putAlarmReq, REGION).getStatus());
+
+        ObjectNode req = MAPPER.createObjectNode();
+        Response resp = handler.handle("DescribeAlarms", req, REGION);
+        assertEquals(200, resp.getStatus());
+        ObjectNode body = (ObjectNode) resp.getEntity();
+        assertTrue(body.has("MetricAlarms"));
+        assertEquals(1, body.get("MetricAlarms").size());
+        assertTrue(body.has("CompositeAlarms"), "composite alarms must appear when types are unspecified");
+        assertEquals(1, body.get("CompositeAlarms").size());
+    }
+
+    @Test
+    void compositeAlarm_tagFamily_routesByArn() {
+        putCompositeAlarm("CompositeOne", "ALARM(\"MetricOne\")");
+
+        ObjectNode tagReq = MAPPER.createObjectNode();
+        tagReq.put("ResourceARN", "arn:aws:cloudwatch:us-east-1:000000000000:alarm:CompositeOne");
+        tagReq.putArray("Tags").addObject().put("Key", "team").put("Value", "platform");
+        assertEquals(200, handler.handle("TagResource", tagReq, REGION).getStatus());
+
+        ObjectNode listReq = MAPPER.createObjectNode();
+        listReq.put("ResourceARN", "arn:aws:cloudwatch:us-east-1:000000000000:alarm:CompositeOne");
+        Response listResp = handler.handle("ListTagsForResource", listReq, REGION);
+        assertEquals(200, listResp.getStatus());
+        JsonNode tags = ((ObjectNode) listResp.getEntity()).get("Tags");
+        assertTrue(tags.isArray());
+        assertEquals("env", tags.get(0).get("Key").asText());
+        assertEquals("test", tags.get(0).get("Value").asText());
+        assertEquals("team", tags.get(1).get("Key").asText());
+        assertEquals("platform", tags.get(1).get("Value").asText());
+
+        ObjectNode untagReq = MAPPER.createObjectNode();
+        untagReq.put("ResourceARN", "arn:aws:cloudwatch:us-east-1:000000000000:alarm:CompositeOne");
+        untagReq.putArray("TagKeys").add("team");
+        assertEquals(200, handler.handle("UntagResource", untagReq, REGION).getStatus());
+
+        Response after = handler.handle("ListTagsForResource", listReq, REGION);
+        JsonNode remaining = ((ObjectNode) after.getEntity()).get("Tags");
+        assertEquals(1, remaining.size());
+        assertEquals("env", remaining.get(0).get("Key").asText());
+    }
+
+    @Test
+    void setAlarmState_updatesCompositeAlarm() {
+        putCompositeAlarm("CompositeOne", "ALARM(\"MetricOne\")");
+
+        ObjectNode stateReq = MAPPER.createObjectNode();
+        stateReq.put("AlarmName", "CompositeOne");
+        stateReq.put("StateValue", "ALARM");
+        stateReq.put("StateReason", "composite fired");
+        assertEquals(200, handler.handle("SetAlarmState", stateReq, REGION).getStatus());
+
+        JsonNode composite = describeComposite("CompositeOne").get("CompositeAlarms").get(0);
+        assertEquals("ALARM", composite.get("StateValue").asText());
+        assertEquals("composite fired", composite.get("StateReason").asText());
+    }
+
+    @Test
+    void deleteAlarms_removesCompositeAlarm() {
+        putCompositeAlarm("CompositeOne", "ALARM(\"MetricOne\")");
+
+        ObjectNode deleteReq = MAPPER.createObjectNode();
+        deleteReq.putArray("AlarmNames").add("CompositeOne");
+        assertEquals(200, handler.handle("DeleteAlarms", deleteReq, REGION).getStatus());
+
+        JsonNode body = describeComposite("CompositeOne");
+        assertTrue(body.has("CompositeAlarms"));
+        assertEquals(0, body.get("CompositeAlarms").size());
+    }
+
+    @Test
+    void putCompositeAlarm_missingRule_rejected() {
+        ObjectNode req = MAPPER.createObjectNode();
+        req.put("AlarmName", "CompositeOne");
+        // The handler surfaces the service's AwsException, which the JAX-RS exception mapper
+        // turns into a 400 in the running emulator.
+        assertThrows(io.github.hectorvent.floci.core.common.AwsException.class,
+                () -> handler.handle("PutCompositeAlarm", req, REGION));
     }
 }

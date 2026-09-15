@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.cloudwatch.metricstreams.CloudWatchMe
 import io.github.hectorvent.floci.services.cloudwatch.metricstreams.model.MetricStream;
 import io.github.hectorvent.floci.services.cloudwatch.metricstreams.model.MetricStreamFilter;
 import io.github.hectorvent.floci.services.cloudwatch.metricstreams.model.MetricStreamStatisticsConfiguration;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.CompositeAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
@@ -56,6 +57,7 @@ public class CloudWatchMetricsJsonHandler {
             case "ListMetrics" -> handleListMetrics(request, region);
             case "GetMetricStatistics" -> handleGetMetricStatistics(request, region);
             case "PutMetricAlarm" -> handlePutMetricAlarm(request, region);
+            case "PutCompositeAlarm" -> handlePutCompositeAlarm(request, region);
             case "DescribeAlarms" -> handleDescribeAlarms(request, region);
             case "DeleteAlarms" -> handleDeleteAlarms(request, region);
             case "SetAlarmState" -> handleSetAlarmState(request, region);
@@ -188,6 +190,61 @@ public class CloudWatchMetricsJsonHandler {
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
+    private Response handlePutCompositeAlarm(JsonNode request, String region) {
+        CompositeAlarm alarm = new CompositeAlarm();
+        alarm.setAlarmName(request.path("AlarmName").asText());
+        alarm.setAlarmDescription(request.path("AlarmDescription").asText(null));
+        alarm.setAlarmRule(request.path("AlarmRule").asText(null));
+        alarm.setActionsEnabled(!request.has("ActionsEnabled") || request.path("ActionsEnabled").asBoolean(true));
+
+        JsonNode alarmActions = request.path("AlarmActions");
+        if (alarmActions.isArray()) {
+            alarmActions.forEach(a -> alarm.getAlarmActions().add(a.asText()));
+        }
+        JsonNode okActions = request.path("OKActions");
+        if (okActions.isArray()) {
+            okActions.forEach(a -> alarm.getOkActions().add(a.asText()));
+        }
+        JsonNode insufficientDataActions = request.path("InsufficientDataActions");
+        if (insufficientDataActions.isArray()) {
+            insufficientDataActions.forEach(a -> alarm.getInsufficientDataActions().add(a.asText()));
+        }
+
+        JsonNode tagsNode = request.has("Tags") ? request.path("Tags")
+                : request.has("TagList") ? request.path("TagList") : request.path("tags");
+        Map<String, String> tags = new LinkedHashMap<>();
+        if (tagsNode.isArray()) {
+            tagsNode.forEach(t -> tags.put(t.path("Key").asText(), t.path("Value").asText()));
+        } else if (tagsNode.isObject()) {
+            tagsNode.fields().forEachRemaining(e -> tags.put(e.getKey(), e.getValue().asText()));
+        }
+        alarm.setTags(tags);
+
+        metricsService.putCompositeAlarm(alarm, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    private ObjectNode compositeNode(CompositeAlarm c) {
+        ObjectNode node = objectMapper.createObjectNode();
+        if (c.getAlarmName() != null) node.put("AlarmName", c.getAlarmName());
+        if (c.getAlarmArn() != null) node.put("AlarmArn", c.getAlarmArn());
+        if (c.getAlarmDescription() != null) node.put("AlarmDescription", c.getAlarmDescription());
+        if (c.getAlarmRule() != null) node.put("AlarmRule", c.getAlarmRule());
+        node.put("ActionsEnabled", c.isActionsEnabled());
+        ArrayNode alarmActions = node.putArray("AlarmActions");
+        c.getAlarmActions().forEach(alarmActions::add);
+        ArrayNode okActions = node.putArray("OKActions");
+        c.getOkActions().forEach(okActions::add);
+        ArrayNode insufficientDataActions = node.putArray("InsufficientDataActions");
+        c.getInsufficientDataActions().forEach(insufficientDataActions::add);
+        if (c.getStateValue() != null) node.put("StateValue", c.getStateValue());
+        if (c.getStateReason() != null) node.put("StateReason", c.getStateReason());
+        if (c.getStateReasonData() != null) node.put("StateReasonData", c.getStateReasonData());
+        node.put("StateUpdatedTimestamp", c.getStateUpdatedTimestamp());
+        node.put("AlarmConfigurationUpdatedTimestamp", c.getAlarmConfigurationUpdatedTimestamp());
+        return node;
+    }
+
     private Response handleDescribeAlarms(JsonNode request, String region) {
         List<String> alarmNames = new ArrayList<>();
         JsonNode namesNode = request.path("AlarmNames");
@@ -196,9 +253,34 @@ public class CloudWatchMetricsJsonHandler {
         }
         String prefix = request.has("AlarmNamePrefix") ? request.path("AlarmNamePrefix").asText() : null;
 
-        List<MetricAlarm> alarms = metricsService.describeAlarms(alarmNames, prefix, region);
+        JsonNode typesNode = request.path("AlarmTypes");
+        boolean requestedTypes = typesNode.isArray() && !typesNode.isEmpty();
+        List<String> alarmTypes = new ArrayList<>();
+        if (requestedTypes) {
+            typesNode.forEach(t -> alarmTypes.add(t.asText()));
+        }
+        boolean includeMetric = !requestedTypes || alarmTypes.contains("MetricAlarm");
+        boolean includeComposite = !requestedTypes || alarmTypes.contains("CompositeAlarm");
 
         ObjectNode response = objectMapper.createObjectNode();
+
+        if (includeComposite) {
+            List<CompositeAlarm> composites = metricsService.describeCompositeAlarms(alarmNames, prefix, region);
+            // AWS always returns the CompositeAlarms member when the caller filters to that type;
+            // when types are unspecified we only add it if there is something to report, so an
+            // ordinary metric-alarm response keeps its historical shape.
+            if (requestedTypes || !composites.isEmpty()) {
+                ArrayNode compositesArr = response.putArray("CompositeAlarms");
+                composites.forEach(c -> compositesArr.add(compositeNode(c)));
+            }
+        }
+
+        if (!includeMetric) {
+            return Response.ok(response).build();
+        }
+
+        List<MetricAlarm> alarms = metricsService.describeAlarms(alarmNames, prefix, region);
+
         ArrayNode arr = response.putArray("MetricAlarms");
         for (MetricAlarm a : alarms) {
             ObjectNode node = arr.addObject();

@@ -194,8 +194,9 @@ aws logs put-retention-policy \
 | `GetMetricStatistics` | Get metric statistics (Average, Sum, etc.) |
 | `GetMetricData` | Query metrics with math expressions |
 | `PutMetricAlarm` | Create a metric alarm |
-| `DescribeAlarms` | List alarms |
-| `DeleteAlarms` | Delete alarms |
+| `PutCompositeAlarm` | Create or update a composite alarm from an `AlarmRule` expression |
+| `DescribeAlarms` | List metric and/or composite alarms, filtered by `AlarmTypes` |
+| `DeleteAlarms` | Delete metric or composite alarms |
 | `SetAlarmState` | Manually set alarm state |
 | `PutMetricStream` | Create or update a metric stream definition |
 | `GetMetricStream` | Read a metric stream definition |
@@ -213,6 +214,13 @@ aws logs put-retention-policy \
 
 Metric streams are stored as definitions with their `running` or `stopped` state. Floci never
 delivers metrics to the Firehose delivery stream a metric stream names.
+
+Composite alarms are stored separately from metric alarms and returned under the
+`CompositeAlarms` member of `DescribeAlarms`; a request filtered with
+`AlarmTypes: ["CompositeAlarm"]` returns only that member, while an unfiltered request returns both
+`MetricAlarms` and `CompositeAlarms`. A composite alarm starts `INSUFFICIENT_DATA` and its state is
+preserved across upserts. Floci stores the `AlarmRule` expression but does not evaluate it, so a
+composite alarm's state only changes through `SetAlarmState`.
 
 ### Examples
 
