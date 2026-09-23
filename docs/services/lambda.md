@@ -821,12 +821,15 @@ Validation mirrors AWS: values outside 2–1000 are rejected with
 source (Kinesis / DynamoDB Streams) is also rejected. Those services
 use `ParallelizationFactor` instead, which is a separate field.
 
-!!! note "Enforcement status"
-    The configured `MaximumConcurrency` is persisted and returned on the
-    wire, but the SQS poller does not yet cap concurrent invocations at
-    this value (the poller today serializes invocations per ESM to one
-    at a time regardless). Real parallel dispatch capped by
-    `MaximumConcurrency` is tracked as a follow-up.
+The SQS poller enforces the cap: each poll interval, it receives batches while the
+mapping has fewer than `MaximumConcurrency` invocations in flight and runs each batch as
+its own concurrent invocation, so throughput scales with the cap. When `ScalingConfig` is
+unset, Floci caps the mapping at 5 concurrent invocations, the number of batches AWS starts
+an SQS mapping with. AWS then scales further toward the function's concurrency limit;
+Floci does not. `MaximumBatchingWindowInSeconds` still holds an underfilled batch open, and
+partial batch responses and visibility handling apply to each batch independently. A function's reserved concurrency still applies,
+so a cap above it throttles, and throttled batches return to the queue after their
+visibility timeout.
 
 ### FilterCriteria
 
