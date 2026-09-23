@@ -264,6 +264,90 @@ class GuardedMessageQueueTest {
         assertEquals("visible", result.claimed().get(0).getBody());
     }
 
+    // --- Fair queues (standard queue + MessageGroupId) ---
+
+    private static Message grouped(String body, String groupId) {
+        Message m = new Message(body);
+        m.setMessageGroupId(groupId);
+        return m;
+    }
+
+    private List<String> claimBodies(int max, boolean fifo) {
+        return queue.claimVisibleMessages(max, 30, fifo, -1, null).claimed().stream()
+                .map(Message::getBody).toList();
+    }
+
+    @Test
+    void fairQueueReceivesQuietGroupAheadOfNoisyGroupBacklog() {
+        for (int i = 0; i < 20; i++) {
+            queue.addMessage(grouped("noisy-" + i, "noisy"));
+        }
+        // The noisy tenant already has five messages in flight.
+        assertEquals(List.of("noisy-0", "noisy-1", "noisy-2", "noisy-3", "noisy-4"), claimBodies(5, false));
+
+        // A quiet tenant's messages arrive behind fifteen visible noisy messages.
+        queue.addMessage(grouped("quiet-0", "quiet"));
+        queue.addMessage(grouped("quiet-1", "quiet"));
+
+        assertEquals(List.of("quiet-0", "quiet-1"), claimBodies(2, false),
+                "the quiet group must not wait behind the noisy group's backlog");
+        assertEquals(List.of("noisy-5"), claimBodies(1, false));
+    }
+
+    @Test
+    void fairQueueInterleavesGroupsWithEqualInFlightByEnqueueOrder() {
+        queue.addMessage(grouped("a-0", "a"));
+        queue.addMessage(grouped("a-1", "a"));
+        queue.addMessage(grouped("a-2", "a"));
+        queue.addMessage(grouped("b-0", "b"));
+        queue.addMessage(grouped("b-1", "b"));
+
+        assertEquals(List.of("a-0", "b-0", "a-1", "b-1", "a-2"), claimBodies(10, false));
+    }
+
+    @Test
+    void fairQueueNeverHoldsBackMessagesWithoutAGroup() {
+        for (int i = 0; i < 5; i++) {
+            queue.addMessage(grouped("noisy-" + i, "noisy"));
+        }
+        claimBodies(3, false);
+        queue.addMessage(new Message("plain-0"));
+        queue.addMessage(new Message("plain-1"));
+
+        assertEquals(List.of("plain-0", "plain-1", "noisy-3"), claimBodies(3, false),
+                "ungrouped messages rank as zero in flight and keep enqueue order");
+    }
+
+    @Test
+    void fairQueueWithoutGroupsKeepsEnqueueOrder() {
+        for (int i = 0; i < 5; i++) {
+            queue.addMessage(new Message("m-" + i));
+        }
+        assertEquals(List.of("m-0", "m-1", "m-2", "m-3", "m-4"), claimBodies(10, false));
+    }
+
+    @Test
+    void fairQueueCountsOnlyClaimedMessagesAsInFlight() {
+        // A delayed noisy message was never received, so it does not make its group noisy.
+        Message delayed = grouped("noisy-delayed", "noisy");
+        delayed.setVisibleAt(Instant.now().plusSeconds(60));
+        queue.addMessage(delayed);
+        queue.addMessage(grouped("noisy-0", "noisy"));
+        queue.addMessage(grouped("quiet-0", "quiet"));
+
+        assertEquals(List.of("noisy-0"), claimBodies(1, false));
+    }
+
+    @Test
+    void fifoQueueIgnoresFairOrdering() {
+        queue.addMessage(grouped("a-0", "a"));
+        queue.addMessage(grouped("a-1", "a"));
+        queue.addMessage(grouped("b-0", "b"));
+
+        assertEquals(List.of("a-0", "a-1", "b-0"), claimBodies(10, true),
+                "FIFO receive keeps insertion order and group locking, not fair ordering");
+    }
+
     // --- DLQ ---
 
     @Test

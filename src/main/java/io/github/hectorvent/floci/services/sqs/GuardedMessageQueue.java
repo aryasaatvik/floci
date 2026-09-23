@@ -112,13 +112,61 @@ class GuardedMessageQueue {
         return true;
     }
 
+    /**
+     * Standard-queue receive with Floci's approximation of SQS fair queues.
+     *
+     * <p>AWS fair queues: on a standard queue, messages sent with a {@code MessageGroupId} belong
+     * to tenant groups, and when some groups hold a disproportionate share of in-flight messages
+     * ReceiveMessage favours messages from the other (quiet) groups so their dwell time stays low.
+     * There is no ordering guarantee, no throughput limit, and messages without a group are
+     * unaffected.
+     *
+     * <p>Floci's policy, applied on every standard-queue receive: each pick takes the visible
+     * message whose group has the fewest in-flight messages, counting messages claimed earlier in
+     * the same call, with ties broken by enqueue order. Messages without a group always rank as
+     * zero in flight, so they are never held back behind a noisy group. With no grouped messages
+     * this reduces to plain enqueue order, the behaviour before fair queues.
+     */
     private void claimStandard(int maxMessages, int effectiveTimeout,
                                int maxReceiveCount, String deadLetterTargetArn,
                                List<Message> claimed, List<Message> dlqCandidates) {
-        for (Message msg : messages) {
-            if (claimed.size() >= maxMessages) break;
-            if (!msg.isVisible()) continue;
-            tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates);
+        Map<String, Integer> inFlightByGroup = new HashMap<>();
+        // Indexes of visible candidates per group, in enqueue order; ungrouped messages share one lane.
+        Map<String, ArrayDeque<Integer>> lanes = new LinkedHashMap<>();
+        ArrayDeque<Integer> ungrouped = new ArrayDeque<>();
+        for (int i = 0; i < messages.size(); i++) {
+            Message msg = messages.get(i);
+            String groupId = msg.getMessageGroupId();
+            if (msg.isVisible()) {
+                if (groupId == null) {
+                    ungrouped.add(i);
+                } else {
+                    lanes.computeIfAbsent(groupId, _ -> new ArrayDeque<>()).add(i);
+                }
+            } else if (groupId != null && msg.getReceiptHandle() != null) {
+                inFlightByGroup.merge(groupId, 1, Integer::sum);
+            }
+        }
+
+        while (claimed.size() < maxMessages) {
+            ArrayDeque<Integer> bestLane = ungrouped.isEmpty() ? null : ungrouped;
+            int bestInFlight = 0;
+            for (var lane : lanes.entrySet()) {
+                ArrayDeque<Integer> candidates = lane.getValue();
+                if (candidates.isEmpty()) continue;
+                int inFlight = inFlightByGroup.getOrDefault(lane.getKey(), 0);
+                if (bestLane == null || inFlight < bestInFlight
+                        || (inFlight == bestInFlight && candidates.peekFirst() < bestLane.peekFirst())) {
+                    bestLane = candidates;
+                    bestInFlight = inFlight;
+                }
+            }
+            if (bestLane == null) break;
+            Message msg = messages.get(bestLane.pollFirst());
+            if (tryClaim(msg, effectiveTimeout, maxReceiveCount, deadLetterTargetArn, claimed, dlqCandidates)
+                    && msg.getMessageGroupId() != null) {
+                inFlightByGroup.merge(msg.getMessageGroupId(), 1, Integer::sum);
+            }
         }
     }
 

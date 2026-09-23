@@ -653,8 +653,9 @@ public class SqsService implements Resettable, ResourceProvider {
             return message;
         }
 
-        // Standard queue. MessageGroupId is retained for ReceiveMessage to
-        // return (fair queues); it has no effect on standard-queue delivery.
+        // Standard queue. MessageGroupId makes this a fair-queue message: it is returned by
+        // ReceiveMessage and steers receive order away from noisy groups (see
+        // GuardedMessageQueue#claimStandard). It never imposes ordering.
         Message message = new Message(body);
         message.setMessageGroupId(messageGroupId);
         message.setAwsTraceHeader(awsTraceHeader);

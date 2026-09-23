@@ -92,6 +92,20 @@ aws sqs set-queue-attributes \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
 
+## Fair Queues
+
+A standard queue becomes a fair queue when producers send messages with a `MessageGroupId`. As in
+AWS, the group has no ordering or throughput effect; it steers `ReceiveMessage` away from tenants
+that hold a disproportionate share of in-flight messages, so a quiet tenant's messages do not wait
+behind a noisy tenant's backlog.
+
+Floci approximates the AWS behaviour with a deterministic policy: each message picked for a
+`ReceiveMessage` response is the visible message whose group has the fewest in-flight messages
+(counting messages already picked for the same response), with ties broken by enqueue order.
+Messages without a `MessageGroupId` always rank as having none in flight, so they are never held
+back. A queue with no grouped messages keeps plain enqueue order. FIFO queues are unaffected.
+Floci does not publish the `ApproximateNumberOfNoisyGroups` CloudWatch metric.
+
 ## Queue Attributes
 
 `GetQueueAttributes` with `--attribute-names All` returns the set AWS returns for a standard queue: `QueueArn`, `CreatedTimestamp`, `LastModifiedTimestamp`, `ApproximateNumberOfMessages`, `ApproximateNumberOfMessagesNotVisible`, `ApproximateNumberOfMessagesDelayed`, `VisibilityTimeout`, `MaximumMessageSize`, `MessageRetentionPeriod`, `DelaySeconds`, `ReceiveMessageWaitTimeSeconds` and `SqsManagedSseEnabled`. `Policy`, `RedrivePolicy` and `KmsMasterKeyId` appear only once set, and FIFO queues also report `FifoQueue` and `ContentBasedDeduplication`.
