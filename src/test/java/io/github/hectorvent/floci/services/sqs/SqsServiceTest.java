@@ -1122,6 +1122,48 @@ class SqsServiceTest {
     }
 
     @Test
+    void changeMessageVisibility_returnsANonDefaultAccountMessageOutsideRequestScope() throws Exception {
+        String account = "111111111111";
+        RequestContext requestContext = new RequestContext();
+        requestContext.setAccountId(account);
+        Thread caller = Thread.currentThread();
+        @SuppressWarnings("unchecked")
+        Instance<RequestContext> requestContextInstance = mock(Instance.class);
+        // Only the calling thread has a request scope; an event source poller runs outside any request.
+        when(requestContextInstance.get()).thenAnswer(invocation -> {
+            if (Thread.currentThread() != caller) {
+                throw new ContextNotActiveException();
+            }
+            return requestContext;
+        });
+        SqsService service = new SqsService(
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), requestContextInstance, "000000000000"),
+                null, null, 30, 1048576, BASE_URL, new RegionResolver("us-east-1", account), false, null, clock);
+        Queue queue = service.createQueue("acct-esm-source", Map.of("VisibilityTimeout", "7"), "us-east-1");
+        service.sendMessage(queue.getQueueUrl(), "retry-me", 0, null, null, "us-east-1");
+
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        AtomicReference<String> visibility = new AtomicReference<>();
+        Thread poller = new Thread(() -> {
+            try {
+                Message received = service.receiveMessage(queue.getQueueUrl(), 1, 300, 0, "us-east-1").getFirst();
+                visibility.set(service.getQueueAttributes(
+                        queue.getQueueUrl(), List.of("VisibilityTimeout"), "us-east-1").get("VisibilityTimeout"));
+                service.changeMessageVisibility(queue.getQueueUrl(), received.getReceiptHandle(), 0, "us-east-1");
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        });
+        poller.start();
+        poller.join();
+
+        assertNull(failure.get());
+        assertEquals("7", visibility.get());
+        assertEquals(List.of("retry-me"),
+                bodies(service.receiveMessage(queue.getQueueUrl(), 1, 30, 0, "us-east-1")));
+    }
+
+    @Test
     void startMessageMoveTask_failedDeliveryLeavesSourceQueueOrderIntact() throws Exception {
         AtomicBoolean destinationStoreDown = new AtomicBoolean();
         SqsService service = serviceWithMessageStoreFailingFor("fail-replay", destinationStoreDown);

@@ -479,7 +479,7 @@ public class SqsService implements Resettable, ResourceProvider {
 
     public Map<String, String> getQueueAttributes(String queueUrl, List<String> attributeNames, String region) {
         String storageKey = regionKey(region, queueUrl);
-        Queue queue = queueStore.get(storageKey)
+        Queue queue = getQueueByUrl(storageKey, queueUrl)
                 .orElseThrow(() -> new AwsException("AWS.SimpleQueueService.NonExistentQueue",
                         "The specified queue does not exist.", 400));
 
@@ -975,7 +975,10 @@ public class SqsService implements Resettable, ResourceProvider {
 
     public void changeMessageVisibility(String queueUrl, String receiptHandle, int visibilityTimeout, String region) {
         String storageKey = regionKey(region, queueUrl);
-        ensureQueueExists(storageKey);
+        if (getQueueByUrl(storageKey, queueUrl).isEmpty()) {
+            throw new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                    "The specified queue does not exist.", 400);
+        }
 
         boolean found = getOrCreateQueue(storageKey).changeVisibility(receiptHandle, visibilityTimeout);
         if (!found) {
