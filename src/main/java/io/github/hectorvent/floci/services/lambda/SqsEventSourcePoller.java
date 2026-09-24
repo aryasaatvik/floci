@@ -370,9 +370,26 @@ public class SqsEventSourcePoller implements Resettable {
                 returnMessagesToQueue(esm, toReturn);
             }
         } else {
-            LOG.warnv("ESM {0}: Lambda returned error [{1}], returning {2} delivered message(s) to queue for retry/redrive",
-                    esm.getUuid(), result.getFunctionError(), matched.size());
+            LOG.warnv("ESM {0}: Lambda returned error [{1}] {2}, returning {3} delivered message(s) to queue for retry/redrive",
+                    esm.getUuid(), result.getFunctionError(), errorType(result), matched.size());
             returnMessagesToQueue(esm, matched);
+        }
+    }
+
+    /**
+     * The {@code errorType} of a failed invocation's payload, which distinguishes the function's
+     * own error from an environment the invocation never reached (for example
+     * {@code Lambda.EnvironmentTimeout} while every physical environment was busy).
+     */
+    private String errorType(InvokeResult result) {
+        if (result.getPayload() == null || result.getPayload().length == 0) {
+            return "(no payload)";
+        }
+        try {
+            JsonNode type = objectMapper.readTree(result.getPayload()).get("errorType");
+            return type == null || type.isNull() ? "(no errorType)" : type.asText();
+        } catch (Exception e) {
+            return "(unparseable payload)";
         }
     }
 
