@@ -20,11 +20,14 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -328,6 +331,12 @@ public class SqsEventSourcePoller implements Resettable {
             }
         }
 
+        // The visibility each message was claimed with, read before the function runs so a
+        // ChangeMessageVisibility it makes can be told apart when a failure is returned.
+        Map<String, Instant> claimedVisibleAt = new HashMap<>();
+        for (Message m : matched) {
+            claimedVisibleAt.put(m.getReceiptHandle(), m.getVisibleAt());
+        }
         String eventJson = buildSqsEvent(matched, esm);
         LOG.infov("ESM {0}: invoking function {1}", esm.getUuid(), fn.getFunctionName());
         InvokeResult result;
@@ -367,12 +376,12 @@ public class SqsEventSourcePoller implements Resettable {
             if (!failedIds.isEmpty()) {
                 List<Message> toReturn = matched.stream()
                         .filter(m -> failedIds.contains(m.getMessageId())).toList();
-                returnMessagesToQueue(esm, toReturn);
+                returnMessagesToQueue(esm, toReturn, claimedVisibleAt);
             }
         } else {
             LOG.warnv("ESM {0}: Lambda returned error [{1}] {2}, returning {3} delivered message(s) to queue for retry/redrive",
                     esm.getUuid(), result.getFunctionError(), errorType(result), matched.size());
-            returnMessagesToQueue(esm, matched);
+            returnMessagesToQueue(esm, matched, claimedVisibleAt);
         }
     }
 
@@ -404,13 +413,18 @@ public class SqsEventSourcePoller implements Resettable {
      * 0 would cause for a persistently failing function) — so ApproximateReceiveCount
      * climbs and the queue's RedrivePolicy moves them to the DLQ once
      * {@code maxReceiveCount} is exceeded.
+     *
+     * A message whose visibility the function changed during the invocation keeps it: AWS
+     * never touches a failed message's visibility, so a consumer that schedules its own retry
+     * with ChangeMessageVisibility and then reports the failure is retried when it asked.
      */
-    private void returnMessagesToQueue(EventSourceMapping esm, List<Message> messages) {
+    private void returnMessagesToQueue(EventSourceMapping esm, List<Message> messages,
+                                       Map<String, Instant> claimedVisibleAt) {
         int retryVisibility = retryVisibilityTimeout(esm);
         for (Message msg : messages) {
             try {
-                sqsService.changeMessageVisibility(
-                        esm.getQueueUrl(), msg.getReceiptHandle(), retryVisibility, esm.getRegion());
+                sqsService.returnClaimedMessage(esm.getQueueUrl(), msg.getReceiptHandle(),
+                        claimedVisibleAt.get(msg.getReceiptHandle()), retryVisibility, esm.getRegion());
             } catch (Exception e) {
                 LOG.warnv("ESM {0}: failed to return message {1} to queue: {2}",
                         esm.getUuid(), msg.getMessageId(), e.getMessage());

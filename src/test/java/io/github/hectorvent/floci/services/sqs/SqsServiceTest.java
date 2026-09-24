@@ -417,6 +417,36 @@ class SqsServiceTest {
     }
 
     @Test
+    void returnClaimedMessageAppliesWhileVisibilityIsUnchanged() {
+        String region = "eu-west-1";
+        Queue queue = sqsService.createQueue("test-queue", null, region);
+        sqsService.sendMessage(queue.getQueueUrl(), "msg1", 0, region);
+
+        Message claimed = sqsService.receiveMessage(queue.getQueueUrl(), 1, 30, 0, region).getFirst();
+        Instant claimedVisibleAt = claimed.getVisibleAt();
+
+        assertTrue(sqsService.returnClaimedMessage(
+                queue.getQueueUrl(), claimed.getReceiptHandle(), claimedVisibleAt, 0, region));
+        assertEquals(1, sqsService.receiveMessage(queue.getQueueUrl(), 1, 30, 0, region).size());
+    }
+
+    @Test
+    void returnClaimedMessageKeepsAVisibilityTheConsumerChanged() {
+        String region = "eu-west-1";
+        Queue queue = sqsService.createQueue("test-queue", null, region);
+        sqsService.sendMessage(queue.getQueueUrl(), "msg1", 0, region);
+
+        Message claimed = sqsService.receiveMessage(queue.getQueueUrl(), 1, 30, 0, region).getFirst();
+        Instant claimedVisibleAt = claimed.getVisibleAt();
+        // The consumer schedules its own retry, immediately here, then reports the failure.
+        sqsService.changeMessageVisibility(queue.getQueueUrl(), claimed.getReceiptHandle(), 0, region);
+
+        assertFalse(sqsService.returnClaimedMessage(
+                queue.getQueueUrl(), claimed.getReceiptHandle(), claimedVisibleAt, 30, region));
+        assertEquals(1, sqsService.receiveMessage(queue.getQueueUrl(), 1, 30, 0, region).size());
+    }
+
+    @Test
     void getQueueAttributes() {
         String region = "eu-west-1";
         Queue queue = sqsService.createQueue("test-queue", null, region);

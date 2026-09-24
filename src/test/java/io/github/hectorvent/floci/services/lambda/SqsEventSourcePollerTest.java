@@ -329,8 +329,7 @@ class SqsEventSourcePollerTest {
         // The failed message must be made visible again after the queue's own visibility
         // timeout (2s here) so the next poll re-receives it and the queue's RedrivePolicy
         // can move it to the DLQ — rather than staying in-flight for fn.timeout + 30s.
-        verify(sqsService, timeout(2000)).changeMessageVisibility(
-                esm.getQueueUrl(), "rh-m1", 2, "us-east-1");
+        verify(sqsService, timeout(2000)).returnClaimedMessage(esm.getQueueUrl(), "rh-m1", null, 2, "us-east-1");
         verify(sqsService, never()).deleteMessage(any(), any(), any());
     }
 
@@ -358,8 +357,7 @@ class SqsEventSourcePollerTest {
         poller.pollAndInvoke(esm);
 
         // Falls back to the AWS default of 30s rather than 0 (which would spin a tight retry loop).
-        verify(sqsService, timeout(2000)).changeMessageVisibility(
-                esm.getQueueUrl(), "rh-m1", 30, "us-east-1");
+        verify(sqsService, timeout(2000)).returnClaimedMessage(esm.getQueueUrl(), "rh-m1", null, 30, "us-east-1");
     }
 
     @Test
@@ -381,7 +379,7 @@ class SqsEventSourcePollerTest {
         poller.pollAndInvoke(esm);
 
         verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
-        verify(sqsService, never()).changeMessageVisibility(any(), any(), anyInt(), any());
+        verify(sqsService, never()).returnClaimedMessage(any(), any(), any(), anyInt(), any());
     }
 
     @Test
@@ -639,7 +637,7 @@ class SqsEventSourcePollerTest {
         }
         // m1 deleted after successful invoke; nothing returned to the queue.
         verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
-        verify(sqsService, never()).changeMessageVisibility(any(), any(), anyInt(), any());
+        verify(sqsService, never()).returnClaimedMessage(any(), any(), any(), anyInt(), any());
     }
 
     @Test
@@ -677,7 +675,7 @@ class SqsEventSourcePollerTest {
         // Filtered-out m2 is consumed (deleted) regardless of the invoke outcome.
         verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
         // Matched m1 failed → returned to the queue (visibility reset), NOT deleted.
-        verify(sqsService, timeout(2000)).changeMessageVisibility(esm.getQueueUrl(), "rh-m1", 5, "us-east-1");
+        verify(sqsService, timeout(2000)).returnClaimedMessage(esm.getQueueUrl(), "rh-m1", null, 5, "us-east-1");
         awaitPollCompleted(esm);
         verify(sqsService, never()).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
     }
@@ -703,7 +701,7 @@ class SqsEventSourcePollerTest {
         verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
         awaitPollCompleted(esm);
         // The stale failure id does not cause a second delete or a visibility reset.
-        verify(sqsService, never()).changeMessageVisibility(any(), any(), anyInt(), any());
+        verify(sqsService, never()).returnClaimedMessage(any(), any(), any(), anyInt(), any());
     }
 
     @Test
@@ -764,8 +762,8 @@ class SqsEventSourcePollerTest {
 
         // AWS treats these as a complete failure: nothing is deleted, every delivered
         // message goes back to the queue for retry/redrive.
-        verify(sqsService, timeout(2000)).changeMessageVisibility(esm.getQueueUrl(), "rh-m1", 2, "us-east-1");
-        verify(sqsService, timeout(2000)).changeMessageVisibility(esm.getQueueUrl(), "rh-m2", 2, "us-east-1");
+        verify(sqsService, timeout(2000)).returnClaimedMessage(esm.getQueueUrl(), "rh-m1", null, 2, "us-east-1");
+        verify(sqsService, timeout(2000)).returnClaimedMessage(esm.getQueueUrl(), "rh-m2", null, 2, "us-east-1");
         awaitPollCompleted(esm);
         verify(sqsService, never()).deleteMessage(any(), any(), any());
     }
@@ -783,7 +781,7 @@ class SqsEventSourcePollerTest {
         verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
         verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
         awaitPollCompleted(esm);
-        verify(sqsService, never()).changeMessageVisibility(any(), any(), anyInt(), any());
+        verify(sqsService, never()).returnClaimedMessage(any(), any(), any(), anyInt(), any());
     }
 
     @Test
@@ -791,10 +789,38 @@ class SqsEventSourcePollerTest {
         EventSourceMapping esm = pollReportingBatch("{\"batchItemFailures\":[{\"itemIdentifier\":\"m2\"}]}");
 
         verify(sqsService, timeout(2000)).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
-        verify(sqsService, timeout(2000)).changeMessageVisibility(esm.getQueueUrl(), "rh-m2", 2, "us-east-1");
+        verify(sqsService, timeout(2000)).returnClaimedMessage(esm.getQueueUrl(), "rh-m2", null, 2, "us-east-1");
         awaitPollCompleted(esm);
         verify(sqsService, never()).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
-        verify(sqsService, never()).changeMessageVisibility(eq(esm.getQueueUrl()), eq("rh-m1"), anyInt(), any());
+        verify(sqsService, never()).returnClaimedMessage(eq(esm.getQueueUrl()), eq("rh-m1"), any(), anyInt(), any());
+    }
+
+    @Test
+    void failedMessageIsReturnedAgainstTheVisibilityItWasClaimedWith() {
+        LambdaFunction fn = stubThrowFn();
+        EventSourceMapping esm = esm();
+        esm.setFunctionResponseTypes(List.of("ReportBatchItemFailures"));
+        Message msg = message("m1");
+        Instant claimedVisibleAt = Instant.now().plusSeconds(40);
+        msg.setVisibleAt(claimedVisibleAt);
+        stubReceive(esm, List.of(msg));
+        when(sqsService.getQueueAttributes(eq(esm.getQueueUrl()), any(), eq("us-east-1")))
+                .thenReturn(Map.of("VisibilityTimeout", "180"));
+        InvokeResult result = new InvokeResult();
+        result.setPayload("{\"batchItemFailures\":[{\"itemIdentifier\":\"m1\"}]}".getBytes());
+        when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenAnswer(inv -> {
+                    // The function schedules its own retry before reporting the failure.
+                    msg.setVisibleAt(Instant.now().plusSeconds(10));
+                    return result;
+                });
+
+        poller.pollAndInvoke(esm);
+
+        // The claim-time visibility, not the one the function set, is what the queue compares
+        // against, so the function's retry time stands.
+        verify(sqsService, timeout(2000)).returnClaimedMessage(
+                esm.getQueueUrl(), "rh-m1", claimedVisibleAt, 180, "us-east-1");
     }
 
     // ──────────────────────────── ScalingConfig.MaximumConcurrency ────────────────────────────

@@ -228,6 +228,27 @@ class GuardedMessageQueue {
         }
     }
 
+    /**
+     * Sets a claimed message's visibility timeout only while it still has the visibility it was
+     * claimed with, so a ChangeMessageVisibility made since the claim stands. Returns whether the
+     * visibility was set.
+     */
+    boolean changeVisibilityIfUnchanged(String receiptHandle, Instant claimedVisibleAt, int visibilityTimeout) {
+        try (var _ = hold()) {
+            for (Message msg : messages) {
+                if (receiptHandle.equals(msg.getReceiptHandle())) {
+                    if (!Objects.equals(msg.getVisibleAt(), claimedVisibleAt)) {
+                        return false;
+                    }
+                    msg.setVisibleAt(Instant.now().plusSeconds(visibilityTimeout));
+                    persist();
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+
     void removeMessages(List<Message> toRemove) {
         try (var _ = hold()) {
             messages.removeAll(toRemove);
