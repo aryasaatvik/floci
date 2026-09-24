@@ -13,6 +13,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Predicate;
@@ -250,6 +251,24 @@ class GuardedMessageQueue {
                 persist();
             }
             return result;
+        }
+    }
+
+    /**
+     * Sets a claimed message's visibility timeout only while the claim is still the message's latest
+     * receive and the message still has the visibility it was claimed with, so a
+     * ChangeMessageVisibility made since the claim stands. Returns whether the visibility was set.
+     */
+    boolean changeVisibilityIfUnchanged(ReceiptHandle handle, Instant claimedVisibleAt, int visibilityTimeout) {
+        try (Guard _ = hold()) {
+            Message msg = findByMessageId(handle.messageId());
+            if (msg == null || !handle.encode().equals(msg.getReceiptHandle())
+                    || !Objects.equals(msg.getVisibleAt(), claimedVisibleAt)) {
+                return false;
+            }
+            msg.setVisibleAt(Instant.now().plusSeconds(visibilityTimeout));
+            persist();
+            return true;
         }
     }
 

@@ -1647,6 +1647,23 @@ public class SqsService implements Resettable, ResourceProvider {
         }
     }
 
+    /**
+     * Returns a message an event-source mapping claimed to the queue after {@code visibilityTimeout},
+     * unless its visibility changed since the claim at {@code claimedVisibleAt}: a consumer that
+     * called ChangeMessageVisibility during its invocation chose when it is retried.
+     */
+    public boolean returnClaimedMessage(String queueUrl, String receiptHandle, Instant claimedVisibleAt,
+                                        int visibilityTimeout, String region) {
+        String storageKey = regionKey(region, queueUrl);
+        ReceiptHandle handle = receiptHandle == null ? null : ReceiptHandle.parse(receiptHandle);
+        if (handle == null || getQueueByUrl(storageKey, queueUrl).isEmpty()) {
+            return false;
+        }
+        GuardedMessageQueue messages = getOrCreateQueue(storageKey);
+        messages.activity().accessed();
+        return messages.changeVisibilityIfUnchanged(handle, claimedVisibleAt, visibilityTimeout);
+    }
+
     private static void rejectUnusableHandle(GuardedMessageQueue.HandleResult result, String receiptHandle,
                                              boolean inBatch) {
         if (result == GuardedMessageQueue.HandleResult.HANDLE_EXPIRED) {
