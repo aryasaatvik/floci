@@ -52,8 +52,16 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `ListFunctionEventInvokeConfigs` | List the asynchronous invocation settings of every version and alias of a function |
 
 The event invoke configuration is stored and returned as AWS does, and `AWS::Lambda::EventInvokeConfig`
-provisions it from a stack. Asynchronous invocations do not yet apply its retry, event age or
-destination settings.
+provisions it from a stack. An asynchronous invocation applies the configuration on the invoked
+qualifier, else the unqualified function's, else AWS's defaults (2 retries, 6 hours):
+
+- A function error, timeout or initialization failure is retried up to `MaximumRetryAttempts`
+  times. The first retry waits `FLOCI_SERVICES_LAMBDA_ASYNC_RETRY_BASE_DELAY_MS` (one minute, as
+  on AWS) and each later retry doubles it.
+- A retry that falls due once the event is older than `MaximumEventAgeInSeconds` is dropped.
+- A dropped event's invocation record (`RetriesExhausted` or `EventAgeExceeded`) goes to the
+  `OnFailure` destination, and a successful invocation's record (`Success`) to `OnSuccess`.
+  SQS destinations are delivered; other destination types are logged and skipped.
 
 ## Hot-Reloading via Reactive S3 Sync
 
@@ -259,6 +267,7 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_RUNTIME_API_MAX_PORT` | `12499` | Last port in the Lambda Runtime API range. One port is held per running container, so the range width caps concurrent executions |
 | `FLOCI_SERVICES_LAMBDA_CODE_PATH` | `./data/lambda-code` | Directory where Lambda ZIP files are stored |
 | `FLOCI_SERVICES_LAMBDA_POLL_INTERVAL_MS` | `1000` | Event-source mapping poll interval (milliseconds) |
+| `FLOCI_SERVICES_LAMBDA_ASYNC_RETRY_BASE_DELAY_MS` | `60000` | Delay before the first retry of a failed asynchronous invocation; later retries double it |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS` | `300` | Idle container shutdown timeout (seconds) |
 | `FLOCI_SERVICES_LAMBDA_MAX_PHYSICAL_ENVIRONMENTS` | *(unset)* | Optional cap on live Docker execution environments (active plus retained warm). When unset, the historical unbounded behavior is preserved |
 | `FLOCI_SERVICES_LAMBDA_PHYSICAL_ENVIRONMENT_WAIT_TIMEOUT_SECONDS` | `15` | Maximum fair-queue wait for a physical environment slot when the cap is enabled; this wait is separate from the function timeout |

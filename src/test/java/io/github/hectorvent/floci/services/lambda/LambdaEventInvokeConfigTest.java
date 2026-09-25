@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.services.lambda.model.AsyncInvokePolicy;
 import io.github.hectorvent.floci.services.lambda.model.FunctionEventInvokeConfig;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
@@ -144,5 +145,75 @@ class LambdaEventInvokeConfigTest {
                 cfg.getDestinationConfig().getOnSuccess().getDestination());
         assertEquals("arn:aws:sqs:us-east-1:000000000000:dlq",
                 cfg.getDestinationConfig().getOnFailure().getDestination());
+    }
+
+    @Test
+    void asyncPolicyUsesAwsDefaultsWithoutConfig() {
+        LambdaFunction fn = service.getFunction(REGION, "test-fn");
+
+        AsyncInvokePolicy policy = service.asyncInvokePolicy(REGION, fn, null);
+
+        assertEquals(fn.getFunctionArn() + ":$LATEST", policy.invokedFunctionArn());
+        assertEquals(2, policy.maximumRetryAttempts());
+        assertEquals(21600, policy.maximumEventAgeSeconds());
+        assertNull(policy.onFailureDestination());
+        assertNull(policy.onSuccessDestination());
+    }
+
+    @Test
+    void asyncPolicyAppliesUnqualifiedConfigToLatest() {
+        service.putEventInvokeConfig(REGION, "test-fn", null, Map.of(
+                "MaximumRetryAttempts", 1,
+                "MaximumEventAgeInSeconds", 3600,
+                "DestinationConfig", Map.of("OnFailure",
+                        Map.of("Destination", "arn:aws:sqs:us-east-1:000000000000:dlq"))));
+        LambdaFunction fn = service.getFunction(REGION, "test-fn");
+
+        AsyncInvokePolicy policy = service.asyncInvokePolicy(REGION, fn, null);
+
+        assertEquals(1, policy.maximumRetryAttempts());
+        assertEquals(3600, policy.maximumEventAgeSeconds());
+        assertEquals("arn:aws:sqs:us-east-1:000000000000:dlq", policy.onFailureDestination());
+        assertEquals(policy, service.asyncInvokePolicy(REGION, fn, "$LATEST"));
+    }
+
+    @Test
+    void asyncPolicyPrefersTheInvokedQualifiersConfig() {
+        service.putEventInvokeConfig(REGION, "test-fn", null, Map.of("MaximumRetryAttempts", 2));
+        service.putEventInvokeConfig(REGION, "test-fn", "live", Map.of(
+                "MaximumRetryAttempts", 0,
+                "DestinationConfig", Map.of("OnFailure",
+                        Map.of("Destination", "arn:aws:sqs:us-east-1:000000000000:live-dlq"))));
+        LambdaFunction version = publishedVersionSnapshot("7");
+
+        AsyncInvokePolicy policy = service.asyncInvokePolicy(REGION, version, "live");
+
+        assertEquals(service.getFunction(REGION, "test-fn").getFunctionArn() + ":live", policy.invokedFunctionArn());
+        assertEquals(0, policy.maximumRetryAttempts());
+        assertEquals("arn:aws:sqs:us-east-1:000000000000:live-dlq", policy.onFailureDestination());
+    }
+
+    @Test
+    void asyncPolicyFallsBackToUnqualifiedConfigForAQualifierWithoutOne() {
+        service.putEventInvokeConfig(REGION, "test-fn", null, Map.of(
+                "MaximumRetryAttempts", 1,
+                "DestinationConfig", Map.of("OnFailure",
+                        Map.of("Destination", "arn:aws:sqs:us-east-1:000000000000:dlq"))));
+        LambdaFunction version = publishedVersionSnapshot("7");
+
+        AsyncInvokePolicy policy = service.asyncInvokePolicy(REGION, version, "7");
+
+        assertEquals(service.getFunction(REGION, "test-fn").getFunctionArn() + ":7", policy.invokedFunctionArn());
+        assertEquals(1, policy.maximumRetryAttempts());
+        assertEquals("arn:aws:sqs:us-east-1:000000000000:dlq", policy.onFailureDestination());
+    }
+
+    private LambdaFunction publishedVersionSnapshot(String version) {
+        LambdaFunction latest = service.getFunction(REGION, "test-fn");
+        LambdaFunction snapshot = new LambdaFunction();
+        snapshot.setFunctionName(latest.getFunctionName());
+        snapshot.setFunctionArn(latest.getFunctionArn() + ":" + version);
+        snapshot.setVersion(version);
+        return snapshot;
     }
 }

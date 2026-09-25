@@ -44,7 +44,8 @@ class LambdaExecutorServiceTest {
 
     @BeforeEach
     void setUp() {
-        executor = new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter);
+        executor = new LambdaExecutorService(warmPool, new ObjectMapper(), concurrencyLimiter,
+                mock(LambdaAsyncDestinations.class), 60_000);
 
         fn = new LambdaFunction();
         fn.setFunctionName("test-fn");

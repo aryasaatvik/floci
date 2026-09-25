@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
+import io.github.hectorvent.floci.services.lambda.model.AsyncInvokePolicy;
 import io.github.hectorvent.floci.services.lambda.model.FunctionEventInvokeConfig;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
@@ -44,6 +45,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -1028,7 +1030,15 @@ public class LambdaService implements ResourceProvider {
     }
 
     public InvokeResult invoke(String region, String functionName, byte[] payload, InvocationType type) {
-        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionName);
+        return invoke(region, functionName, null, payload, type);
+    }
+
+    /** Invokes {@code functionName}, applying a {@code ?Qualifier=} value the way Invoke does. */
+    public InvokeResult invoke(String region, String functionName, String qualifierParam, byte[] payload,
+                               InvocationType type) {
+        LambdaArnUtils.ResolvedFunctionRef ref = qualifierParam == null
+                ? LambdaArnUtils.resolve(functionName)
+                : LambdaArnUtils.resolveWithQualifier(functionName, qualifierParam);
         enforceRegion(region, ref);
         String name = ref.name();
         String qualifier = ref.qualifier();
@@ -1040,9 +1050,7 @@ public class LambdaService implements ResourceProvider {
             fn = resolveInvokeTarget(region, name, qualifier);
         }
         reportCustomResourceLiveness(payload);
-        InvokeResult result = executorService.invoke(fn, payload, type);
-        result.setExecutedVersion(fn.getVersion());
-        return result;
+        return dispatchInvoke(region, fn, qualifier, payload, type);
     }
 
     /** Invokes a Lambda target ARN using the account encoded in that ARN. */
@@ -1051,9 +1059,40 @@ public class LambdaService implements ResourceProvider {
         LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionArn);
         LambdaFunction fn = resolveInvokeTargetForAccount(
                 arn.accountId(), arn.region(), ref.name(), ref.qualifier());
-        InvokeResult result = executorService.invoke(fn, payload, type);
+        return dispatchInvoke(arn.region(), fn, ref.qualifier(), payload, type);
+    }
+
+    private InvokeResult dispatchInvoke(String region, LambdaFunction fn, String qualifier, byte[] payload,
+                                        InvocationType type) {
+        InvokeResult result = type == InvocationType.Event
+                ? executorService.invokeAsync(fn, payload, asyncInvokePolicy(region, fn, qualifier))
+                : executorService.invoke(fn, payload, type);
         result.setExecutedVersion(fn.getVersion());
         return result;
+    }
+
+    /**
+     * Resolves the event-invoke config that governs an Event invocation: the config on the
+     * invoked qualifier, else the unqualified function's, else AWS's defaults.
+     */
+    AsyncInvokePolicy asyncInvokePolicy(String region, LambdaFunction fn, String qualifier) {
+        String unqualifiedArn = unqualifiedFunctionArn(fn.getFunctionArn());
+        String effectiveQualifier = qualifier == null || qualifier.isBlank() ? "$LATEST" : qualifier;
+        FunctionEventInvokeConfig config = eventInvokeConfigs.get(
+                eventInvokeKey(region, unqualifiedArn, effectiveQualifier));
+        if (config == null && !"$LATEST".equals(effectiveQualifier)) {
+            config = eventInvokeConfigs.get(eventInvokeKey(region, unqualifiedArn, null));
+        }
+        return AsyncInvokePolicy.from(unqualifiedArn + ":" + effectiveQualifier, config);
+    }
+
+    /** A published version's snapshot carries its qualified ARN; strip it back to the function. */
+    private static String unqualifiedFunctionArn(String functionArn) {
+        String[] parts = functionArn.split(":", -1);
+        if (parts.length <= 7) {
+            return functionArn;
+        }
+        return String.join(":", Arrays.copyOf(parts, 7));
     }
 
     /**

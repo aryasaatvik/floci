@@ -194,6 +194,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_LAMBDA_RUNTIME_API_MAX_PORT` | `12499` | Last port in the Lambda Runtime API port range. One port is held per running Lambda container, so the range width is the concurrent-execution ceiling |
 | `FLOCI_SERVICES_LAMBDA_CODE_PATH` | `./data/lambda-code` | Container path where Lambda deployment ZIPs are stored |
 | `FLOCI_SERVICES_LAMBDA_POLL_INTERVAL_MS` | `1000` | How often (ms) the SQS and Kinesis event source pollers check for new messages |
+| `FLOCI_SERVICES_LAMBDA_ASYNC_RETRY_BASE_DELAY_MS` | `60000` | Delay (ms) before the first retry of a failed asynchronous invocation; each later retry doubles it |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_IDLE_TIMEOUT_SECONDS` | `300` | Seconds of inactivity before an idle Lambda container is removed |
 | `FLOCI_SERVICES_LAMBDA_MAX_PHYSICAL_ENVIRONMENTS` | _(unset)_ | Optional cap on live Lambda execution environments (active plus retained warm); unset preserves the historical behavior |
 | `FLOCI_SERVICES_LAMBDA_PHYSICAL_ENVIRONMENT_WAIT_TIMEOUT_SECONDS` | `15` | Maximum fair-queue wait (seconds) for a physical environment slot when the cap is enabled |

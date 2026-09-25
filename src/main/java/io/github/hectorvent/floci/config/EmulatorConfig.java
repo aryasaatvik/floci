@@ -2207,6 +2207,16 @@ public interface EmulatorConfig {
         @WithDefault("1000")
         long pollIntervalMs();
 
+        /**
+         * Delay before the first retry of a failed asynchronous (Event) invocation. Each later
+         * retry doubles it, matching AWS's roughly one then two minutes. Lower it to exercise
+         * retries and OnFailure destinations quickly in local development and tests.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_ASYNC_RETRY_BASE_DELAY_MS
+         */
+        @WithDefault("60000")
+        long asyncRetryBaseDelayMs();
+
         @WithDefault("false")
         boolean ephemeral();
 
