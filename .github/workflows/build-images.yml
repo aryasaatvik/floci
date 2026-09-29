@@ -1,6 +1,21 @@
 name: Build Floci Images
 
 on:
+  workflow_dispatch:
+    inputs:
+      source-ref:
+        description: Full Floci source commit SHA to publish
+        required: true
+        type: string
+      image:
+        description: OCI image repository including registry host, without a tag or digest
+        required: true
+        type: string
+      publish-native:
+        description: Also publish native and native compatibility images
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       source-ref:

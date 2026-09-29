@@ -79,6 +79,13 @@ trigger, destination registry, credentials, and package permissions; the shared
 workflow owns the multi-architecture manifest, image labels, and provenance
 output.
 
+The same workflow also accepts a manual dispatch. Select the workflow revision
+that contains the desired build contract, pass the full source commit SHA as
+`source-ref`, and provide the destination repository as `image`. Leave
+`publish-native` false for the JVM and Cedar images. Manual publication uses the
+same build, digest outputs, and provenance artifact as a reusable call; it does
+not update a consumer's image selection.
+
 For example, a fork can keep this small manual caller on its default branch:
 
 ```yaml title=".github/workflows/publish-images.yml"
