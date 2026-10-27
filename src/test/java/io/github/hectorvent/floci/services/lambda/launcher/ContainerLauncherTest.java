@@ -71,6 +71,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
@@ -498,8 +499,46 @@ class ContainerLauncherTest {
                 "io.floci.service", "lambda",
                 "io.floci.resource-id", "standard-fn",
                 "io.floci.account", "222222222222",
-                "io.floci.region", "us-west-2"),
+                "io.floci.region", "us-west-2",
+                "io.floci.owner", "4566",
+                "io.floci.component", "execution",
+                "io.floci.lambda.function", "standard-fn",
+                "io.floci.lambda.code", "0",
+                "io.floci.lambda.environment", "arn:aws:lambda:us-west-2:222222222222:function:standard-fn"),
                 spec.labels());
+    }
+
+    @Test
+    void launchFunction_labelsCodeVolumeAndItsPopulatorWithTheFunction() throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("labelled-large-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]);
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("large-fn");
+        fn.setFunctionArn("arn:aws:lambda:us-west-2:222222222222:function:large-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setCodeSha256("large-fn-sha-v1");
+        when(lifecycleManager.create(any())).thenReturn("helper-123", "container-123");
+
+        withLoweredCodeVolumeThreshold(() -> launcher.launch(fn));
+
+        Map<String, String> function = Map.of(
+                "io.floci.service", "lambda",
+                "io.floci.account", "222222222222",
+                "io.floci.owner", "4566",
+                "io.floci.lambda.function", "large-fn",
+                "io.floci.lambda.code", "large-fn-sha-v1",
+                "io.floci.lambda.environment", "arn:aws:lambda:us-west-2:222222222222:function:large-fn");
+        ArgumentCaptor<Map<String, String>> volumeLabels = ArgumentCaptor.forClass(Map.class);
+        verify(lifecycleManager).ensureVolume(any(), volumeLabels.capture());
+        assertTrue(volumeLabels.getValue().entrySet().containsAll(function.entrySet()));
+        assertEquals("code-volume", volumeLabels.getValue().get("io.floci.component"));
+        ArgumentCaptor<ContainerSpec> specs = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(lifecycleManager, times(2)).create(specs.capture());
+        Map<String, String> populator = specs.getAllValues().getFirst().labels();
+        assertTrue(populator.entrySet().containsAll(function.entrySet()));
+        assertEquals("code-populator", populator.get("io.floci.component"));
     }
 
     @Test
@@ -1348,7 +1387,7 @@ class ContainerLauncherTest {
                 "/var/task should be copied exactly once (into the populate helper)");
         // Two creates: the helper + the real container. The helper is discarded.
         verify(lifecycleManager, times(2)).create(any());
-        verify(lifecycleManager, atLeastOnce()).ensureVolume(any());
+        verify(lifecycleManager, atLeastOnce()).ensureVolume(any(), anyMap());
         verify(lifecycleManager).stopAndRemove("helper-123", null, 0);
         verify(lifecycleManager, never()).stopAndRemove(any(), any());
         InOrder order = inOrder(lifecycleManager);
@@ -1410,7 +1449,7 @@ class ContainerLauncherTest {
         fn.setCodeSha256("leak-fn-sha-v1");
 
         // The code-volume populate fails (daemon under load), before any container is created.
-        doThrow(new RuntimeException("docker daemon busy")).when(lifecycleManager).ensureVolume(any());
+        doThrow(new RuntimeException("docker daemon busy")).when(lifecycleManager).ensureVolume(any(), anyMap());
 
         withLoweredCodeVolumeThreshold(() -> {
             assertThrows(RuntimeException.class, () -> launcher.launch(fn));

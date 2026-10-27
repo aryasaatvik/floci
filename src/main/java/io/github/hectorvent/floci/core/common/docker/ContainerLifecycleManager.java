@@ -1274,6 +1274,36 @@ public class ContainerLifecycleManager {
     }
 
     /**
+     * Containers, running or not, carrying every one of {@code labels}. Docker filters on the
+     * labels; each result is checked against them again, so a runtime that ignores the filter
+     * cannot hand back a foreign container.
+     */
+    public List<Container> listContainersByLabels(Map<String, String> labels) {
+        List<Container> containers = dockerClient.listContainersCmd()
+                .withShowAll(true)
+                .withLabelFilter(labels)
+                .exec();
+        return containers == null ? List.of()
+                : containers.stream().filter(container -> hasLabels(container.getLabels(), labels)).toList();
+    }
+
+    /** Volumes carrying every one of {@code labels}, checked as {@link #listContainersByLabels} does. */
+    public List<InspectVolumeResponse> listVolumesByLabels(Map<String, String> labels) {
+        List<String> filter = labels.entrySet().stream()
+                .map(entry -> entry.getKey() + "=" + entry.getValue())
+                .toList();
+        ListVolumesResponse response = dockerClient.listVolumesCmd().withFilter("label", filter).exec();
+        List<InspectVolumeResponse> volumes = response == null ? null : response.getVolumes();
+        return volumes == null ? List.of()
+                : volumes.stream().filter(volume -> hasLabels(volume.getLabels(), labels)).toList();
+    }
+
+    private static boolean hasLabels(Map<String, String> actual, Map<String, String> required) {
+        return actual != null && required.entrySet().stream()
+                .allMatch(entry -> entry.getValue().equals(actual.get(entry.getKey())));
+    }
+
+    /**
      * Capability names as a task definition or a caller gives them, with or without the
      * {@code CAP_} prefix and in any case. A name Docker does not know fails the create, as
      * {@code docker run --cap-add} does.

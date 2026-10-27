@@ -26,6 +26,7 @@ import io.github.hectorvent.floci.services.lambda.DynamoDbStreamsEventSourcePoll
 import io.github.hectorvent.floci.services.lambda.KinesisEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.SqsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.durable.DurableExecutionService;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaDockerResourceReconciler;
 import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerManager;
 import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
 import io.github.hectorvent.floci.services.pipes.PipesService;
@@ -123,6 +124,8 @@ class EmulatorLifecycleTest {
     @Mock private StepFunctionsService stepFunctionsService;
     @Mock private DurableExecutionService durableExecutionService;
     @Mock private Instance<ContainerTeardown> containerTeardowns;
+    @Mock private Instance<LambdaDockerResourceReconciler> lambdaDockerResources;
+    @Mock private LambdaDockerResourceReconciler lambdaDockerResourceReconciler;
     @Mock private DynamoDbRuntime dynamoDbRuntime;
     @Mock private RedshiftDynamoDbZeroEtlConsumer redshiftZeroEtlConsumer;
 
@@ -168,7 +171,7 @@ class EmulatorLifecycleTest {
                 pipesService, ec2MetadataServer, ecsTaskRoleCredentialsServer, ecrRegistryManager, flociUiManager, initLifecycleState,
                 schemaCreationWorker, stepFunctionsService, durableExecutionService, containerTeardowns,
                 persistentPathValidator,
-                dynamoDbRuntime, redshiftZeroEtlConsumer, eksService);
+                dynamoDbRuntime, redshiftZeroEtlConsumer, eksService, lambdaDockerResources);
         Mockito.lenient().when(containerTeardowns.iterator())
                 .thenReturn(java.util.Collections.emptyIterator());
     }
@@ -196,6 +199,36 @@ class EmulatorLifecycleTest {
         inOrder.verify(iamService).sweepOrphanedLambdaExecutionRoleSessions();
         inOrder.verify(iamService).sweepOrphanedEc2InstanceSessions();
         inOrder.verify(rdsService).restorePersistedRuntime();
+    }
+
+    @Test
+    void reclaimsLeftoverLambdaDockerResourcesAfterStorageLoadAndBeforeThePollers() {
+        stubStorageConfig();
+        when(lambdaServiceConfig.enabled()).thenReturn(true);
+        when(lambdaServiceConfig.executor()).thenReturn("docker");
+        when(lambdaDockerResources.get()).thenReturn(lambdaDockerResourceReconciler);
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        InOrder inOrder = Mockito.inOrder(storageFactory, lambdaDockerResourceReconciler, sqsPoller);
+        inOrder.verify(storageFactory).loadAll();
+        inOrder.verify(lambdaDockerResourceReconciler).reconcileAtStartup();
+        inOrder.verify(sqsPoller).startPersistedPollers();
+    }
+
+    @Test
+    void leavesKubernetesLambdaEnvironmentsToTheirExecutor() {
+        stubStorageConfig();
+        when(lambdaServiceConfig.enabled()).thenReturn(true);
+        when(lambdaServiceConfig.executor()).thenReturn("kubernetes");
+        when(initializationHooksRunner.hasHooks(InitializationHook.START)).thenReturn(false);
+        when(initializationHooksRunner.hasHooks(InitializationHook.READY)).thenReturn(false);
+
+        emulatorLifecycle.onStart(Mockito.mock(StartupEvent.class));
+
+        Mockito.verifyNoInteractions(lambdaDockerResources);
     }
 
     @Test

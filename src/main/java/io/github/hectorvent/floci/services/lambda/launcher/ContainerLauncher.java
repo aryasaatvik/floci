@@ -46,6 +46,7 @@ import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
@@ -296,6 +297,9 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                         "lambda", fn.getFunctionName(), lambdaAccountId, lambdaRegion));
 
         applyDockerFlags(specBuilder, dockerFlags);
+        // After the configured flags, so a flag cannot relabel the container's owner or function.
+        specBuilder.withLabels(LambdaDockerResourceLabels.forFunction(config, fn,
+                LambdaDockerResourceLabels.EXECUTION, lambdaAccountId, lambdaRegion));
 
         specBuilder.withEmbeddedDns();
 
@@ -990,7 +994,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     }
 
     void populateCodeVolume(String volName, LambdaFunction fn, String image) {
-        lifecycleManager.ensureVolume(volName);
+        lifecycleManager.ensureVolume(volName, functionLabels(fn, LambdaDockerResourceLabels.CODE_VOLUME));
         String shortId = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         // A minimal helper container (sleep) with the volume mounted read-write at /var/task; we
         // tar-copy the code into it, then discard it — the data persists in the volume.
@@ -998,6 +1002,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .withName(ContainerStorageHelper.prefixedDockerName(config, resolveContainerNamePrefix(config),
                         "codevol-" + fn.getFunctionName() + "-" + shortId))
                 .withEnv(java.util.List.of())
+                .withLabels(functionLabels(fn, LambdaDockerResourceLabels.CODE_POPULATOR))
                 .withEntrypoint(java.util.List.of("sleep"))
                 .withCmd(java.util.List.of("3600"))
                 .withNamedVolume(volName, TASK_DIR, false);
@@ -1022,6 +1027,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             }
             populateSemaphore.release();
         }
+    }
+
+    private Map<String, String> functionLabels(LambdaFunction fn, String component) {
+        return LambdaDockerResourceLabels.forFunction(config, fn, component,
+                AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId()),
+                extractRegionFromArn(fn.getFunctionArn(), config.defaultRegion()));
     }
 
     // A code volume survives an emulator restart, but the in-process populatedCodeVolumes set does not.

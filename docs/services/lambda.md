@@ -679,6 +679,24 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
     trades some warm hits for the memory bound. A negative value is ignored with a warning and
     leaves the total unbounded, like `0`.
 
+!!! note "Docker labels and leftover environments"
+    Every container and code volume the Docker executor creates carries `io.floci.service=lambda`,
+    the function's `io.floci.account` and `io.floci.region`, the deployment's `io.floci.owner`
+    (its resource namespace and API port) and an `io.floci.component`: `execution`,
+    `code-volume` or `code-populator`. Three more labels name what it serves:
+
+    | Label | Value |
+    |---|---|
+    | `io.floci.lambda.function` | The function's name |
+    | `io.floci.lambda.code` | The function's `CodeSha256` (its last-modified time when it has none) |
+    | `io.floci.lambda.environment` | The execution environment: the function version's ARN |
+
+    A Floci process that stops without draining its warm pool, such as after a crash, leaves its
+    containers running. At startup, before any event-source poller runs, Floci removes every
+    `execution` and `code-populator` container of its own owner, then every code volume of its
+    owner that no current function version mounts. Containers and volumes of another owner, and
+    unlabelled ones from older releases, are left alone.
+
 ### Slow cold starts
 
 A cold start has two budgets. The Init phase runs from the moment the container has started

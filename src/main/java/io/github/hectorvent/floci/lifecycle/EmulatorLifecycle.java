@@ -31,6 +31,7 @@ import io.github.hectorvent.floci.services.lambda.DynamoDbStreamsEventSourcePoll
 import io.github.hectorvent.floci.services.lambda.KinesisEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.SqsEventSourcePoller;
 import io.github.hectorvent.floci.services.lambda.durable.DurableExecutionService;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaDockerResourceReconciler;
 import io.github.hectorvent.floci.services.memorydb.container.MemoryDbContainerManager;
 import io.github.hectorvent.floci.services.memorydb.proxy.MemoryDbProxyManager;
 import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerManager;
@@ -120,6 +121,7 @@ public class EmulatorLifecycle {
     private final EksService eksService;
     private final DynamoDbRuntime dynamoDbRuntime;
     private final RedshiftDynamoDbZeroEtlConsumer redshiftZeroEtlConsumer;
+    private final Instance<LambdaDockerResourceReconciler> lambdaDockerResources;
     // Set on the boot thread, read by the async HttpServerStart observer.
     private volatile CompletableFuture<Void> metadataServerStarted = CompletableFuture.completedFuture(null);
 
@@ -163,7 +165,8 @@ public class EmulatorLifecycle {
                              PersistentPathValidator persistentPathValidator,
                              DynamoDbRuntime dynamoDbRuntime,
                              RedshiftDynamoDbZeroEtlConsumer redshiftZeroEtlConsumer,
-                             EksService eksService) {
+                             EksService eksService,
+                             Instance<LambdaDockerResourceReconciler> lambdaDockerResources) {
         this.storageFactory = storageFactory;
         this.serviceRegistry = serviceRegistry;
         this.config = config;
@@ -205,6 +208,7 @@ public class EmulatorLifecycle {
         this.eksService = eksService;
         this.dynamoDbRuntime = dynamoDbRuntime;
         this.redshiftZeroEtlConsumer = redshiftZeroEtlConsumer;
+        this.lambdaDockerResources = lambdaDockerResources;
     }
 
     void onStart(@Observes StartupEvent ignored) {
@@ -251,6 +255,10 @@ public class EmulatorLifecycle {
         stepFunctionsService.abortAbandonedExecutions();
         if (config.services().lambda().enabled()) {
             durableExecutionService.recoverAfterRestart();
+            // Before any poller or request can launch an environment of its own.
+            if ("docker".equalsIgnoreCase(config.services().lambda().executor().trim())) {
+                lambdaDockerResources.get().reconcileAtStartup();
+            }
         }
 
         // The selected DynamoDB backend is ready before any persisted stream consumer reads it.
