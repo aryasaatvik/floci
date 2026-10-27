@@ -197,7 +197,10 @@ public class S3VirtualHostFilter implements ContainerRequestFilter {
      * <p>Reverse proxies (e.g. Traefik, Nginx, ALB) often rewrite the {@code Host} header
      * to the internal upstream address (e.g. {@code floci:4566}) and forward the client's
      * original host in {@code X-Forwarded-Host}. When present, that header takes priority
-     * so virtual-hosted bucket names survive reverse proxying.
+     * so virtual-hosted bucket names survive reverse proxying. A {@code Host} that already
+     * names another AWS service ({@code <api-id>.execute-api.<region>.amazonaws.com}) was
+     * not rewritten to an upstream: the proxy addressed that service, so it stays
+     * authoritative over the client's original host.
      *
      * @param hostHeader the value of the {@code Host} header, or {@code null}
      * @param xForwardedHost the value of the {@code X-Forwarded-Host} header, or {@code null}
@@ -205,6 +208,9 @@ public class S3VirtualHostFilter implements ContainerRequestFilter {
      * @return the effective authority ({@code host[:port]}), or {@code null} if neither is available
      */
     static String resolveHost(String hostHeader, String xForwardedHost, URI requestUri) {
+        if (hostHeader != null && namesNonS3Service(stripPort(hostHeader.trim()))) {
+            return hostHeader.trim();
+        }
         if (xForwardedHost != null && !xForwardedHost.isBlank()) {
             String first = xForwardedHost.split(",", -1)[0].trim();
             if (!first.isEmpty()) {
@@ -580,6 +586,17 @@ public class S3VirtualHostFilter implements ContainerRequestFilter {
             }
         }
         return null;
+    }
+
+    /** Whether a host addresses another AWS service that shares the endpoint host with S3. */
+    private static boolean namesNonS3Service(String hostname) {
+        String[] labels = hostname.split("\\.", -1);
+        for (int i = 1; i < labels.length; i++) {
+            if (NON_S3_SERVICE_LABELS.contains(labels[i].toLowerCase())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isValidCandidateBucket(String candidate) {

@@ -791,6 +791,30 @@ class S3VirtualHostFilterTest {
     }
 
     @Test
+    void resolveHostKeepsAHostThatNamesAnotherService() {
+        URI uri = URI.create("http://127.0.0.1:4566/execute-api/abc123/$default/v1/health");
+        assertEquals("abc123.execute-api.us-east-1.amazonaws.com",
+                S3VirtualHostFilter.resolveHost("abc123.execute-api.us-east-1.amazonaws.com",
+                        "app.api.example.localhost", uri));
+    }
+
+    @Test
+    void filterLeavesAnExecuteApiRequestBehindAReverseProxyAlone() {
+        URI requestUri = URI.create("http://127.0.0.1:4566/execute-api/abc123/%24default/v1/health");
+        UriInfo uriInfo = mock(UriInfo.class);
+        when(uriInfo.getRequestUri()).thenReturn(requestUri);
+        when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getUriInfo()).thenReturn(uriInfo);
+        when(ctx.getHeaderString("Host")).thenReturn("abc123.execute-api.us-east-1.amazonaws.com");
+        when(ctx.getHeaderString("X-Forwarded-Host")).thenReturn("app.api.example.localhost");
+
+        new S3VirtualHostFilter().filter(ctx);
+
+        verify(ctx, never()).setRequestUri(any());
+    }
+
+    @Test
     void bucketBeforeS3QualifierExtractsBucketOnCustomDomains() {
         assertEquals("my-bucket",
                 S3VirtualHostFilter.bucketBeforeS3Qualifier("my-bucket.s3.us-east-1.floci.apps.mesirendon.com"));
