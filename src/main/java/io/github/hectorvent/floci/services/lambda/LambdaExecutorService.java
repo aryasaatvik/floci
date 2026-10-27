@@ -367,6 +367,12 @@ public class LambdaExecutorService implements Resettable {
             if (handle == null) {
                 handle = warmPool.acquire(fn);
             }
+        } catch (LambdaEnvironmentLimiter.AdmissionTimeoutException
+                 | LambdaEnvironmentLimiter.AdmissionInterruptedException e) {
+            // The invocation never reached an environment, so it is not an init failure.
+            LOG.warnv("No physical environment for function {0}: {1}", fn.getFunctionName(), e.getMessage());
+            return new InvokeResult(200, "Unhandled",
+                    buildErrorPayload(e.getMessage(), "Lambda.EnvironmentTimeout"), null, requestId);
         } catch (Exception e) {
             LOG.warnv("Failed to acquire container for function {0}: {1}", fn.getFunctionName(), e.getMessage());
             return new InvokeResult(200, "Unhandled",

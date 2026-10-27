@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServiceRegistry;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbBackendSelector;
+import io.github.hectorvent.floci.services.lambda.LambdaEnvironmentLimiter;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -54,7 +55,8 @@ class EmulatorInfoControllerTest {
     @BeforeEach
     void setUp() {
         controller = new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
-                resettables, containerTeardowns, certificateAuthority, config, dynamoDbBackendSelector);
+                resettables, containerTeardowns, certificateAuthority, config, dynamoDbBackendSelector,
+                new LambdaEnvironmentLimiter());
     }
 
     @Test
@@ -79,7 +81,8 @@ class EmulatorInfoControllerTest {
         when(serviceRegistry.getServices()).thenReturn(Map.of("s3", "running", "ec2", "available"));
 
         Map<?, ?> info = (Map<?, ?>) new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
-                resettables, containerTeardowns, certificateAuthority, manifestConfig, dynamoDbBackendSelector)
+                resettables, containerTeardowns, certificateAuthority, manifestConfig, dynamoDbBackendSelector,
+                new LambdaEnvironmentLimiter())
                 .info().getEntity();
 
         assertEquals(1, info.get("manifest_version"));
@@ -98,7 +101,7 @@ class EmulatorInfoControllerTest {
     private EmulatorInfoController manifestController() {
         return new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
                 resettables, containerTeardowns, certificateAuthority, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
-                dynamoDbBackendSelector);
+                dynamoDbBackendSelector, new LambdaEnvironmentLimiter());
     }
 
     @Test

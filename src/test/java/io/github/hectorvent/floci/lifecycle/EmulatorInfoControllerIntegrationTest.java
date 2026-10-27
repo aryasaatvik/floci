@@ -160,6 +160,22 @@ class EmulatorInfoControllerIntegrationTest {
                 .body("status", equalTo("OK"));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"_floci", "_localstack"})
+    void capacityReportsPhysicalLambdaEnvironmentsWithTheUncappedSentinel(String prefix) {
+        given()
+            .when().get("/" + prefix + "/capacity")
+            .then()
+                .statusCode(200)
+                .body("configuredLimit", equalTo(0))
+                .body("total", equalTo(0))
+                .body("active", equalTo(0))
+                .body("idle", equalTo(0))
+                .body("retiring", equalTo(0))
+                .body("queued", equalTo(0))
+                .body("available", equalTo(Integer.MAX_VALUE));
+    }
+
     @Test
     void stateReset_keepsBootstrapStateOfServicesThatReseedOnClear() {
         // IAM Identity Center recreates its bootstrap instance in clear(). A reset that wiped

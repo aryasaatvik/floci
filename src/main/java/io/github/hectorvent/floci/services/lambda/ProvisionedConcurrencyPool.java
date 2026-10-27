@@ -58,7 +58,10 @@ public class ProvisionedConcurrencyPool implements Resettable {
     private final int maxTotal;
     private final boolean ephemeral;
     private final long drainTimeoutNanos;
+    private final LambdaEnvironmentLimiter environmentLimiter;
     private final Map<String, Allocation> allocations = new HashMap<>();
+    /** Each owned environment's place under the physical cap, until its stop is confirmed. */
+    private final Map<ContainerHandle, LambdaEnvironmentLimiter.Slot> slots = new HashMap<>();
     private final Map<ContainerHandle, Allocation> leases = new HashMap<>();
     private final Map<ContainerHandle, Configuration> owned = new HashMap<>();
     private final Set<Allocation> launchingAllocations = new HashSet<>();
@@ -105,16 +108,27 @@ public class ProvisionedConcurrencyPool implements Resettable {
     @Inject
     public ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
                                      LambdaAliasStore aliases, StorageFactory storageFactory,
-                                     EmulatorConfig config, Clock clock) {
+                                     EmulatorConfig config, Clock clock,
+                                     LambdaEnvironmentLimiter environmentLimiter) {
         this(launcher, functions, aliases, storageFactory.create("lambda",
                         "lambda-provisioned-concurrency.json", new TypeReference<>() {}),
                 clock, WarmPool.resolveMaxPerFunction(config), WarmPool.resolveMaxTotal(config),
-                config.services().lambda().ephemeral(), WarmPool.resolveDrainTimeout(config));
+                config.services().lambda().ephemeral(), WarmPool.resolveDrainTimeout(config),
+                environmentLimiter);
     }
 
     ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
                               LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
                               Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds) {
+        this(launcher, functions, aliases, storage, clock, maxPerFunction, maxTotal, ephemeral, drainSeconds,
+                new LambdaEnvironmentLimiter());
+    }
+
+    ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                              LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
+                              Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
+                              LambdaEnvironmentLimiter environmentLimiter) {
+        this.environmentLimiter = environmentLimiter;
         this.launcher = launcher;
         this.functions = functions;
         this.aliases = aliases;
@@ -267,6 +281,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                     selected = candidate;
                     leases.put(candidate, allocation);
                     candidate.setState(ContainerState.BUSY);
+                    environmentLimiter.markActive(slots.get(candidate));
                     break;
                 }
                 allocation.handles.remove(candidate);
@@ -292,6 +307,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
             } else {
                 handle.setState(ContainerState.WARM);
                 allocation.idle.addLast(handle);
+                environmentLimiter.markIdle(slots.get(handle));
             }
         }
         if (retire) {
@@ -531,8 +547,16 @@ public class ProvisionedConcurrencyPool implements Resettable {
         boolean retained = false;
         List<ContainerHandle> retired = List.of();
         try {
-            handle = launcher.launchProvisioned(fn);
+            // Provisioned environments count against the physical cap like on-demand ones.
+            LambdaEnvironmentLimiter.Slot slot = environmentLimiter.admit(() -> null).slot();
+            try {
+                handle = launcher.launchProvisioned(fn);
+            } catch (RuntimeException e) {
+                slot.close();
+                throw e;
+            }
             synchronized (lock) {
+                slots.put(handle, slot);
                 owned.put(handle, allocation.configuration);
                 finishedLaunching(allocation);
                 if (!current(allocation)) {
@@ -546,6 +570,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 currentFunction(allocation.configuration);
                 if (current(allocation) && healthy(handle)) {
                     allocation.idle.addLast(handle);
+                    environmentLimiter.markIdle(slots.get(handle));
                     retained = true;
                     if (allocation.handles.size() == allocation.configuration.requested()
                             && allocation.handles.stream().allMatch(this::healthy)) {
@@ -680,10 +705,19 @@ public class ProvisionedConcurrencyPool implements Resettable {
             return;
         }
         try {
+            LambdaEnvironmentLimiter.Slot slot;
+            synchronized (lock) {
+                slot = slots.get(handle);
+            }
+            environmentLimiter.markRetiring(slot);
             launcher.stop(handle);
             synchronized (lock) {
                 pendingTeardown.remove(handle);
                 owned.remove(handle);
+                slots.remove(handle);
+            }
+            if (slot != null) {
+                slot.close();
             }
         } catch (RuntimeException failure) {
             LOG.warnv(failure, "Could not stop provisioned Lambda environment {0}", handle.getContainerId());

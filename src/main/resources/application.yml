@@ -455,6 +455,8 @@ floci:
       container-drain-timeout-seconds: 15      # FLOCI_SERVICES_LAMBDA_CONTAINER_DRAIN_TIMEOUT_SECONDS - shared shutdown budget for both Lambda pools
       # warm-pool-max-per-function:           # FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_PER_FUNCTION - idle containers kept per function (default max(4, cpus))
       warm-pool-max-total: 0                  # FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_TOTAL - idle containers kept across all functions, LRU evicted beyond it; 0 = unbounded
+      # max-physical-environments:            # FLOCI_SERVICES_LAMBDA_MAX_PHYSICAL_ENVIRONMENTS - active, warm and stopping environments across all functions; unset = counted, not capped
+      physical-environment-wait-timeout-seconds: 15 # FLOCI_SERVICES_LAMBDA_PHYSICAL_ENVIRONMENT_WAIT_TIMEOUT_SECONDS - wait for a physical environment under the cap
       region-concurrency-limit: 1000
       unreserved-concurrency-min: 100
       accept-external-layer-arns: false       # FLOCI_SERVICES_LAMBDA_ACCEPT_EXTERNAL_LAYER_ARNS - accept a Layers ARN from another account (content is never mounted). AWS answers these through the layer resource policy, which Floci does not model, so the default refuses them like AWS refuses a non-public one. Turn on to attach public layers such as Powertools.

@@ -601,6 +601,8 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_INIT_TIMEOUT_SECONDS` | `10` | Time a newly started runtime has to finish its init and request its first invocation (seconds). A function whose `Timeout` plus 2 seconds is longer waits that long instead. See [Slow cold starts](#slow-cold-starts) |
 | `FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_PER_FUNCTION` | `max(4, cpus)` | Maximum idle (warm) containers kept per function |
 | `FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_TOTAL` | `0` | Maximum idle (warm) containers kept across all functions, LRU-evicted beyond it. `0` = unbounded. See the note below |
+| `FLOCI_SERVICES_LAMBDA_MAX_PHYSICAL_ENVIRONMENTS` | *(unset)* | Maximum physical execution environments across all functions. Unset = counted, not capped. See [Capping physical environments](#capping-physical-environments) |
+| `FLOCI_SERVICES_LAMBDA_PHYSICAL_ENVIRONMENT_WAIT_TIMEOUT_SECONDS` | `15` | Wait for a physical environment under the cap, separate from the function timeout |
 | `FLOCI_SERVICES_LAMBDA_REGION_CONCURRENCY_LIMIT` | `1000` | Maximum concurrent executions per region |
 | `FLOCI_SERVICES_LAMBDA_UNRESERVED_CONCURRENCY_MIN` | `100` | Minimum unreserved capacity `PutFunctionConcurrency` must leave |
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED` | `false` | Enable bind-mount hot-reload via `S3Bucket=hot-reload` |
@@ -678,6 +680,37 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
     active region. A cap that is smaller than the number of functions invoked in a tight loop
     trades some warm hits for the memory bound. A negative value is ignored with a warning and
     leaves the total unbounded, like `0`.
+
+### Capping physical environments
+
+`warm-pool-max-total` bounds idle containers and `region-concurrency-limit` bounds invocations,
+but neither bounds the containers a host runs at once. `max-physical-environments` does: it
+counts every execution environment from the moment its launch is admitted until its teardown is
+confirmed, across all functions, accounts and regions. That includes busy, warm and
+provisioned-concurrency environments, ones being stopped, and containers an earlier Floci
+process left behind until they are removed. A stop that fails keeps its environment counted, so
+the cap never reads free while the container may still run.
+
+An invocation that finds no warm environment to reuse waits for room in arrival order. The
+oldest waiter first retires the least-recently-used idle environment of any function, since a
+warm container is only a cache. An invocation still waiting after
+`physical-environment-wait-timeout-seconds` fails with error type `Lambda.EnvironmentTimeout`;
+an SQS event source returns its batch to the queue as for any failed invocation. The wait is
+separate from the function timeout.
+
+```bash
+FLOCI_SERVICES_LAMBDA_MAX_PHYSICAL_ENVIRONMENTS=4
+```
+
+`GET /_floci/capacity` (also under `/_localstack`) reads the count back:
+
+```json
+{"configuredLimit":4,"total":3,"active":1,"idle":1,"retiring":1,"queued":0,"available":1}
+```
+
+`total` is always `active + idle + retiring` and `available` is `configuredLimit - total`. With
+no cap, `configuredLimit` is `0` and `available` is `2147483647`. `queued` counts invocations
+waiting for room, which hold no environment yet.
 
 !!! note "Docker labels and leftover environments"
     Every container and code volume the Docker executor creates carries `io.floci.service=lambda`,

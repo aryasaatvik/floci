@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.ContainerTeardowns;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaDockerResourceLabels;
 import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
@@ -53,6 +54,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
 
     private final LambdaRuntimeLauncher lambdaRuntimeLauncher;
     private final ProvisionedConcurrencyPool provisioned;
+    private final LambdaEnvironmentLimiter environmentLimiter;
     private final EmulatorConfig config;
     private final Clock clock;
     private final int maxPoolSizePerFunction;
@@ -63,6 +65,8 @@ public class WarmPool implements ContainerTeardown, Resettable {
     private final Set<ContainerHandle> owned = ConcurrentHashMap.newKeySet();
     private final Set<ContainerHandle> pendingTeardown = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<ContainerHandle, CountDownLatch> stoppingHandles = new ConcurrentHashMap<>();
+    /** Each owned on-demand environment's place under the physical cap, until its stop is confirmed. */
+    private final ConcurrentHashMap<ContainerHandle, LambdaEnvironmentLimiter.Slot> slots = new ConcurrentHashMap<>();
     private LifecycleState lifecycleState = new LifecycleState();
     /**
      * Serialises the return-to-pool step of {@link #release} so the global idle count is
@@ -94,14 +98,21 @@ public class WarmPool implements ContainerTeardown, Resettable {
 
     @Inject
     public WarmPool(LambdaRuntimeLauncher lambdaRuntimeLauncher, EmulatorConfig config, Clock clock,
-                    ProvisionedConcurrencyPool provisioned) {
+                    ProvisionedConcurrencyPool provisioned, LambdaEnvironmentLimiter environmentLimiter) {
         this.lambdaRuntimeLauncher = lambdaRuntimeLauncher;
         this.provisioned = provisioned;
+        this.environmentLimiter = environmentLimiter;
+        environmentLimiter.retireIdleWith(this::retireIdleForCapacity);
         this.config = config;
         this.clock = clock;
         this.maxPoolSizePerFunction = resolveMaxPerFunction(config);
         this.maxIdleTotal = resolveMaxTotal(config);
         this.drainTimeoutNanos = TimeUnit.SECONDS.toNanos(resolveDrainTimeout(config));
+    }
+
+    public WarmPool(LambdaRuntimeLauncher lambdaRuntimeLauncher, EmulatorConfig config, Clock clock,
+                    ProvisionedConcurrencyPool provisioned) {
+        this(lambdaRuntimeLauncher, config, clock, provisioned, new LambdaEnvironmentLimiter());
     }
 
     public WarmPool(LambdaRuntimeLauncher launcher, EmulatorConfig config, Clock clock) {
@@ -112,6 +123,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
     WarmPool() {
         this.lambdaRuntimeLauncher = null;
         this.provisioned = null;
+        this.environmentLimiter = new LambdaEnvironmentLimiter();
         this.config = null;
         this.clock = Clock.systemUTC();
         this.maxPoolSizePerFunction = DEFAULT_MAX_POOL_SIZE;
@@ -195,6 +207,8 @@ public class WarmPool implements ContainerTeardown, Resettable {
             pendingTeardown.addAll(knownHandles);
             pendingTeardown.removeIf(handle -> !owned.contains(handle));
         }
+        // Admissions waiting for room look again and find the pool stopping.
+        environmentLimiter.signal();
         List<Runnable> drains = new ArrayList<>();
         if (provisioned != null) {
             drains.add(() -> provisioned.stopManagedContainers(shutdownState.deadlineNanos));
@@ -252,38 +266,25 @@ public class WarmPool implements ContainerTeardown, Resettable {
                     leaseEpoch = poolState.epochByEnvironment.computeIfAbsent(environmentKey, ignored -> 0L);
                 }
             }
-            // Probe outside the locks, then recheck this acquisition's lifecycle before leasing.
-            while (true) {
-                ContainerHandle candidate;
-                synchronized (capLock) {
-                    requireCurrentAdmission(admission);
-                    synchronized (poolState) {
-                        ArrayDeque<ContainerHandle> idle = poolState.idleByEnvironment.get(environmentKey);
-                        candidate = idle == null ? null : idle.pollFirst();
-                    }
-                }
-                if (candidate == null) {
-                    break;
-                }
-                if (candidate.isFaulted()) {
-                    LOG.infov("Discarding pooled container {0} for function {1}: an extension reported a fatal error",
-                            candidate.getContainerId(), fn.getFunctionName());
-                    stopQuietly(candidate);
-                    continue;
-                }
-                if (lambdaRuntimeLauncher.isAlive(candidate)) {
-                    handle = candidate;
-                    break;
-                }
-                LOG.infov("Discarding dead pooled container {0} for function {1}",
-                        candidate.getContainerId(), fn.getFunctionName());
-                stopQuietly(candidate);
-            }
         }
+        PoolState pool = poolState;
+        LambdaEnvironmentLimiter.Admission<ContainerHandle> admitted = environmentLimiter.admit(ephemeral
+                ? () -> {
+                    synchronized (capLock) {
+                        requireCurrentAdmission(admission);
+                    }
+                    return null;
+                }
+                : () -> takeWarm(fn, admission, pool, environmentKey));
+        handle = admitted.reused();
+        LambdaEnvironmentLimiter.Slot launchSlot = admitted.slot();
 
         boolean launching = handle == null;
         if (launching) {
             synchronized (capLock) {
+                if (admission.stopped || admission != lifecycleState) {
+                    launchSlot.close();
+                }
                 requireCurrentAdmission(admission);
                 admission.activeLaunches++;
             }
@@ -292,7 +293,13 @@ public class WarmPool implements ContainerTeardown, Resettable {
             if (launching) {
                 LOG.debugv(ephemeral ? "Ephemeral start for function: {0}" : "Cold start for function: {0}",
                         fn.getFunctionName());
-                handle = lambdaRuntimeLauncher.launch(fn);
+                try {
+                    handle = lambdaRuntimeLauncher.launch(fn);
+                } catch (RuntimeException e) {
+                    launchSlot.close();
+                    throw e;
+                }
+                slots.put(handle, launchSlot);
                 owned.add(handle);
             } else {
                 LOG.debugv("Reusing warm container for function: {0}", fn.getFunctionName());
@@ -305,6 +312,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
                 }
                 if (!rejected) {
                     handle.setState(ContainerState.BUSY);
+                    environmentLimiter.markActive(slots.get(handle));
                 }
             }
             if (rejected) {
@@ -390,6 +398,7 @@ public class WarmPool implements ContainerTeardown, Resettable {
                     lease.poolState().idleByEnvironment
                             .computeIfAbsent(lease.environmentKey(), ignored -> new ArrayDeque<>())
                             .addFirst(handle);
+                    environmentLimiter.markIdle(slots.get(handle));
                 }
             }
         }
@@ -641,11 +650,67 @@ public class WarmPool implements ContainerTeardown, Resettable {
     }
 
     private static String executionEnvironmentKey(LambdaFunction fn) {
-        String functionArn = fn.getFunctionArn();
-        if (functionArn != null && !functionArn.isBlank()) {
-            return functionArn;
+        return LambdaDockerResourceLabels.environmentKey(fn);
+    }
+
+    /**
+     * Takes a live warm container of {@code environmentKey} off the pool, or returns null. Faulted
+     * and dead candidates are stopped on the way. The probe runs outside the locks, and the
+     * acquisition's lifecycle is checked again before each pop.
+     */
+    private ContainerHandle takeWarm(LambdaFunction fn, LifecycleState admission, PoolState poolState,
+                                     String environmentKey) {
+        while (true) {
+            ContainerHandle candidate;
+            synchronized (capLock) {
+                requireCurrentAdmission(admission);
+                synchronized (poolState) {
+                    ArrayDeque<ContainerHandle> idle = poolState.idleByEnvironment.get(environmentKey);
+                    candidate = idle == null ? null : idle.pollFirst();
+                }
+            }
+            if (candidate == null) {
+                return null;
+            }
+            if (candidate.isFaulted()) {
+                LOG.infov("Discarding pooled container {0} for function {1}: an extension reported a fatal error",
+                        candidate.getContainerId(), fn.getFunctionName());
+                stopQuietly(candidate);
+                continue;
+            }
+            if (lambdaRuntimeLauncher.isAlive(candidate)) {
+                return candidate;
+            }
+            LOG.infov("Discarding dead pooled container {0} for function {1}",
+                    candidate.getContainerId(), fn.getFunctionName());
+            stopQuietly(candidate);
         }
-        return fn.getFunctionName() + ":" + fn.getVersion();
+    }
+
+    /**
+     * Stops the least-recently-used idle container of any function so an admission waiting under
+     * the physical cap can launch; returns whether there was one to stop.
+     */
+    boolean retireIdleForCapacity() {
+        List<ContainerHandle> victims;
+        synchronized (capLock) {
+            if (lifecycleState.stopped) {
+                return false;
+            }
+            int idle = 0;
+            for (PoolState poolState : poolStates.values()) {
+                synchronized (poolState) {
+                    idle += idleSize(poolState);
+                }
+            }
+            victims = idle == 0 ? List.of() : evictIdleBeyond(idle - 1);
+        }
+        for (ContainerHandle victim : victims) {
+            LOG.infov("Physical environment cap reached; retiring least-recently-used container {0} for function {1}",
+                    victim.getContainerId(), victim.getFunctionName());
+            stopQuietly(victim);
+        }
+        return !victims.isEmpty();
     }
 
     private static int idleSize(PoolState poolState) {
@@ -687,10 +752,15 @@ public class WarmPool implements ContainerTeardown, Resettable {
                 return;
             }
             pendingTeardown.add(handle);
+            environmentLimiter.markRetiring(slots.get(handle));
             lambdaRuntimeLauncher.stop(handle);
             owned.remove(handle);
             pendingTeardown.remove(handle);
             activeLeases.remove(handle);
+            LambdaEnvironmentLimiter.Slot slot = slots.remove(handle);
+            if (slot != null) {
+                slot.close();
+            }
         } catch (Exception e) {
             LOG.warnv(e, "Error stopping container {0}", handle.getContainerId());
         } finally {

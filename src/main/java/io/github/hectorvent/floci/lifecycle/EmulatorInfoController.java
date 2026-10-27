@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.ServiceRegistry;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHook;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbBackendSelector;
+import io.github.hectorvent.floci.services.lambda.LambdaEnvironmentLimiter;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
@@ -49,6 +50,7 @@ public class EmulatorInfoController {
     private final FlociCertificateAuthority certificateAuthority;
     private final EmulatorConfig config;
     private final DynamoDbBackendSelector dynamoDbBackendSelector;
+    private final LambdaEnvironmentLimiter environmentLimiter;
 
     @Inject
     public EmulatorInfoController(ServiceRegistry serviceRegistry,
@@ -58,7 +60,8 @@ public class EmulatorInfoController {
                                   Instance<ContainerTeardown> containerTeardowns,
                                   FlociCertificateAuthority certificateAuthority,
                                   EmulatorConfig config,
-                                  DynamoDbBackendSelector dynamoDbBackendSelector) {
+                                  DynamoDbBackendSelector dynamoDbBackendSelector,
+                                  LambdaEnvironmentLimiter environmentLimiter) {
         this.serviceRegistry = serviceRegistry;
         this.initLifecycleState = initLifecycleState;
         this.storageFactory = storageFactory;
@@ -67,6 +70,7 @@ public class EmulatorInfoController {
         this.certificateAuthority = certificateAuthority;
         this.config = config;
         this.dynamoDbBackendSelector = dynamoDbBackendSelector;
+        this.environmentLimiter = environmentLimiter;
         this.version = FlociVersion.current();
     }
 
@@ -144,6 +148,27 @@ public class EmulatorInfoController {
         Map<String, String> services = new TreeMap<>();
         healthServices.forEach((name, status) -> services.put(name, "running".equals(status) ? "enabled" : "disabled"));
         return services;
+    }
+
+    /**
+     * The physical Lambda execution environments running now, as {@link LambdaEnvironmentLimiter}
+     * counts them: {@code total = active + idle + retiring}, {@code available = configuredLimit -
+     * total}, and with no cap {@code configuredLimit} is 0 and {@code available} is
+     * {@link Integer#MAX_VALUE}. It names no function or invocation.
+     */
+    @GET
+    @Path("/capacity")
+    public Response capacity() {
+        LambdaEnvironmentLimiter.Status status = environmentLimiter.status();
+        Map<String, Integer> body = new LinkedHashMap<>();
+        body.put("configuredLimit", status.configuredLimit());
+        body.put("total", status.total());
+        body.put("active", status.active());
+        body.put("idle", status.idle());
+        body.put("retiring", status.retiring());
+        body.put("queued", status.queued());
+        body.put("available", status.available());
+        return Response.ok(body).build();
     }
 
     @GET

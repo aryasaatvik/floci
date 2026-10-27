@@ -159,6 +159,17 @@ class LambdaExecutorServiceTest {
     }
 
     @Test
+    void noPhysicalEnvironmentInTime_failsAsEnvironmentTimeoutNotInitError() {
+        when(warmPool.acquire(any())).thenThrow(new LambdaEnvironmentLimiter.AdmissionTimeoutException(4, 15));
+
+        InvokeResult result = executor.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse);
+
+        assertEquals(200, result.getStatusCode());
+        assertEquals("Unhandled", result.getFunctionError());
+        assertTrue(new String(result.getPayload()).contains("\"errorType\":\"Lambda.EnvironmentTimeout\""));
+    }
+
+    @Test
     void timeoutInvocation_destroysHandle_doesNotRelease() {
         RuntimeApiServer rtas = mock(RuntimeApiServer.class);
         ContainerHandle handle = new ContainerHandle("cid-1", "test-fn", rtas, ContainerState.WARM);

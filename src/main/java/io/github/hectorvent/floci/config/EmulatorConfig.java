@@ -3140,6 +3140,27 @@ public interface EmulatorConfig {
         @WithDefault("0")
         int warmPoolMaxTotal();
 
+        /**
+         * Maximum physical execution environments across all functions, accounts and regions:
+         * active, warm and still being stopped, on-demand and provisioned alike. An invocation
+         * that finds no warm environment to reuse and no room waits in arrival order, after the
+         * least-recently-used idle environment is retired to make room. Unset, environments are
+         * only counted. {@code GET /_floci/capacity} reads the count back.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_MAX_PHYSICAL_ENVIRONMENTS
+         */
+        OptionalInt maxPhysicalEnvironments();
+
+        /**
+         * How long an invocation waits for a physical environment under
+         * {@link #maxPhysicalEnvironments()} before it fails with {@code Lambda.EnvironmentTimeout}.
+         * Separate from the function timeout, which starts once the runtime takes the invocation.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_PHYSICAL_ENVIRONMENT_WAIT_TIMEOUT_SECONDS
+         */
+        @WithDefault("15")
+        int physicalEnvironmentWaitTimeoutSeconds();
+
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
 

@@ -4,17 +4,23 @@ import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.services.lambda.LambdaEnvironmentLimiter;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
@@ -30,6 +36,8 @@ class LambdaDockerResourceReconcilerTest {
     private ContainerLifecycleManager lifecycleManager;
     private LambdaFunctionStore functionStore;
     private EmulatorConfig config;
+    private LambdaEnvironmentLimiter limiter;
+    private ScheduledExecutorService retries;
     private LambdaDockerResourceReconciler reconciler;
 
     @BeforeEach
@@ -48,7 +56,9 @@ class LambdaDockerResourceReconcilerTest {
         when(lambda.containerNamePrefix()).thenReturn(Optional.empty());
         when(functionStore.listAll()).thenReturn(List.of());
         when(lifecycleManager.listVolumesByLabels(any())).thenReturn(List.of());
-        reconciler = new LambdaDockerResourceReconciler(lifecycleManager, functionStore, config);
+        limiter = new LambdaEnvironmentLimiter();
+        retries = mock(ScheduledExecutorService.class);
+        reconciler = new LambdaDockerResourceReconciler(lifecycleManager, functionStore, config, limiter, retries);
     }
 
     @Test
@@ -76,6 +86,25 @@ class LambdaDockerResourceReconcilerTest {
         reconciler.reconcileAtStartup();
 
         verify(lifecycleManager).stopAndRemoveStrict(eq("exec-2"), any(), anyInt());
+    }
+
+    @Test
+    void aLeftoverEnvironmentCountsAsRetiringUntilItsRemovalIsConfirmed() {
+        List<Container> containers = List.of(container("stuck", "execution"), container("populator", "code-populator"));
+        when(lifecycleManager.listContainersByLabels(OWNER)).thenReturn(containers);
+        doThrow(new RuntimeException("daemon busy")).doNothing()
+                .when(lifecycleManager).stopAndRemoveStrict(eq("stuck"), any(), anyInt());
+
+        reconciler.reconcileAtStartup();
+
+        // Populators are not execution environments; the stuck container stays counted.
+        assertEquals(1, limiter.status().retiring());
+        ArgumentCaptor<Runnable> retry = ArgumentCaptor.forClass(Runnable.class);
+        verify(retries).schedule(retry.capture(), anyLong(), any(TimeUnit.class));
+
+        retry.getValue().run();
+
+        assertEquals(0, limiter.status().total());
     }
 
     @Test

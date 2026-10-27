@@ -80,6 +80,19 @@ class WarmPoolTest {
         return new WarmPool(containerLauncher, config, clock, provisioned);
     }
 
+    private WarmPool buildCappedPool(LambdaEnvironmentLimiter limiter) {
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.lambda()).thenReturn(lambda);
+        when(lambda.ephemeral()).thenReturn(false);
+        when(lambda.containerIdleTimeoutSeconds()).thenReturn(0);
+        when(lambda.warmPoolMaxPerFunction()).thenReturn(Optional.empty());
+        when(lambda.warmPoolMaxTotal()).thenReturn(0);
+        when(lambda.containerDrainTimeoutSeconds()).thenReturn(15);
+        return new WarmPool(containerLauncher, config, clock, null, limiter);
+    }
+
     private static LambdaFunction function(String name) {
         LambdaFunction fn = mock(LambdaFunction.class);
         when(fn.getFunctionName()).thenReturn(name);
@@ -1286,5 +1299,89 @@ class WarmPoolTest {
         lenient().when(lambda.warmPoolMaxPerFunction()).thenReturn(maxPerFunction);
         lenient().when(lambda.warmPoolMaxTotal()).thenReturn(maxTotal);
         return emulatorConfig;
+    }
+
+    @Test
+    void physicalCap_countsEachEnvironmentFromLaunchUntilItsStopIsConfirmed() {
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter();
+        WarmPool pool = buildCappedPool(limiter);
+        pool.init();
+        ContainerHandle a1 = new ContainerHandle("cid-a1", "fn-a", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(a1);
+        doThrow(new RuntimeException("daemon busy")).doNothing().when(containerLauncher).stop(a1);
+
+        ContainerHandle leased = pool.acquire(function("fn-a"));
+        assertEquals(1, limiter.status().active());
+        pool.release(leased);
+        assertEquals(1, limiter.status().idle());
+
+        pool.drainFunction("fn-a");
+        // The stop failed, so the container may still run: it stays counted, as retiring.
+        assertEquals(new LambdaEnvironmentLimiter.Status(0, 1, 0, 0, 1, 0, LambdaEnvironmentLimiter.UNLIMITED),
+                limiter.status());
+
+        pool.evictIdleContainers();
+        assertEquals(0, limiter.status().total());
+        pool.shutdown();
+    }
+
+    @Test
+    void physicalCap_retiresTheLeastRecentlyUsedIdleEnvironmentToLaunchAnotherFunction() {
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 5);
+        WarmPool pool = buildCappedPool(limiter);
+        pool.init();
+        ContainerHandle a1 = new ContainerHandle("cid-a1", "fn-a", null, ContainerState.WARM);
+        ContainerHandle b1 = new ContainerHandle("cid-b1", "fn-b", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(a1, b1);
+
+        pool.release(pool.acquire(function("fn-a")));
+        ContainerHandle leased = pool.acquire(function("fn-b"));
+
+        assertSame(b1, leased);
+        verify(containerLauncher).stop(a1);
+        assertEquals(new LambdaEnvironmentLimiter.Status(1, 1, 1, 0, 0, 0, 0), limiter.status());
+        pool.shutdown();
+    }
+
+    @Test
+    void physicalCap_aWaitingInvocationReusesTheEnvironmentItsFunctionReleases() throws Exception {
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 10);
+        WarmPool pool = buildCappedPool(limiter);
+        pool.init();
+        LambdaFunction fn = function("fn-a");
+        ContainerHandle a1 = new ContainerHandle("cid-a1", "fn-a", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(a1);
+        when(containerLauncher.isAlive(a1)).thenReturn(true);
+        ContainerHandle busy = pool.acquire(fn);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<ContainerHandle> waiting = executor.submit(() -> pool.acquire(fn));
+            await().atMost(5, TimeUnit.SECONDS).until(() -> limiter.status().queued() == 1);
+
+            pool.release(busy);
+
+            assertSame(a1, waiting.get(5, TimeUnit.SECONDS));
+            verify(containerLauncher, times(1)).launch(any());
+            verify(containerLauncher, never()).stop(a1);
+        } finally {
+            executor.shutdownNow();
+            pool.shutdown();
+        }
+    }
+
+    @Test
+    void physicalCap_anInvocationThatFindsNoRoomInTimeLaunchesNothing() {
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 0);
+        WarmPool pool = buildCappedPool(limiter);
+        pool.init();
+        ContainerHandle a1 = new ContainerHandle("cid-a1", "fn-a", null, ContainerState.WARM);
+        when(containerLauncher.launch(any())).thenReturn(a1);
+        pool.acquire(function("fn-a"));
+
+        assertThrows(LambdaEnvironmentLimiter.AdmissionTimeoutException.class,
+                () -> pool.acquire(function("fn-b")));
+        verify(containerLauncher, times(1)).launch(any());
+        assertEquals(new LambdaEnvironmentLimiter.Status(1, 1, 1, 0, 0, 0, 0), limiter.status());
+        pool.shutdown();
     }
 }

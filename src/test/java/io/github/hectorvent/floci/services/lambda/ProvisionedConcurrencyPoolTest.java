@@ -321,6 +321,27 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
+    void provisionedEnvironmentsCountAgainstThePhysicalCap() throws Exception {
+        pool.shutdown();
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 0);
+        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, storage, Clock.systemUTC(), 4, 8, false, 15,
+                limiter);
+        put(1);
+        Environment first = launched();
+        first.initialized.complete(null);
+        ready();
+        assertEquals(new LambdaEnvironmentLimiter.Status(1, 1, 0, 1, 0, 0, 0), limiter.status());
+
+        assertSame(first.handle, pool.acquire(version, "live"));
+        assertEquals(1, limiter.status().active());
+        assertTrue(pool.release(first.handle, false));
+        assertEquals(1, limiter.status().idle());
+
+        pool.delete(REGION, "example", "live", ACCOUNT);
+        await().atMost(Duration.ofSeconds(5)).until(() -> limiter.status().total() == 0);
+    }
+
+    @Test
     void repeatedPutPreservesTheCurrentAllocation() throws Exception {
         put(1);
         Environment first = launched();
@@ -1118,7 +1139,8 @@ class ProvisionedConcurrencyPoolTest {
         when(lambda.containerDrainTimeoutSeconds()).thenReturn(1);
         when(factory.<ProvisionedConcurrencyPool.Configuration>create(
                 eq("lambda"), eq("lambda-provisioned-concurrency.json"), any())).thenReturn(storage);
-        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, factory, config, Clock.systemUTC());
+        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, factory, config, Clock.systemUTC(),
+                new LambdaEnvironmentLimiter());
         put(1);
         Environment first = launched();
         first.initialized.complete(null);
@@ -1355,7 +1377,8 @@ class ProvisionedConcurrencyPoolTest {
         for (int restart = 0; restart < 3; restart++) {
             StorageFactory factory = new StorageFactory(config, access);
             try {
-                pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, factory, config, Clock.systemUTC());
+                pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, factory, config, Clock.systemUTC(),
+                        new LambdaEnvironmentLimiter());
                 pool.start();
                 if (restart == 0) {
                     put(2);
