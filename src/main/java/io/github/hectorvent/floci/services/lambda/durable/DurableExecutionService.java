@@ -48,6 +48,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 
 /**
@@ -87,6 +88,8 @@ public class DurableExecutionService implements Resettable {
     private final DurableFunctionInvoker invoker;
     private final Executor launchExecutor;
     private final long invocationRetryDelayMillis;
+    /** Builds an execution's status-change event under its lock; the event is published as an effect. */
+    private final Function<DurableExecution, Runnable> statusEvents;
     /** Striped, so a lookup of an unknown ARN never grows a map. Two executions may share a lock, never nest one. */
     private final Object[] executionLocks = newLocks(LOCK_STRIPES);
     private final ConcurrentHashMap<String, Object> startLocks = new ConcurrentHashMap<>();
@@ -96,15 +99,22 @@ public class DurableExecutionService implements Resettable {
 
     @Inject
     public DurableExecutionService(StorageFactory storageFactory, ObjectMapper objectMapper, Clock clock,
-                                   DurableFunctionInvoker invoker) {
+                                   DurableFunctionInvoker invoker, DurableExecutionEventPublisher publisher) {
         this(storageFactory, objectMapper, clock, invoker,
                 Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("lambda-durable-", 0).factory()),
-                INVOCATION_RETRY_DELAY);
+                INVOCATION_RETRY_DELAY, publisher::statusChange);
     }
 
     /** For tests. An inline executor and a zero delay make every invocation chain synchronous. */
     DurableExecutionService(StorageFactory storageFactory, ObjectMapper objectMapper, Clock clock,
                             DurableFunctionInvoker invoker, Executor launchExecutor, Duration invocationRetryDelay) {
+        this(storageFactory, objectMapper, clock, invoker, launchExecutor, invocationRetryDelay, execution -> () -> {
+        });
+    }
+
+    DurableExecutionService(StorageFactory storageFactory, ObjectMapper objectMapper, Clock clock,
+                            DurableFunctionInvoker invoker, Executor launchExecutor, Duration invocationRetryDelay,
+                            Function<DurableExecution, Runnable> statusEvents) {
         this.store = storageFactory.create("lambda", "lambda-durable-executions.json",
                 new TypeReference<Map<String, DurableExecution>>() {}, WriteProfile.APPEND_HEAVY);
         this.objectMapper = objectMapper;
@@ -112,6 +122,7 @@ public class DurableExecutionService implements Resettable {
         this.invoker = invoker;
         this.launchExecutor = launchExecutor;
         this.invocationRetryDelayMillis = invocationRetryDelay.toMillis();
+        this.statusEvents = statusEvents;
     }
 
     public record StartRequest(String accountId, String region, String functionName, String qualifier,
@@ -161,6 +172,7 @@ public class DurableExecutionService implements Resettable {
             }
             long now = clock.millis();
             execution = newExecution(request, target, name, now);
+            effects.add(statusEvents.apply(execution));
             trigger(execution, effects);
             store.putForAccount(request.accountId(), storeKey(execution), execution);
         }
@@ -740,6 +752,7 @@ public class DurableExecutionService implements Resettable {
             root.setChangeSequence(execution.nextChangeSequence());
         }
         closeEvent(execution, now);
+        effects.add(statusEvents.apply(execution));
         closeBookkeeping(execution, now, effects);
     }
 
@@ -854,6 +867,7 @@ public class DurableExecutionService implements Resettable {
         DurableExecution child = newExecution(request, target, name, executionId, now);
         child.setParentExecutionArn(parent.getExecutionArn());
         child.setParentOperationId(operation.getId());
+        effects.add(statusEvents.apply(child));
         trigger(child, effects);
         return child;
     }

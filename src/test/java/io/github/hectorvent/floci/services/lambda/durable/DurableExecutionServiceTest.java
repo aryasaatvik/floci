@@ -89,6 +89,25 @@ class DurableExecutionServiceTest {
     }
 
     @Test
+    void publishesAStatusChangeWhenAnExecutionStartsAndWhenItCloses() {
+        List<String> statuses = new ArrayList<>();
+        service = new DurableExecutionService(storage, MAPPER, clock, invoker, Runnable::run, Duration.ZERO,
+                execution -> {
+                    String status = execution.getStatus().name();
+                    return () -> statuses.add(execution.getName() + ":" + status);
+                });
+        invoker.script(event -> succeeded("\"done\""));
+        start("ok", "{}", true);
+        invoker.script(event -> {
+            checkpoint(event, token(event), List.of(waitStart("w1", 60)));
+            return pending();
+        });
+        service.stop(start("halted", "{}", false).getExecutionArn(), null);
+
+        assertEquals(List.of("ok:RUNNING", "ok:SUCCEEDED", "halted:RUNNING", "halted:STOPPED"), statuses);
+    }
+
+    @Test
     void stepCheckpointIsReturnedAsNewStateAndTheResultClosesTheExecution() {
         invoker.script(event -> {
             CheckpointResult first = checkpoint(event, token(event),
