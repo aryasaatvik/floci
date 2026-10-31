@@ -12,6 +12,7 @@ import software.amazon.awssdk.services.lambda.model.FunctionCode;
 import software.amazon.awssdk.services.lambda.model.GetAliasResponse;
 import software.amazon.awssdk.services.lambda.model.GetProvisionedConcurrencyConfigResponse;
 import software.amazon.awssdk.services.lambda.model.InvalidParameterValueException;
+import software.amazon.awssdk.services.lambda.model.ListProvisionedConcurrencyConfigsResponse;
 import software.amazon.awssdk.services.lambda.model.ProvisionedConcurrencyConfigNotFoundException;
 import software.amazon.awssdk.services.lambda.model.PutProvisionedConcurrencyConfigResponse;
 import software.amazon.awssdk.services.lambda.model.ResourceConflictException;
@@ -53,6 +54,32 @@ class LambdaProvisionedConcurrencyTest {
                 lambda.close();
             }
         }
+    }
+
+    @Test
+    @DisplayName("List deserializes empty and paginated qualified configurations")
+    void listConfigurations() {
+        assertThat(lambda.listProvisionedConcurrencyConfigs(request -> request.functionName(name))
+                .provisionedConcurrencyConfigs()).isEmpty();
+        lambda.putProvisionedConcurrencyConfig(request -> request.functionName(name).qualifier("live")
+                .provisionedConcurrentExecutions(1));
+        lambda.updateFunctionConfiguration(request -> request.functionName(name).description("second"));
+        String second = lambda.publishVersion(request -> request.functionName(name)).version();
+        lambda.putProvisionedConcurrencyConfig(request -> request.functionName(name).qualifier(second)
+                .provisionedConcurrentExecutions(1));
+        ListProvisionedConcurrencyConfigsResponse first = lambda.listProvisionedConcurrencyConfigs(request -> request
+                .functionName(name).maxItems(1));
+        assertThat(first.provisionedConcurrencyConfigs()).hasSize(1);
+        assertThat(first.provisionedConcurrencyConfigs().get(0).functionArn()).isEqualTo(arn + ":" + second);
+        assertThat(first.provisionedConcurrencyConfigs().get(0).requestedProvisionedConcurrentExecutions()).isEqualTo(1);
+        assertThat(first.nextMarker()).isNotBlank();
+        ListProvisionedConcurrencyConfigsResponse last = lambda.listProvisionedConcurrencyConfigs(request -> request
+                .functionName(name).marker(first.nextMarker()).maxItems(1));
+        assertThat(last.provisionedConcurrencyConfigs()).hasSize(1);
+        assertThat(last.provisionedConcurrencyConfigs().get(0).functionArn()).isEqualTo(arn + ":live");
+        assertThat(last.nextMarker()).isNull();
+        assertThatThrownBy(() -> lambda.listProvisionedConcurrencyConfigs(request -> request.functionName(name + "-absent")))
+                .isInstanceOf(ResourceNotFoundException.class);
     }
 
     @Test

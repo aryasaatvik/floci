@@ -7,6 +7,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.List;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.mockito.ArgumentMatchers.*;
@@ -17,6 +19,24 @@ class LambdaProvisionedConcurrencyIntegrationTest {
     private static final String PATH = "/2019-09-30/functions/example/provisioned-concurrency";
     @InjectMock
     ProvisionedConcurrencyPool pool;
+
+    @Test
+    void listUsesAwsShapeAndPagination() {
+        ProvisionedConcurrencyPool.Status status = new ProvisionedConcurrencyPool.Status(
+                2, 1, 1, "FAILED", "initialization failed", "2026-01-01T00:00:00Z");
+        when(pool.list(anyString(), eq("example"), anyString(), eq(null), eq(1)))
+                .thenReturn(new ProvisionedConcurrencyPool.Page(List.of(
+                        new ProvisionedConcurrencyPool.ListedConfiguration("qualified:live", status)), "next"));
+        given().queryParam("List", "ALL").queryParam("MaxItems", 1).get(PATH).then().statusCode(200)
+                .body("ProvisionedConcurrencyConfigs[0].FunctionArn", equalTo("qualified:live"))
+                .body("ProvisionedConcurrencyConfigs[0].RequestedProvisionedConcurrentExecutions", equalTo(2))
+                .body("ProvisionedConcurrencyConfigs[0].StatusReason", equalTo("initialization failed"))
+                .body("NextMarker", equalTo("next"));
+        when(pool.list(anyString(), eq("example"), anyString(), eq("next"), eq(1)))
+                .thenReturn(new ProvisionedConcurrencyPool.Page(List.of(), null));
+        given().queryParam("Marker", "next").queryParam("MaxItems", 1).get(PATH).then().statusCode(200)
+                .body("ProvisionedConcurrencyConfigs.size()", equalTo(0));
+    }
 
     @Test
     void putUsesTheDatedAwsRouteAndReturnsAcceptedAllocation() {

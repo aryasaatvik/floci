@@ -492,6 +492,13 @@ with a required `Qualifier` query parameter. Put accepts a positive integer
 function without a configuration returns `ProvisionedConcurrencyConfigNotFoundException`
 from Get.
 
+GET without `Qualifier` lists the request account's configurations as
+`ProvisionedConcurrencyConfigs`, including each qualified `FunctionArn` and its current
+capacity, status and modification timestamp. An existing function without configurations
+returns an empty list; an unknown function returns `ResourceNotFoundException` (404).
+`MaxItems` (1 to 10000, default 50) limits the page; pass `NextMarker` as `Marker` for
+the next page. Markers are local cursors over qualified ARNs and are not AWS-compatible tokens.
+
 An alias and its resolved published version cannot both have configurations. Different
 aliases of the same provisioned version also conflict; other versions remain independent.
 `LastModified` uses Lambda's UTC `+0000` form.
@@ -563,7 +570,6 @@ For a longer drain, explicitly stop with the larger timeout and then start Floci
 These AWS Lambda operations have no handler in Floci. Calls will return `404` or an error:
 
 - Layer permissions (`AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
-- Listing provisioned concurrency (`ListProvisionedConcurrencyConfigs`)
 - `InvokeWithResponseStream`
 - Code signing enforcement. A configuration is created, read, updated, deleted and listed, and
   nothing verifies a signature against it, so it never gates a deployment. Attaching one to a

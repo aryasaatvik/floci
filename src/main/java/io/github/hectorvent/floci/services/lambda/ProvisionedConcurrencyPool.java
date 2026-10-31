@@ -26,6 +26,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -234,6 +235,45 @@ public class ProvisionedConcurrencyPool implements Resettable {
         stop(retired);
         reconcile();
         return result;
+    }
+
+    public record ListedConfiguration(String functionArn, Status status) {}
+
+    public record Page(List<ListedConfiguration> configurations, String nextMarker) {}
+
+    public Page list(String region, String name, String account, String marker, Integer maxItems) {
+        int limit = maxItems == null ? 50 : maxItems;
+        if (limit < 1 || limit > 10000) {
+            throw invalid("MaxItems must be between 1 and 10000");
+        }
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(name);
+        if ((ref.account() != null && !account.equals(ref.account()))
+                || (ref.region() != null && !region.equals(ref.region()))) {
+            throw missing("Function not found: " + name);
+        }
+        LambdaFunction fn = functions.getForAccount(account, region, ref.name())
+                .orElseThrow(() -> missing("Function not found: " + name));
+        String functionArn = baseArn(fn);
+        synchronized (lock) {
+            List<ListedConfiguration> values = allocations.values().stream()
+                    .filter(entry -> account.equals(entry.configuration.account())
+                            && functionArn.equals(entry.configuration.functionArn()))
+                    .map(entry -> new ListedConfiguration(entry.configuration.key(), status(entry)))
+                    .sorted(Comparator.comparing(ListedConfiguration::functionArn)).toList();
+            int start = 0;
+            if (marker != null) {
+                while (start < values.size() && !values.get(start).functionArn().equals(marker)) {
+                    start++;
+                }
+                if (start == values.size()) {
+                    throw invalid("Invalid Marker");
+                }
+                start++;
+            }
+            int end = Math.min(values.size(), start + limit);
+            return new Page(values.subList(start, end),
+                    end < values.size() ? values.get(end - 1).functionArn() : null);
+        }
     }
 
     public Status get(String region, String name, String qualifier, String account) {
@@ -767,12 +807,15 @@ public class ProvisionedConcurrencyPool implements Resettable {
         if (ref.region() != null && !region.equals(ref.region())) {
             throw invalid("Function ARN region must match the request region");
         }
-        account = ref.account() != null ? ref.account() : account;
         boolean publishedVersion = qualifier.matches("[0-9]+");
-        String qualifiedArn = AwsArnUtils.Arn.of("lambda", region, account,
+        String qualifiedArn = AwsArnUtils.Arn.of("lambda", region,
+                ref.account() != null ? ref.account() : account,
                 "function:" + ref.name() + ":" + qualifier).toString();
         String notFoundMessage = (publishedVersion ? "Function not found: " : "Cannot find alias arn: ")
                 + qualifiedArn;
+        if (ref.account() != null && !account.equals(ref.account())) {
+            throw missing(notFoundMessage);
+        }
         LambdaFunction latest = functions.getForAccount(account, region, ref.name())
                 .orElseThrow(() -> missing(notFoundMessage));
         LambdaAlias alias = null;

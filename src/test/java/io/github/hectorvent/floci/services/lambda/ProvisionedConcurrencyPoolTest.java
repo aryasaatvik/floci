@@ -102,6 +102,42 @@ class ProvisionedConcurrencyPoolTest {
         return pool.put(REGION, "example", "live", count, ACCOUNT);
     }
 
+    @Test
+    void listsEmptyAndRejectsMissingOrForeignFunctions() {
+        assertTrue(pool.list(REGION, "example", ACCOUNT, null, null).configurations().isEmpty());
+        for (String name : List.of("absent", "arn:aws:lambda:us-east-1:222222222222:function:example")) {
+            assertEquals("ResourceNotFoundException", assertThrows(AwsException.class,
+                    () -> pool.list(REGION, name, ACCOUNT, null, null)).getErrorCode());
+        }
+        assertEquals("ResourceNotFoundException", assertThrows(AwsException.class,
+                () -> pool.list(REGION, "example", "222222222222", null, null)).getErrorCode());
+    }
+
+    @Test
+    void listsAliasesAndVersionsWithPaginationAndAccountIsolation() {
+        function(ACCOUNT, REGION, "2");
+        put(1);
+        pool.put(REGION, "example", "2", 1, ACCOUNT);
+        function("222222222222", REGION, "$LATEST");
+        assertTrue(pool.list(REGION, "example", "222222222222", null, null).configurations().isEmpty());
+        ProvisionedConcurrencyPool.Page first = pool.list(REGION, "example", ACCOUNT, null, 1);
+        assertEquals(1, first.configurations().size());
+        assertEquals("arn:aws:lambda:us-east-1:111111111111:function:example:2", first.nextMarker());
+        assertEquals(1, first.configurations().getFirst().status().requested());
+        ProvisionedConcurrencyPool.Page second = pool.list(REGION, "example", ACCOUNT, first.nextMarker(), 1);
+        assertEquals("arn:aws:lambda:us-east-1:111111111111:function:example:live",
+                second.configurations().getFirst().functionArn());
+        assertNull(second.nextMarker());
+        assertEquals(1, pool.get(REGION, "example", "live", ACCOUNT).requested());
+        String foreignArn = "arn:aws:lambda:us-east-1:111111111111:function:example";
+        assertThrows(AwsException.class, () -> pool.get(REGION, foreignArn, "live", "222222222222"));
+        assertThrows(AwsException.class, () -> pool.delete(REGION, foreignArn, "live", "222222222222"));
+        assertThrows(AwsException.class, () -> pool.put(REGION, foreignArn, "live", 1, "222222222222"));
+        assertThrows(AwsException.class, () -> pool.list(REGION, "example", ACCOUNT, "bad", 1));
+        assertThrows(AwsException.class, () -> pool.list(REGION, "example", ACCOUNT, null, 0));
+        assertThrows(AwsException.class, () -> pool.list(REGION, "example", ACCOUNT, null, 10001));
+    }
+
     @ParameterizedTest
     @CsvSource({"1, None", "live, None", "1, PublishedVersions", "live, PublishedVersions"})
     void snapStartEligibilityUsesThePublishedSnapshot(String qualifier, String latestApplyOn) {
