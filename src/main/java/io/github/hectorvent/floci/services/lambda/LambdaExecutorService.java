@@ -195,6 +195,7 @@ public class LambdaExecutorService implements Resettable {
 
     private InvokeResult invoke(LambdaFunction fn, byte[] payload, InvocationType type, int chainDepth,
                                 String invokedQualifier, String clientContext, String requestId) {
+        WarmPool.requireInvocable(fn);
         if (type == InvocationType.DryRun) {
             return new InvokeResult(204, null, new byte[0], null, requestId);
         }
@@ -373,6 +374,8 @@ public class LambdaExecutorService implements Resettable {
             LOG.warnv("No physical environment for function {0}: {1}", fn.getFunctionName(), e.getMessage());
             return new InvokeResult(200, "Unhandled",
                     buildErrorPayload(e.getMessage(), "Lambda.EnvironmentTimeout"), null, requestId);
+        } catch (AwsException e) {
+            throw e;
         } catch (Exception e) {
             LOG.warnv("Failed to acquire container for function {0}: {1}", fn.getFunctionName(), e.getMessage());
             return new InvokeResult(200, "Unhandled",

@@ -114,12 +114,18 @@ public class LambdaEnvironmentLimiter {
         }
         try {
             while (true) {
+                long seen;
+                lock.lock();
+                try {
+                    seen = changes;
+                } finally {
+                    lock.unlock();
+                }
                 T warm = reuse.get();
                 if (warm != null) {
                     return new Admission<>(warm, null);
                 }
                 boolean head;
-                long seen;
                 lock.lock();
                 try {
                     head = queue.peekFirst() == ticket;
@@ -129,7 +135,6 @@ public class LambdaEnvironmentLimiter {
                         changed.signalAll();
                         return new Admission<>(null, slot(SlotState.ACTIVE));
                     }
-                    seen = changes;
                 } finally {
                     lock.unlock();
                 }

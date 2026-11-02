@@ -588,8 +588,12 @@ public class ProvisionedConcurrencyPool implements Resettable {
         List<ContainerHandle> retired = List.of();
         try {
             // Provisioned environments count against the physical cap like on-demand ones.
-            LambdaEnvironmentLimiter.Slot slot = environmentLimiter.admit(() -> null).slot();
+            LambdaEnvironmentLimiter.Slot slot = environmentLimiter.admit(() -> {
+                WarmPool.requireInvocable(fn);
+                return null;
+            }).slot();
             try {
+                WarmPool.requireInvocable(fn);
                 handle = launcher.launchProvisioned(fn);
             } catch (RuntimeException e) {
                 slot.close();
@@ -599,7 +603,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 slots.put(handle, slot);
                 owned.put(handle, allocation.configuration);
                 finishedLaunching(allocation);
-                if (!current(allocation)) {
+                if (!current(allocation) || fn.isDeleted()) {
                     return;
                 }
                 allocation.handles.add(handle);
@@ -831,7 +835,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     private LambdaFunction currentFunction(Configuration configuration) {
         functions.getForAccount(configuration.account(), configuration.region(), configuration.name())
-                .orElseThrow(TargetUnavailableException::new);
+                .filter(fn -> !fn.isDeleted()).orElseThrow(TargetUnavailableException::new);
         if (!configuration.qualifier().matches("[0-9]+")) {
             LambdaAlias alias = aliases.getForAccount(configuration.account(), configuration.region(),
                     configuration.name(), configuration.qualifier()).orElseThrow(TargetUnavailableException::new);
@@ -842,7 +846,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
         }
         LambdaFunction fn = functions.getForAccount(configuration.account(), configuration.region(),
                 configuration.name(), configuration.version()).orElseThrow(TargetUnavailableException::new);
-        if (!Objects.equals(configuration.revision(), fn.getRevisionId())) {
+        if (fn.isDeleted() || !Objects.equals(configuration.revision(), fn.getRevisionId())) {
             throw new TargetUnavailableException();
         }
         return fn;

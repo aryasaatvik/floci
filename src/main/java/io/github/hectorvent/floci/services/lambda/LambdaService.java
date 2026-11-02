@@ -1100,8 +1100,9 @@ public class LambdaService implements ResourceProvider {
             return;
         }
         synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            WarmPool.requireInvocable(fn);
+            warmPool.deleteFunctions(List.of(version.get()));
             warmPool.deleteProvisionedQualifier(fn, qualifier);
-            warmPool.drainEnvironment(version.get());
             functionStore.deleteVersion(region, name, qualifier);
             reclaimVersionCodeDirectory(region, fn, qualifier, version.get());
             // The snapshot may still share $LATEST's code directory, so this only reclaims once no
@@ -1115,12 +1116,6 @@ public class LambdaService implements ResourceProvider {
         LambdaFunction fn = getFunction(region, functionName); // throws 404 if not found
         functionName = fn.getFunctionName();
         String arn = fn.getFunctionArn();
-        // Before the drain and anything is deleted, so no queued or running event starts a container for,
-        // or reports on, a function being removed.
-        if (executorService != null) {
-            executorService.dropPending(fn);
-        }
-        warmPool.drainFunction(functionName);
         // Take the same per-function lock used by Put/DeleteFunctionConcurrency
         // so a concurrent concurrency mutation cannot interleave with the
         // limiter reset and store delete and leave the two views out of sync.
@@ -1129,6 +1124,11 @@ public class LambdaService implements ResourceProvider {
         // object, letting a follow-up request allocate a fresh lock and run
         // in parallel — the very serialization this map exists to prevent.
         synchronized (lockForConcurrencyOp(arn)) {
+            WarmPool.requireInvocable(fn);
+            if (executorService != null) {
+                executorService.dropPending(fn);
+            }
+            warmPool.deleteFunctions(functionStore.listVersions(region, functionName));
             warmPool.deleteProvisionedFunction(fn);
             if (concurrencyLimiter != null) {
                 concurrencyLimiter.reset(arn);
@@ -1170,9 +1170,9 @@ public class LambdaService implements ResourceProvider {
         return functionStore.getForAccount(arn.accountId(), arn.region(), fn.getFunctionName());
     }
 
-    /** Whether the function {@code fn} belongs to is still in the store, whichever version {@code fn} is. */
+    /** Whether this version and its function still admit invocations. */
     boolean isLive(LambdaFunction fn) {
-        return findLatest(fn).isPresent();
+        return !fn.isDeleted() && findLatest(fn).filter(latest -> !latest.isDeleted()).isPresent();
     }
 
     /**
@@ -2392,6 +2392,7 @@ public class LambdaService implements ResourceProvider {
         // delete, persisting a snapshot.codeLocalPath (below) that names a directory about to
         // be removed as unreferenced.
         synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            WarmPool.requireInvocable(fn);
             // Inside the lock UpdateFunctionCode and UpdateFunctionConfiguration now take, so the
             // hash cannot be checked against one version of $LATEST and the snapshot then taken
             // from another. Checking it outside would let an overlapping deploy publish code the

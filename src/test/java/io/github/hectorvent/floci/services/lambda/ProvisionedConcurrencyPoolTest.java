@@ -1085,6 +1085,43 @@ class ProvisionedConcurrencyPoolTest {
     }
 
     @Test
+    void aLaunchReturningAfterFunctionDeletionIsRetiredWithoutReplacement() throws Exception {
+        launcher.launchGate = new CompletableFuture<>();
+        put(1);
+        Environment first = launched();
+        version.markDeleted();
+        launcher.launchGate.complete(null);
+
+        await().atMost(Duration.ofSeconds(5)).until(() -> !first.alive);
+        assertEquals(1, first.stops.get());
+        assertNull(pool.acquire(version, "live"));
+        pool.reconcile();
+        assertEquals(1, launcher.starts.get());
+        assertEquals("FAILED", get().status());
+    }
+
+    @Test
+    void aQueuedProvisionedLaunchRejectsADeletedFunctionWithoutTakingASlot() throws Exception {
+        pool.shutdown();
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 10);
+        LambdaEnvironmentLimiter.Slot held = limiter.admit(() -> null).slot();
+        pool = new ProvisionedConcurrencyPool(launcher, functions, aliases, storage,
+                Clock.systemUTC(), 4, 8, false, 15, limiter);
+        put(1);
+        await().atMost(Duration.ofSeconds(5)).until(() -> limiter.status().queued() == 1);
+        version.markDeleted();
+        limiter.signal();
+        try {
+            await().atMost(Duration.ofSeconds(2)).until(() -> limiter.status().queued() == 0);
+            assertEquals(0, launcher.starts.get());
+            assertEquals(1, limiter.status().total());
+            assertNull(pool.acquire(version, "live"));
+        } finally {
+            held.close();
+        }
+    }
+
+    @Test
     void shutdownWaitsForAndRemovesALaunchThatReturnsAfterAdmissionCloses() throws Exception {
         launcher.launchGate = new CompletableFuture<>();
         put(1);

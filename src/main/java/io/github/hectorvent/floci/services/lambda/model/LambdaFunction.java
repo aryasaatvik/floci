@@ -80,8 +80,17 @@ public class LambdaFunction {
     @JsonIgnore
     private volatile ContainerState containerState = ContainerState.COLD;
 
+    /** Process-local fence also invalidates references resolved before the store entry is removed. */
+    @JsonIgnore
+    private volatile boolean deleted;
+
     public LambdaFunction() {
     }
+
+    @JsonIgnore
+    public boolean isDeleted() { return deleted; }
+
+    public void markDeleted() { deleted = true; }
 
     public String getFunctionName() { return functionName; }
     public void setFunctionName(String functionName) { this.functionName = functionName; }

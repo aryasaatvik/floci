@@ -3,10 +3,12 @@ package io.github.hectorvent.floci.services.lambda;
 import org.junit.jupiter.api.Test;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -132,6 +134,34 @@ class LambdaEnvironmentLimiterTest {
 
         assertEquals("warm", waiter.get(5, TimeUnit.SECONDS).reused());
         assertEquals(status(1, 1, 0, 1, 0, 0, 0), limiter.status());
+    }
+
+    @Test
+    void aDeletionSignalDuringTheReuseProbeIsNotLostBeforeWaiting() throws Exception {
+        LambdaEnvironmentLimiter limiter = new LambdaEnvironmentLimiter(1, 10);
+        LambdaEnvironmentLimiter.Slot held = limiter.admit(() -> null).slot();
+        AtomicBoolean deleted = new AtomicBoolean();
+        AtomicInteger probes = new AtomicInteger();
+        CompletableFuture<LambdaEnvironmentLimiter.Admission<Object>> waiter = CompletableFuture.supplyAsync(() ->
+                limiter.admit(() -> {
+                    if (deleted.get()) {
+                        throw new IllegalStateException("function deleted");
+                    }
+                    if (probes.incrementAndGet() == 1) {
+                        deleted.set(true);
+                        limiter.signal();
+                    }
+                    return null;
+                }), threads);
+        try {
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> waiter.get(2, TimeUnit.SECONDS));
+            assertEquals("function deleted", failure.getCause().getMessage());
+            assertEquals(0, limiter.status().queued());
+            assertEquals(1, limiter.status().total());
+        } finally {
+            held.close();
+        }
     }
 
     @Test
