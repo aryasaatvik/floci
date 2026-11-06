@@ -1750,6 +1750,40 @@ class LambdaServiceTest {
     }
 
     @Test
+    void updateFunctionUrlConfig_emptyCorsOnUrlWithoutCors_clearsCors() {
+        // Catches: UpdateFunctionUrlConfig unboxing a null stored MaxAge when Cors arrives without one
+        service.createFunction(REGION, baseRequest("url-cors-clear-fn"));
+        LambdaUrlConfig seeded = new LambdaUrlConfig();
+        seeded.setAuthType("NONE");
+        service.getFunction(REGION, "url-cors-clear-fn").setUrlConfig(seeded);
+
+        LambdaUrlConfig updated = service.updateFunctionUrlConfig(REGION, "url-cors-clear-fn", null,
+                Map.of("AuthType", "NONE", "Cors", Map.of()));
+
+        assertEquals(0, updated.getCors().getMaxAge());
+        assertNull(updated.getCors().getAllowOrigins());
+    }
+
+    @Test
+    void updateFunctionUrlConfig_corsReplacesStoredCors() {
+        // Catches: UpdateFunctionUrlConfig carrying an omitted MaxAge over from the stored Cors
+        service.createFunction(REGION, baseRequest("url-cors-replace-fn"));
+        LambdaUrlConfig seeded = new LambdaUrlConfig();
+        seeded.setAuthType("NONE");
+        LambdaUrlConfig.Cors stored = new LambdaUrlConfig.Cors();
+        stored.setAllowOrigins(new String[] {"https://a.example"});
+        stored.setMaxAge(300);
+        seeded.setCors(stored);
+        service.getFunction(REGION, "url-cors-replace-fn").setUrlConfig(seeded);
+
+        LambdaUrlConfig updated = service.updateFunctionUrlConfig(REGION, "url-cors-replace-fn", null,
+                Map.of("Cors", Map.of("AllowOrigins", List.of("https://b.example"))));
+
+        assertEquals(0, updated.getCors().getMaxAge());
+        assertArrayEquals(new String[] {"https://b.example"}, updated.getCors().getAllowOrigins());
+    }
+
+    @Test
     void getAndDeleteFunctionUrlConfig_rejectMalformedQualifier() {
         // Catches: Get/DeleteFunctionUrlConfig skipping the FunctionUrlQualifier constraint that Create/Update enforce
         AwsException numeric = assertThrows(AwsException.class,

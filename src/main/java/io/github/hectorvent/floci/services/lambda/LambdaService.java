@@ -3168,14 +3168,7 @@ public class LambdaService implements ResourceProvider {
         @SuppressWarnings("unchecked")
         Map<String, Object> corsMap = (Map<String, Object>) request.get("Cors");
         if (corsMap != null) {
-            LambdaUrlConfig.Cors cors = new LambdaUrlConfig.Cors();
-            cors.setAllowCredentials(Boolean.TRUE.equals(corsMap.get("AllowCredentials")));
-            cors.setAllowHeaders(toStringArray(corsMap.get("AllowHeaders")));
-            cors.setAllowMethods(toStringArray(corsMap.get("AllowMethods")));
-            cors.setAllowOrigins(toStringArray(corsMap.get("AllowOrigins")));
-            cors.setExposeHeaders(toStringArray(corsMap.get("ExposeHeaders")));
-            cors.setMaxAge(toInt(corsMap.get("MaxAge"), 0));
-            urlConfig.setCors(cors);
+            urlConfig.setCors(parseCors(corsMap));
         }
 
         if (qualifier != null && !qualifier.equals("$LATEST")) {
@@ -3254,15 +3247,7 @@ public class LambdaService implements ResourceProvider {
             @SuppressWarnings("unchecked")
             Map<String, Object> corsMap = (Map<String, Object>) request.get("Cors");
             if (corsMap != null) {
-                LambdaUrlConfig.Cors cors = urlConfig.getCors();
-                if (cors == null) cors = new LambdaUrlConfig.Cors();
-                cors.setAllowCredentials(Boolean.TRUE.equals(corsMap.get("AllowCredentials")));
-                cors.setAllowHeaders(toStringArray(corsMap.get("AllowHeaders")));
-                cors.setAllowMethods(toStringArray(corsMap.get("AllowMethods")));
-                cors.setAllowOrigins(toStringArray(corsMap.get("AllowOrigins")));
-                cors.setExposeHeaders(toStringArray(corsMap.get("ExposeHeaders")));
-                cors.setMaxAge(toInt(corsMap.get("MaxAge"), cors.getMaxAge()));
-                urlConfig.setCors(cors);
+                urlConfig.setCors(parseCors(corsMap));
             } else {
                 urlConfig.setCors(null);
             }
@@ -3409,6 +3394,21 @@ public class LambdaService implements ResourceProvider {
             }
         }
         throw new AwsException("ResourceNotFoundException", "No Lambda found for URL ID: " + urlId, 404);
+    }
+
+    /**
+     * A request's {@code Cors} replaces the stored one as a whole, as on AWS: every member is
+     * optional, and an omitted member is unset rather than carried over.
+     */
+    private LambdaUrlConfig.Cors parseCors(Map<String, Object> corsMap) {
+        LambdaUrlConfig.Cors cors = new LambdaUrlConfig.Cors();
+        cors.setAllowCredentials(Boolean.TRUE.equals(corsMap.get("AllowCredentials")));
+        cors.setAllowHeaders(toStringArray(corsMap.get("AllowHeaders")));
+        cors.setAllowMethods(toStringArray(corsMap.get("AllowMethods")));
+        cors.setAllowOrigins(toStringArray(corsMap.get("AllowOrigins")));
+        cors.setExposeHeaders(toStringArray(corsMap.get("ExposeHeaders")));
+        cors.setMaxAge(toInt(corsMap.get("MaxAge"), 0));
+        return cors;
     }
 
     private String[] toStringArray(Object obj) {
