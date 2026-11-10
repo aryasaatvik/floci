@@ -3,7 +3,9 @@ package io.github.hectorvent.floci.services.lambda.durable;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.PersistentStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -23,6 +25,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -34,7 +37,11 @@ import java.util.Map;
 import java.util.concurrent.Executor;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.*;
 
 /**
  * A restart reloads executions from the JSON file, not from shared objects, so this proves that
@@ -49,6 +56,33 @@ class DurableExecutionServicePersistenceTest {
     Path directory;
 
     private final MutableClock clock = new MutableClock();
+
+    @Test
+    void scopedResetImmediatelyReclaimsItsWalSnapshot() throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.defaultAccountId()).thenReturn(ACCOUNT);
+        when(config.storage().persistentPath()).thenReturn(directory.toString());
+        when(config.storage().wal().compactionIntervalMs()).thenReturn(60_000L);
+        ServiceConfigAccess access = mock(ServiceConfigAccess.class);
+        when(access.storageMode(anyString())).thenReturn("persistent");
+        when(access.storageFlushInterval(anyString())).thenReturn(60_000L);
+        StorageFactory storage = new StorageFactory(config, access);
+        ScriptedInvoker invoker = new ScriptedInvoker();
+        DurableExecutionService service = newService(storage, invoker);
+        try {
+            invoker.script((ignored, event) -> "{\"Status\":\"SUCCEEDED\",\"Result\":\"null\"}");
+            String arn = service.start(new StartRequest(ACCOUNT, "us-east-1", "durable-fn", "1", "to-purge", "{}",
+                    false)).getExecutionArn();
+            storage.flushAll();
+            Path snapshot = directory.resolve("lambda-durable-executions.json");
+            assertTrue(Files.readString(snapshot).contains(ACCOUNT));
+            service.clearAccount(ACCOUNT);
+            assertFalse(Files.readString(snapshot).contains(ACCOUNT), "reset must reclaim persisted account bytes immediately");
+            assertThrows(AwsException.class, () -> service.get(arn));
+        } finally {
+            storage.shutdownAll();
+        }
+    }
 
     @Test
     void aRunningExecutionResumesFromDiskAfterARestart() {

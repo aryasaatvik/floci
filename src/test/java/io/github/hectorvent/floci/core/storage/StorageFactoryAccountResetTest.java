@@ -10,6 +10,8 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Instant;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -40,6 +42,39 @@ class StorageFactoryAccountResetTest {
             assertEquals("other", reloaded.getForAccount(OTHER, "same").orElseThrow());
             restarted.shutdownAll();
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void purgeReadsOnlyTheLatestStorageModeWithoutReplayingStaleForeignValues(boolean latestPlain) throws Exception {
+        Path snapshot = directory.resolve("switched-snapshot.json");
+        Path log = directory.resolve("switched.wal");
+        Path plain = directory.resolve("switched.json");
+        WalStorage<String, String> old = new WalStorage<>(snapshot, log, TYPE, Long.MAX_VALUE);
+        old.load();
+        old.put(TARGET + "/same", "target");
+        old.put(OTHER + "/same", "stale-snapshot");
+        old.flush();
+        old.put(OTHER + "/same", "journal-value");
+        Files.writeString(plain, "{\"111111111111/same\":\"target\",\"222222222222/same\":\"plain-value\"}");
+        FileTime selectedTime = FileTime.from(latestPlain ? Instant.now().plusSeconds(60) : Instant.EPOCH);
+        Files.setLastModifiedTime(plain, selectedTime);
+        // Do not shutdown the old writer: that would compact its log and change the mode-selection evidence.
+        // These are offline fixture files; use a copy so the actual writer remains outside the purge directory.
+        Path fixture = directory.resolve("fixture");
+        Files.createDirectories(fixture);
+        Files.copy(snapshot, fixture.resolve(snapshot.getFileName()));
+        Files.copy(log, fixture.resolve(log.getFileName()));
+        Files.copy(plain, fixture.resolve(plain.getFileName()));
+        Files.setLastModifiedTime(fixture.resolve(plain.getFileName()), selectedTime);
+        old.shutdown();
+        StorageFactory factory = factory(latestPlain ? "persistent" : "wal", fixture);
+        factory.clearAccount(TARGET);
+        factory.clearAccount(TARGET);
+        AccountAwareStorageBackend<String> store = factory.create("svc", "switched.json", TYPE);
+        assertTrue(store.getForAccount(TARGET, "same").isEmpty());
+        assertEquals(latestPlain ? "plain-value" : "journal-value", store.getForAccount(OTHER, "same").orElseThrow());
+        factory.shutdownAll();
     }
 
     @Test
@@ -77,9 +112,13 @@ class StorageFactoryAccountResetTest {
     }
 
     private StorageFactory factory(String mode) {
+        return factory(mode, directory);
+    }
+
+    private StorageFactory factory(String mode, Path path) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.defaultAccountId()).thenReturn(TARGET);
-        when(config.storage().persistentPath()).thenReturn(directory.toString());
+        when(config.storage().persistentPath()).thenReturn(path.toString());
         when(config.storage().wal().compactionIntervalMs()).thenReturn(60_000L);
         ServiceConfigAccess access = mock(ServiceConfigAccess.class);
         when(access.storageMode(anyString())).thenReturn(mode);

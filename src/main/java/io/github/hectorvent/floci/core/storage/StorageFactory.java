@@ -334,9 +334,19 @@ public class StorageFactory {
                         || backendsByPath.containsKey(root.resolve(stem))) {
                     continue;
                 }
-                Path liveSnapshot = Files.exists(snapshot) && (!Files.exists(plain)
-                        || Math.max(lastModified(snapshot), Files.exists(journal) ? lastModified(journal) : Long.MIN_VALUE)
-                        >= lastModified(plain)) ? snapshot : plain;
+                boolean newerPlain = Files.exists(snapshot) && Files.exists(plain)
+                        && lastModified(plain) > Math.max(lastModified(snapshot),
+                        Files.exists(journal) ? lastModified(journal) : Long.MIN_VALUE);
+                if (newerPlain) {
+                    // The newer plain store supersedes both old WAL files; replaying their records
+                    // over it would restore stale values from a previous storage mode.
+                    PersistentStorage<String, Object> unopened = new PersistentStorage<>(plain,
+                            new TypeReference<Map<String, Object>>() {});
+                    unopened.load();
+                    new AccountAwareStorageBackend<>(unopened, null, config.defaultAccountId()).clearAccount(accountId);
+                    continue;
+                }
+                Path liveSnapshot = Files.exists(snapshot) ? snapshot : plain;
                 WalStorage<String, Object> unopened = new WalStorage<>(liveSnapshot, journal,
                         new TypeReference<Map<String, Object>>() {}, Long.MAX_VALUE);
                 try {

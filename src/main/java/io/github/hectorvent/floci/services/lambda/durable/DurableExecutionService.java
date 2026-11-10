@@ -533,12 +533,17 @@ public class DurableExecutionService implements Resettable {
 
     @Override
     public void clearAccount(String accountId) {
+        boolean removed = false;
         for (AccountEntry<DurableExecution> entry : store.scanAllAccountEntries(key -> true)) {
             if (accountId.equals(entry.accountId())) {
                 synchronized (lockFor(accountId, entry.key())) {
                     store.deleteForAccount(accountId, entry.key());
+                    removed = true;
                 }
             }
+        }
+        if (removed) {
+            store.flush();
         }
         completions.forEach((key, waiter) -> {
             if (key.startsWith(accountId + "/") && completions.remove(key, waiter)) {
