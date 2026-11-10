@@ -26,6 +26,7 @@ import org.jboss.logging.Logger;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -93,6 +94,7 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
     private int queuedSamples;
     /** Bumped by every reset or clear, so a batch taken before one is never written after it. */
     private int resetGeneration;
+    private final Map<String, Integer> accountGenerations = new HashMap<>();
     private final AtomicBoolean drainScheduled = new AtomicBoolean();
     /** Failed samples retried by the worker. Process-local best effort, bounded by samples. No durable outbox. */
     private static final int MAX_PENDING_SAMPLES = 10_000;
@@ -109,7 +111,7 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
     private boolean paused;
     private boolean stopped;
 
-    private record Owner(String account, String region, String group, String filter) {}
+    private record Owner(String account, String region, String group, String filter, int generation) {}
 
     /** One filter's samples for one PutLogEvents request, evaluated at ingestion and immutable after. */
     private record Batch(Owner owner, List<Publication> publications) {
@@ -484,7 +486,8 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
     }
 
     private void cancelPublications(String logGroupName, String filterName, String region) {
-        Owner owner = new Owner(regionResolver.getAccountId(), region, logGroupName, filterName);
+        Owner owner = new Owner(regionResolver.getAccountId(), region, logGroupName, filterName,
+                accountGenerations.getOrDefault(regionResolver.getAccountId(), 0));
         pending.values().removeIf(p -> p.owner().equals(owner));
         forgetCompletedOutages();
     }
@@ -567,7 +570,8 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
         FilterPattern pattern = FilterPattern.parse(filter.getFilterPattern());
         MetricTransformation t = filter.getMetricTransformations().getFirst();
         Double literal = number(t.getMetricValue());
-        Owner owner = new Owner(account, event.region(), event.logGroupName(), filter.getFilterName());
+        Owner owner = new Owner(account, event.region(), event.logGroupName(), filter.getFilterName(),
+                accountGenerations.getOrDefault(account, 0));
         List<Publication> publications = new ArrayList<>();
         for (LogEvent logEvent : event.events()) {
             FilterMatch match = pattern.match(logEvent.getMessage());
@@ -671,7 +675,8 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
         RuntimeException firstFailure = null;
         for (Publication publication : batch.publications()) {
             synchronized (store) {
-                if (paused || generation != resetGeneration) {
+                if (paused || generation != resetGeneration
+                        || batch.owner().generation() != accountGenerations.getOrDefault(batch.owner().account(), 0)) {
                     return;
                 }
                 try {
@@ -852,6 +857,20 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
             discardQueued();
             pending.clear();
             forgetCompletedOutages();
+        }
+    }
+
+    @Override
+    public void clearAccount(String accountId) {
+        synchronized (store) {
+            accountGenerations.merge(accountId, 1, Integer::sum);
+            queued.removeIf(batch -> accountId.equals(batch.owner().account()));
+            queuedSamples = queued.stream().mapToInt(batch -> batch.publications().size()).sum();
+            pending.values().removeIf(publication -> accountId.equals(publication.owner().account()));
+            reportedOutages.removeIf(owner -> accountId.equals(owner.account()));
+            if (store instanceof AccountAwareStorageBackend<?> aware) {
+                aware.clearAccount(accountId);
+            }
         }
     }
 

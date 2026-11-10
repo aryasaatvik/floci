@@ -60,6 +60,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private final AccountAwareStorageBackend<Execution> executionStore;
     private final StorageBackend<String, Activity> activityStore;
     private final StorageBackend<String, MapRun> mapRunStore;
+    private final Map<String, Integer> accountResetGenerations = new ConcurrentHashMap<>();
     private final Map<String, ExecutionHistory> historyCache = new ConcurrentHashMap<>();
     private final Map<String, BlockingQueue<ActivityTask>> activityQueues = new ConcurrentHashMap<>();
     private final Map<String, PendingTask> pendingTaskTokens = new ConcurrentHashMap<>();
@@ -173,6 +174,49 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         this.objectMapper = objectMapper;
         this.mockLoader = mockLoader;
         this.eventPublisher = eventPublisher;
+    }
+
+    @Override
+    public void checkAccountReset(String accountId) {
+        synchronized (executionStartLock) {
+            if (executionStore.scanAllAccountEntries(key -> true).stream().anyMatch(entry ->
+                    accountId.equals(entry.accountId()) && "RUNNING".equals(entry.value().getStatus()))) {
+                throw new AwsException("ConflictException", "Stop Step Functions executions before resetting account "
+                        + accountId, 409);
+            }
+        }
+    }
+
+    @Override
+    public void clearAccount(String accountId) {
+        synchronized (executionStartLock) {
+            accountResetGenerations.merge(accountId, 1, Integer::sum);
+            historyCache.keySet().removeIf(arn -> accountId.equals(AwsArnUtils.accountOrDefault(arn, "")));
+            activityQueues.keySet().removeIf(arn -> accountId.equals(AwsArnUtils.accountOrDefault(arn, "")));
+            executionStore.clearAccount(accountId);
+        }
+        synchronized (this) {
+            pendingTaskTokens.entrySet().removeIf(entry -> {
+                if (!accountId.equals(entry.getValue().accountId())) {
+                    return false;
+                }
+                taskHeartbeatNanos.remove(entry.getKey());
+                entry.getValue().future().completeExceptionally(
+                        new AslExecutor.FailStateException("States.TaskFailed", "Step Functions account reset"));
+                return true;
+            });
+            closedTaskTokens.values().removeIf(task -> accountId.equals(task.accountId()));
+        }
+    }
+
+    private boolean saveExecutionBeforeAccountReset(Execution execution, String accountId, int generation) {
+        synchronized (executionStartLock) {
+            if (generation != accountResetGenerations.getOrDefault(accountId, 0)) {
+                return false;
+            }
+            executionStore.putForAccount(accountId, execution.getExecutionArn(), execution);
+            return true;
+        }
     }
 
     public void clear() {
@@ -791,6 +835,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                         "express:" + sm.getName() + ":" + execName + ":" + UUID.randomUUID())
                 : regionResolver.buildArn("states", region, "execution:" + sm.getName() + ":" + execName);
 
+        String executionAccount = AwsArnUtils.accountOrDefault(arn, executionStore.accountId());
+        int accountGeneration = accountResetGenerations.getOrDefault(executionAccount, 0);
         Execution exec;
         ExecutionHistory history;
         synchronized (executionStartLock) {
@@ -819,7 +865,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             exec.setStatus("RUNNING");
             history = new ExecutionHistory(eventCount -> {
                 if (eventCount % HISTORY_PERSIST_CHECKPOINT == 0) {
-                    executionStore.put(arn, exec);
+                    saveExecutionBeforeAccountReset(exec, executionAccount, accountGeneration);
                 }
             });
             HistoryEvent startEvent = new HistoryEvent();
@@ -844,7 +890,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         // finished history by the time this runs. The worker also lands here after StopExecution
         // aborted it; that ABORTED event is StopExecution's to emit, so it is not emitted twice.
         aslExecutor.executeAsync(sm, exec, history, mockedTestCase, (updatedExec, updatedHistory) -> {
-            executionStore.put(updatedExec.getExecutionArn(), updatedExec);
+            if (!saveExecutionBeforeAccountReset(updatedExec, executionAccount, accountGeneration)) {
+                return;
+            }
             LOG.infov("Execution {0} completed with status {1}", updatedExec.getExecutionArn(), updatedExec.getStatus());
             if (!express && !"ABORTED".equals(updatedExec.getStatus())) {
                 eventPublisher.emitStatusChange(updatedExec);

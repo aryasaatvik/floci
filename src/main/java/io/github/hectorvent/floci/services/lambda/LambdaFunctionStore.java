@@ -56,6 +56,11 @@ public class LambdaFunctionStore implements Resettable {
         urlIdIndex.clear();
     }
 
+    @Override
+    public void clearAccount(String accountId) {
+        urlIdIndex.values().removeIf(function -> belongsToAccount(function, accountId));
+    }
+
     private void indexFunction(LambdaFunction fn) {
         if (fn.getUrlConfig() != null && fn.getUrlConfig().getFunctionUrl() != null) {
             String urlId = extractUrlId(fn.getUrlConfig().getFunctionUrl());

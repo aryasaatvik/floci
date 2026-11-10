@@ -14,7 +14,7 @@ public enum WriteProfile {
     /**
      * Append-heavy data such as log events. Under {@code persistent} mode the store is journaled:
      * every mutation is appended to a {@code .wal} file next to the store, and the store file is
-     * rewritten only on the WAL compaction interval and at shutdown.
+     * rewritten when a compaction check finds enough journal growth or an idle period, and on explicit flush or shutdown.
      */
     APPEND_HEAVY
 }

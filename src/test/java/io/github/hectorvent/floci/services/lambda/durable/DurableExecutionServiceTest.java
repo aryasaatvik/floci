@@ -68,6 +68,21 @@ class DurableExecutionServiceTest {
     }
 
     @Test
+    void accountResetRemovesWaitingExecutionsAndDoesNotReinvokeAfterTimerFires() {
+        invoker.script(event -> {
+            checkpoint(event, token(event), List.of(waitStart("w1", 5)));
+            return pending();
+        });
+        String arn = start("purged-wait", "{}", false).getExecutionArn();
+        service.checkAccountReset(ACCOUNT);
+        service.clearAccount(ACCOUNT);
+        clock.advance(Duration.ofSeconds(10));
+        service.sweep();
+        assertThrows(AwsException.class, () -> service.get(arn));
+        assertEquals(1, invoker.events.size());
+    }
+
+    @Test
     void startInvokesTheFunctionWithTheExecutionOperationAndAToken() {
         invoker.script(event -> succeeded("\"done\""));
 

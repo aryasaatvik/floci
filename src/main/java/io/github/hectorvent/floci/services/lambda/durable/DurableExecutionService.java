@@ -522,6 +522,33 @@ public class DurableExecutionService implements Resettable {
     }
 
     @Override
+    public void checkAccountReset(String accountId) {
+        for (AccountEntry<DurableExecution> entry : store.scanAllAccountEntries(key -> true)) {
+            if (accountId.equals(entry.accountId()) && entry.value().getCurrentInvocationId() != null) {
+                throw new AwsException("ConflictException", "Wait for durable invocations before resetting account "
+                        + accountId, 409);
+            }
+        }
+    }
+
+    @Override
+    public void clearAccount(String accountId) {
+        for (AccountEntry<DurableExecution> entry : store.scanAllAccountEntries(key -> true)) {
+            if (accountId.equals(entry.accountId())) {
+                synchronized (lockFor(accountId, entry.key())) {
+                    store.deleteForAccount(accountId, entry.key());
+                }
+            }
+        }
+        completions.forEach((key, waiter) -> {
+            if (key.startsWith(accountId + "/") && completions.remove(key, waiter)) {
+                waiter.completeExceptionally(new AwsException("ResourceNotFoundException", NOT_FOUND, 404));
+            }
+        });
+        // Keep start monitors: replacing one while another caller holds it would create two locks.
+    }
+
+    @Override
     public void beforeReset() {
         generation.incrementAndGet();
     }

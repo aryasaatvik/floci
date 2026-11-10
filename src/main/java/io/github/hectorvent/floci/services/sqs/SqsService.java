@@ -61,6 +61,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 @ApplicationScoped
@@ -466,6 +467,35 @@ public class SqsService implements Resettable, ResourceProvider {
         moveTaskCancellation.values().forEach(MoveTaskCancellation::request);
         moveTaskCancellation.clear();
         moveTasksByHandle.clear();
+    }
+
+    @Override
+    public void checkAccountReset(String accountId) {
+        if (moveTasksByHandle.values().stream().anyMatch(task -> accountId.equals(
+                AwsArnUtils.accountOrDefault(task.sourceArn(), "")) && MoveTaskStore.isActive(task.status()))) {
+            throw new AwsException("ConflictException", "Wait for SQS move tasks before resetting account " + accountId, 409);
+        }
+    }
+
+    @Override
+    public synchronized void clearAccount(String accountId) {
+        Predicate<String> owned = key -> key.contains("::/" + accountId + "/");
+        messagesByQueue.forEach((key, queue) -> {
+            if (owned.test(key) && messagesByQueue.remove(key, queue)) {
+                queue.close();
+            }
+        });
+        if (queueStore instanceof AccountAwareStorageBackend<?> aware) {
+            aware.clearAccount(accountId);
+        }
+        redrivePolicyCache.keySet().removeIf(owned);
+        deduplicationCache.keySet().removeIf(owned);
+        deduplicationIdentityCache.keySet().removeIf(owned);
+        // Queue monitors outlive reset so an operation cannot acquire a second monitor for the same key.
+        synchronized (moveTasksByHandle) {
+            moveTasksByHandle.entries.values().removeIf(entry -> accountId.equals(
+                    AwsArnUtils.accountOrDefault(entry.task().sourceArn(), "")));
+        }
     }
 
     /**

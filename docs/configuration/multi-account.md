@@ -209,3 +209,20 @@ Storage keys are namespaced per account at the persistence layer. When using `pe
 | `FLOCI_DEFAULT_ACCOUNT_ID` | `000000000000` | Account ID used when the AKID does not resolve directly or through a stored credential |
 | `FLOCI_DEFAULT_REGION` | `us-east-1` | Region used when not derivable from the `Authorization` header |
 | `FLOCI_AUTH_VALIDATE_SIGNATURES` | `false` | Verify the SigV4 signature of every signed request, for every service, without evaluating policies |
+
+## Resetting One Account
+
+`POST /_floci/state/accounts/{accountId}/reset` removes that account's stored resources in every region,
+including unopened persistent stores, metrics, logs, S3 payloads and multipart uploads, Lambda code,
+and durable executions. `/_localstack` is an equivalent prefix. The account ID must contain exactly
+12 ASCII digits. Success returns `{"status":"OK","accountId":"111111111111"}`. Repeating the request
+is safe. Other accounts remain available, and no global container teardown runs.
+
+Stop the account's clients and drain its Lambda environments first. A target account with owned
+Lambda environments, a running durable invocation, or an active SQS move task returns HTTP 409
+before deleting any state. Account reset is an emulator administration API and follows the same
+local trust model as global reset. It is not an AWS API.
+
+`GET /_floci/info` advertises `capabilities.accountStateReset: true`. Older versions do not support
+the scoped path and return 404. Never replace a missing scoped reset with the global
+`POST /_floci/state/reset` or `POST /_floci/state/nuke` on a shared emulator.

@@ -48,6 +48,16 @@ class SqsMetricsPublisherTest {
     }
 
     @Test
+    void scopedResetCannotRepublishDeletedQueuesOnTheNextTick() {
+        sqs.createQueue("removed", null, REGION);
+        publisher.publish(Instant.now());
+        sqs.clearAccount(ACCOUNT);
+        cloudWatch.deleteMetricDataBefore(Instant.now().plus(Duration.ofDays(1)));
+        publisher.publish(Instant.now().plusSeconds(60));
+        assertTrue(cloudWatch.listMetrics(SqsMetricsPublisher.NAMESPACE, null, List.of(), REGION).isEmpty());
+    }
+
+    @Test
     void activeQueueReportsItsDepthAsGauges() {
         String url = sqs.createQueue("depth", null, REGION).getQueueUrl();
         sqs.sendMessage(url, "visible", null, REGION);

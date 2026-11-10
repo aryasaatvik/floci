@@ -159,6 +159,22 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         delegate.clear();
     }
 
+    /** Purges exactly one account, including unprefixed legacy entries owned by the default account. */
+    public synchronized void clearAccount(String accountId) {
+        Set<String> keys = delegate.keys().stream().filter(key -> hasAccountPrefix(key)
+                ? key.startsWith(accountId + "/") : defaultAccountId.equals(accountId))
+                .collect(Collectors.toSet());
+        if (!keys.isEmpty()) {
+            if (delegate instanceof PartitionedFileStorage<?>) {
+                keys.forEach(delegate::delete);
+            } else {
+                delegate.deleteAllAtomically(keys);
+            }
+            delegate.flush();
+        }
+        ownerAccounts.remove(accountId);
+    }
+
     // --- Explicit-account methods for async workers ---
 
     /** Scans all values across every account, without any account prefix filtering. */

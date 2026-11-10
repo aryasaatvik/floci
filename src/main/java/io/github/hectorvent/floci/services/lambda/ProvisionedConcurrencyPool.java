@@ -880,6 +880,24 @@ public class ProvisionedConcurrencyPool implements Resettable {
     }
 
     @Override
+    public void checkAccountReset(String accountId) {
+        synchronized (lock) {
+            if (owned.values().stream().anyMatch(configuration -> accountId.equals(configuration.account()))
+                    || launchingAllocations.stream().anyMatch(allocation -> accountId.equals(allocation.configuration.account()))) {
+                throw new AwsException("ConflictException", "Drain provisioned Lambda environments before resetting account "
+                        + accountId, 409);
+            }
+        }
+    }
+
+    @Override
+    public void clearAccount(String accountId) {
+        synchronized (lock) {
+            allocations.values().removeIf(allocation -> accountId.equals(allocation.configuration.account()));
+        }
+    }
+
+    @Override
     public void clear() {
         stopManagedContainers();
         synchronized (lock) {

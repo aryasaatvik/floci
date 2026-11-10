@@ -42,6 +42,7 @@ public class SqsMetricsPublisher {
     private final SqsService sqsService;
     private final CloudWatchMetricsService metricsService;
     private final boolean enabled;
+    private final Duration retention;
     private final ScheduledExecutorService scheduler;
 
     @Inject
@@ -50,6 +51,9 @@ public class SqsMetricsPublisher {
         this.metricsService = metricsService;
         this.enabled = config.services().sqs().enabled() && config.services().sqs().cloudwatchMetricsEnabled()
                 && config.services().cloudwatchmetrics().enabled();
+        long configuredRetention = config.services().cloudwatchmetrics().retentionSeconds();
+        this.retention = configuredRetention > 0 ? Duration.ofSeconds(Math.min(RETENTION.toSeconds(), configuredRetention))
+                : RETENTION;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "sqs-metrics-publisher");
             t.setDaemon(true);
@@ -84,6 +88,12 @@ public class SqsMetricsPublisher {
      * drops only that queue's samples for the minute.
      */
     void publish(Instant now) {
+        synchronized (sqsService) {
+            publishLocked(now);
+        }
+    }
+
+    private void publishLocked(Instant now) {
         List<SqsService.QueueMetrics> queues;
         try {
             queues = sqsService.collectQueueMetrics(now);
@@ -103,9 +113,9 @@ public class SqsMetricsPublisher {
         }
         if (minute % 3600 == 0) {
             try {
-                metricsService.deleteMetricDataBefore(NAMESPACE, Instant.ofEpochSecond(minute).minus(RETENTION));
+                metricsService.deleteMetricDataBefore(NAMESPACE, Instant.ofEpochSecond(minute).minus(retention));
             } catch (RuntimeException e) {
-                LOG.warnv(e, "Dropping AWS/SQS datapoints older than {0} failed; the next hour tries again", RETENTION);
+                LOG.warnv(e, "Dropping AWS/SQS datapoints older than {0} failed; the next hour tries again", retention);
             }
         }
     }

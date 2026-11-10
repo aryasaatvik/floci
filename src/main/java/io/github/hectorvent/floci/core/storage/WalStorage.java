@@ -29,6 +29,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -52,6 +53,8 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
 
     private static final Logger LOG = Logger.getLogger(WalStorage.class);
 
+    private static final long MIN_COMPACTION_BYTES = 1024 * 1024;
+
     static final byte OP_PUT = 0x01;
     static final byte OP_DELETE = 0x02;
     static final byte OP_BATCH = 0x03;
@@ -69,9 +72,19 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
     // Set under the read lock by every mutation and cleared under the write lock by compaction,
     // so an idle store does not rewrite its snapshot on every compaction tick.
     private volatile boolean dirty;
+    private final boolean appendHeavy;
+    private final long idleCompactionNanos;
+    private volatile long lastMutationNanos = System.nanoTime();
 
     public WalStorage(Path snapshotPath, Path walPath, TypeReference<Map<K, V>> typeReference,
                       long compactionIntervalMs) {
+        this(snapshotPath, walPath, typeReference, compactionIntervalMs, false);
+    }
+
+    public WalStorage(Path snapshotPath, Path walPath, TypeReference<Map<K, V>> typeReference,
+                      long compactionIntervalMs, boolean appendHeavy) {
+        this.appendHeavy = appendHeavy;
+        this.idleCompactionNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(120_000L, compactionIntervalMs));
         this.snapshotPath = snapshotPath;
         this.walPath = walPath;
         this.typeReference = typeReference;
@@ -85,7 +98,7 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
         this.walMapper.registerModule(new JavaTimeModule());
         this.walMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
-        this.scheduler = StorageFiles.scheduleEvery("wal-storage-compaction", compactionIntervalMs, this::compact);
+        this.scheduler = StorageFiles.scheduleEvery("wal-storage-compaction", compactionIntervalMs, this::compactIfNeeded);
     }
 
     @Override
@@ -94,6 +107,7 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
         try {
             store.put(key, value);
             dirty = true;
+            lastMutationNanos = System.nanoTime();
             appendPut(key, value);
         } finally {
             compactionLock.readLock().unlock();
@@ -113,6 +127,7 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
         try {
             store.putAll(entries);
             dirty = true;
+            lastMutationNanos = System.nanoTime();
             appendPuts(entries);
         } finally {
             compactionLock.readLock().unlock();
@@ -189,6 +204,7 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
             }
             store = candidate;
             dirty = true;
+            lastMutationNanos = System.nanoTime();
         } catch (IOException exception) {
             throw new UncheckedIOException("Failed to commit atomic WAL batch to " + walPath, exception);
         } finally {
@@ -207,6 +223,7 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
         try {
             store.remove(key);
             dirty = true;
+            lastMutationNanos = System.nanoTime();
             appendDelete(key);
         } finally {
             compactionLock.readLock().unlock();
@@ -250,6 +267,7 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
             if (replayed > 0) {
                 // The snapshot is behind the log; the next compaction folds the log in.
                 dirty = true;
+                lastMutationNanos = System.nanoTime();
             }
         }
 
@@ -270,6 +288,7 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
                 LOG.errorv(e, "Failed to delete WAL/snapshot files");
                 // A snapshot that survived must be overwritten by the next compaction.
                 dirty = true;
+                lastMutationNanos = System.nanoTime();
             }
             openWalWriter();
         } finally {
@@ -309,6 +328,34 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
                     LOG.warnv(e, "Failed to remove the empty log {0} a read created", walPath);
                 }
             }
+        }
+    }
+
+    /** Timer ticks bound journal growth without repeatedly rewriting an almost unchanged large snapshot. */
+    void compactIfNeeded() {
+        compactIfNeeded(System.nanoTime());
+    }
+
+    void compactIfNeeded(long nowNanos) {
+        if (!appendHeavy) {
+            compact();
+            return;
+        }
+        compactionLock.writeLock().lock();
+        try {
+            if (!dirty) {
+                return;
+            }
+            long snapshotBytes = Files.exists(snapshotPath) ? Files.size(snapshotPath) : 0;
+            long journalBytes = Files.exists(walPath) ? Files.size(walPath) : 0;
+            if (journalBytes >= Math.max(MIN_COMPACTION_BYTES, snapshotBytes / 4)
+                    || nowNanos - lastMutationNanos >= idleCompactionNanos) {
+                compact();
+            }
+        } catch (IOException e) {
+            LOG.errorv(e, "Failed to inspect WAL compaction sizes for {0}", walPath);
+        } finally {
+            compactionLock.writeLock().unlock();
         }
     }
 

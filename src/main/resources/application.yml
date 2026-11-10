@@ -612,10 +612,12 @@ floci:
       enabled: true
     cloudwatchlogs:
       enabled: true
+      retention-seconds: ${FLOCI_CLOUDWATCH_LOGS_RETENTION_SECONDS:0}
       max-events-per-query: 10000
       max-stored-events: 20000
     cloudwatchmetrics:
       enabled: true
+      retention-seconds: ${FLOCI_CLOUDWATCH_METRICS_RETENTION_SECONDS:0}
     secretsmanager:
       enabled: true
       default-recovery-window-days: 30

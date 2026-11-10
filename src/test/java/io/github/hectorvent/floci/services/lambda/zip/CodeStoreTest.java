@@ -1,5 +1,9 @@
 package io.github.hectorvent.floci.services.lambda.zip;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -10,15 +14,50 @@ import java.nio.file.FileSystem;
 import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 class CodeStoreTest {
 
     private static final String ACCOUNT_A = "111111111111";
     private static final String ACCOUNT_B = "222222222222";
     private static final String REGION = "us-east-1";
+
+    @Test
+    void scopedResetRemovesBothAccountLayoutsAndPreservesTheOtherAccount(@TempDir Path baseDir) throws Exception {
+        CodeStore store = new CodeStore(baseDir);
+        writeHandler(store.getCodePath(ACCOUNT_A, REGION, "fn"), "new");
+        writeHandler(baseDir.resolve(ACCOUNT_A).resolve("old"), "old");
+        writeHandler(store.getCodePath(ACCOUNT_B, REGION, "fn"), "other");
+        store.clearAccount(ACCOUNT_A);
+        assertFalse(Files.exists(baseDir.resolve(ACCOUNT_A)));
+        assertEquals("other", Files.readString(store.getCodePath(ACCOUNT_B, REGION, "fn").resolve("index.js")));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"111111111111,222222222222,111111111111", "111111111111,222222222222,222222222222/legacy"})
+    void scopedResetRefusesForeignLegacyCodeInsideEitherDeletionRoot(String target, String foreign,
+                                                                                    String relativePath,
+                                                                                    @TempDir Path baseDir) throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().lambda().codePath()).thenReturn(baseDir.toString());
+        LambdaFunctionStore functions = mock(LambdaFunctionStore.class);
+        LambdaFunction own = new LambdaFunction();
+        own.setAccountId(target);
+        own.setFunctionName(foreign);
+        LambdaFunction other = new LambdaFunction();
+        other.setAccountId(foreign);
+        other.setFunctionName(target);
+        other.setCodeLocalPath(baseDir.resolve(relativePath).toString());
+        when(functions.listAll()).thenReturn(List.of(own, other));
+        CodeStore store = new CodeStore(config, functions);
+        writeHandler(Path.of(other.getCodeLocalPath()), "foreign");
+        assertEquals(409, assertThrows(AwsException.class, () -> store.checkAccountReset(target)).getHttpStatus());
+        assertEquals("foreign", Files.readString(Path.of(other.getCodeLocalPath()).resolve("index.js")));
+    }
 
     @Test
     void sameFunctionNameInTwoAccountsResolvesToDistinctDirectories(@TempDir Path baseDir) {

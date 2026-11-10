@@ -60,6 +60,35 @@ class EmulatorInfoControllerTest {
     }
 
     @Test
+    void scopedResetChecksBeforePurgingWithoutGlobalTeardown() {
+        when(resettables.iterator()).thenAnswer(ignored -> List.of(resettable).iterator());
+        assertEquals(200, controller.resetAccount("111111111111").getStatus());
+        InOrder order = inOrder(resettable, storageFactory);
+        order.verify(resettable).checkAccountReset("111111111111");
+        order.verify(resettable).clearAccount("111111111111");
+        order.verify(storageFactory).clearAccount("111111111111");
+        verifyNoInteractions(containerTeardowns);
+        verify(storageFactory, never()).clearAll();
+        verify(resettable, never()).clear();
+    }
+
+    @Test
+    void invalidScopedResetCannotTouchState() {
+        assertEquals(400, controller.resetAccount("../222222222222").getStatus());
+        assertEquals(400, controller.resetAccount("１２３４５６７８９０１２").getStatus());
+        verifyNoInteractions(storageFactory, resettables, containerTeardowns);
+    }
+
+    @Test
+    void scopedResetRefusalLeavesAllStateUntouched() {
+        when(resettables.iterator()).thenAnswer(ignored -> List.of(resettable).iterator());
+        doThrow(new IllegalStateException("busy")).when(resettable).checkAccountReset("111111111111");
+        assertThrows(IllegalStateException.class, () -> controller.resetAccount("111111111111"));
+        verifyNoInteractions(storageFactory, containerTeardowns);
+        verify(resettable, never()).clearAccount("111111111111");
+    }
+
+    @Test
     @DisplayName("Should report the selected DynamoDB backend in info")
     void info_reportsTheSelectedDynamoDbBackend() {
         when(dynamoDbBackendSelector.selected()).thenReturn("local");

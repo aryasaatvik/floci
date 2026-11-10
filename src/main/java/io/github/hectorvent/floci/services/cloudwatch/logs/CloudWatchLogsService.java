@@ -36,6 +36,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -246,6 +247,24 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
     public void afterReset() {
         clearEveryIndex();
         resetting = false;
+    }
+
+    @Override
+    public void clearAccount(String accountId) {
+        LogEventIndex index = eventIndex(accountId);
+        synchronized (index) {
+            for (StorageBackend<String, ?> store : List.of(groupStore, streamStore, eventStore,
+                    subscriptionFilterStore, metricFilterStore, resourcePolicyStore)) {
+                if (store instanceof AccountAwareStorageBackend<?> aware) {
+                    aware.clearAccount(accountId);
+                }
+            }
+            index.clear();
+        }
+        streamPageSnapshots.values().removeIf(snapshot -> accountId.equals(snapshot.account()));
+        synchronized (insightsQueries) {
+            insightsQueries.values().removeIf(query -> accountId.equals(query.account));
+        }
     }
 
     private void clearEveryIndex() {
@@ -604,7 +623,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
                     groupKey(region, groupName), prefix == null ? "" : prefix,
                     byLastEventTime, descending,
                     result.stream().map(LogStream::getLogStreamName).toList(),
-                    clock.getAsLong()));
+                    clock.getAsLong(), indexAccount(null)));
             evictExpiredStreamPageSnapshots();
             token = encodeStreamPageToken(snapshotId, end);
         }
@@ -654,7 +673,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
     }
 
     private record StreamPageSnapshot(String groupKey, String prefix, boolean byLastEventTime,
-                                      boolean descending, List<String> streamNames, long createdAtMs) {}
+                                      boolean descending, List<String> streamNames, long createdAtMs, String account) {}
 
     private static final long STREAM_PAGE_SNAPSHOT_TTL_MS = 15 * 60 * 1000;
 
@@ -818,6 +837,35 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             index.remove(key);
         }
         LOG.debugv("Evicted {0} oldest log event(s) to stay within the {1}-event store ceiling", excess, maxStoredEvents);
+    }
+
+    /** Applies an emulator-wide event age ceiling even to groups with no retention policy. */
+    public void deleteEventsBefore(long cutoffMillis) {
+        if (eventStore instanceof AccountAwareStorageBackend<LogEvent> aware) {
+            Set<String> accounts = new HashSet<>();
+            aware.scanAllAccountEntries(key -> true).forEach(entry -> accounts.add(entry.accountId()));
+            for (String account : accounts) {
+                deleteEventsBefore(account, cutoffMillis);
+            }
+        } else {
+            deleteEventsBefore(null, cutoffMillis);
+        }
+    }
+
+    private void deleteEventsBefore(String account, long cutoffMillis) {
+        LogEventIndex index = eventIndex(indexAccount(account));
+        synchronized (index) {
+            for (String key : keysForAccount(eventStore, account)) {
+                if (getForAccount(eventStore, account, key).filter(event -> event.getTimestamp() < cutoffMillis).isPresent()) {
+                    deleteForAccount(eventStore, account, key);
+                    index.remove(key);
+                }
+            }
+        }
+    }
+
+    public void flushEvents() {
+        eventStore.flush();
     }
 
     /** The account's event index; every write to the account's events holds its monitor. */
@@ -1077,18 +1125,20 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
      */
     private static final class QueryRecord {
         private List<LinkedHashMap<String, String>> rows;
+        private final String account;
         private final long recordsScanned;
         private final long recordsMatched;
         private final long completeAtMs;
         private final String failureReason;
         private boolean cancelled;
 
-        QueryRecord(List<LinkedHashMap<String, String>> rows, long recordsScanned, long completeAtMs) {
-            this(rows, recordsScanned, completeAtMs, null);
+        QueryRecord(List<LinkedHashMap<String, String>> rows, long recordsScanned, long completeAtMs, String account) {
+            this(rows, recordsScanned, completeAtMs, null, account);
         }
 
         private QueryRecord(List<LinkedHashMap<String, String>> rows, long recordsScanned, long completeAtMs,
-                             String failureReason) {
+                             String failureReason, String account) {
+            this.account = account;
             this.rows = rows;
             this.recordsScanned = recordsScanned;
             this.recordsMatched = rows.size();
@@ -1097,8 +1147,8 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
         }
 
         /** A query whose string could not be fully evaluated: it never produces rows and ends up {@code Failed}. */
-        static QueryRecord failed(long recordsScanned, long completeAtMs, String failureReason) {
-            return new QueryRecord(List.of(), recordsScanned, completeAtMs, failureReason);
+        static QueryRecord failed(long recordsScanned, long completeAtMs, String failureReason, String account) {
+            return new QueryRecord(List.of(), recordsScanned, completeAtMs, failureReason, account);
         }
 
         private InsightsQueryStatus status(long nowMs) {
@@ -1183,7 +1233,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             // A query containing syntax this engine cannot evaluate must not come back as a
             // "successful" empty or partial result set: fail it, so the caller can tell the
             // difference between "the filter matched nothing" and "the filter was never applied".
-            insightsQueries.put(queryId, QueryRecord.failed(gathered.size(), completeAtMs, parsedQuery.getUnsupportedReason()));
+            insightsQueries.put(queryId, QueryRecord.failed(gathered.size(), completeAtMs, parsedQuery.getUnsupportedReason(), indexAccount(null)));
             LOG.warnv("Logs Insights query {0} will fail: {1}", queryId, parsedQuery.getUnsupportedReason());
             return queryId;
         }
@@ -1191,7 +1241,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
         int effectiveLimit = (limit != null && limit > 0) ? Math.min(limit, maxEventsPerQuery) : maxEventsPerQuery;
         List<LinkedHashMap<String, String>> rows = parsedQuery.evaluate(gathered, effectiveLimit);
 
-        insightsQueries.put(queryId, new QueryRecord(rows, gathered.size(), completeAtMs));
+        insightsQueries.put(queryId, new QueryRecord(rows, gathered.size(), completeAtMs, indexAccount(null)));
         LOG.infov("Logs Insights query {0}: scanned {1} event(s) across {2} group(s) -> {3} row(s)",
                 queryId, gathered.size(), distinctGroups.size(), rows.size());
         return queryId;

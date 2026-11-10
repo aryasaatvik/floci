@@ -1,7 +1,12 @@
 package io.github.hectorvent.floci.services.lambda.zip;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.FileTrees;
+import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -11,6 +16,8 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.stream.Stream;
 
 /**
@@ -22,7 +29,7 @@ import java.util.stream.Stream;
  * function is named like a region.
  */
 @ApplicationScoped
-public class CodeStore {
+public class CodeStore implements Resettable {
 
     private static final Logger LOG = Logger.getLogger(CodeStore.class);
 
@@ -36,14 +43,94 @@ public class CodeStore {
     private static final String REGIONS_DIR = "@regions";
 
     private final Path baseDir;
+    private final LambdaFunctionStore functions;
+
+    public CodeStore(EmulatorConfig config) {
+        this(Path.of(config.services().lambda().codePath()));
+    }
 
     @Inject
-    public CodeStore(EmulatorConfig config) {
+    public CodeStore(EmulatorConfig config, LambdaFunctionStore functions) {
         this.baseDir = Path.of(config.services().lambda().codePath());
+        this.functions = functions;
     }
 
     public CodeStore(Path baseDir) {
         this.baseDir = baseDir;
+        this.functions = null;
+    }
+
+    @Override
+    public void clear() {
+        deleteAccountDirectory(baseDir);
+    }
+
+    @Override
+    public void checkAccountReset(String accountId) {
+        if (functions == null) {
+            return;
+        }
+        List<LambdaFunction> all = functions.listAll();
+        List<Path> candidates = new ArrayList<>();
+        candidates.add(baseDir.resolve(accountId).toAbsolutePath().normalize());
+        for (LambdaFunction function : all) {
+            if (accountId.equals(owner(function))) {
+                candidates.add(getLegacyCodePath(function.getFunctionName()).toAbsolutePath().normalize());
+            }
+        }
+        for (LambdaFunction function : all) {
+            if (accountId.equals(owner(function))) {
+                continue;
+            }
+            Path foreignRoot = baseDir.resolve(owner(function)).toAbsolutePath().normalize();
+            if (Files.exists(foreignRoot) && candidates.stream().anyMatch(foreignRoot::startsWith)) {
+                throw new AwsException("ConflictException", "Lambda code paths overlap account " + accountId
+                        + "; migrate the foreign legacy code before resetting", 409);
+            }
+            if (function.getCodeLocalPath() == null) {
+                continue;
+            }
+            Path foreignCode = Path.of(function.getCodeLocalPath()).toAbsolutePath().normalize();
+            if (candidates.stream().anyMatch(foreignCode::startsWith)) {
+                throw new AwsException("ConflictException", "Lambda code paths overlap account " + accountId
+                        + "; migrate the foreign legacy code before resetting", 409);
+            }
+        }
+    }
+
+    private static String owner(LambdaFunction function) {
+        return function.getAccountId() != null && !function.getAccountId().isBlank() ? function.getAccountId()
+                : AwsArnUtils.accountOrDefault(function.getFunctionArn(), "");
+    }
+
+    @Override
+    public void clearAccount(String accountId) {
+        checkAccountReset(accountId);
+        if (functions != null) {
+            List<LambdaFunction> all = functions.listAll();
+            for (LambdaFunction function : all) {
+                if (!accountId.equals(owner(function))) {
+                    continue;
+                }
+                Path legacy = getLegacyCodePath(function.getFunctionName());
+                boolean shared = all.stream().anyMatch(other -> other != function
+                        && !accountId.equals(owner(other))
+                        && legacy.toString().equals(other.getCodeLocalPath()));
+                if (!shared && !Files.isDirectory(legacy.resolve(REGIONS_DIR))) {
+                    deleteAccountDirectory(legacy);
+                }
+            }
+        }
+        // This also removes the preceding account/function layout and every version's code.
+        deleteAccountDirectory(baseDir.resolve(accountId));
+    }
+
+    private static void deleteAccountDirectory(Path directory) {
+        try {
+            FileTrees.delete(directory);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to purge Lambda code under " + directory, e);
+        }
     }
 
     public Path getCodePath(String accountId, String region, String functionName) {

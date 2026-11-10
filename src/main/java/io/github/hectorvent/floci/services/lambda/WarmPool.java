@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.ContainerTeardowns;
@@ -97,6 +98,17 @@ public class WarmPool implements ContainerTeardown, Resettable {
 
     private record IdleEntry(PoolState poolState, String environmentKey,
                              ArrayDeque<ContainerHandle> idle, ContainerHandle handle) {
+    }
+
+    @Override
+    public void checkAccountReset(String accountId) {
+        synchronized (capLock) {
+            boolean ownsEnvironment = handleFunctions.values().stream().anyMatch(fn -> accountId.equals(AwsArnUtils.accountOrDefault(fn.getFunctionArn(), fn.getAccountId())));
+            boolean launching = functionLaunches.keySet().stream().anyMatch(fn -> accountId.equals(AwsArnUtils.accountOrDefault(fn.getFunctionArn(), fn.getAccountId())));
+            if (ownsEnvironment || launching) {
+                throw new AwsException("ConflictException", "Drain Lambda environments before resetting account " + accountId, 409);
+            }
+        }
     }
 
     @Inject

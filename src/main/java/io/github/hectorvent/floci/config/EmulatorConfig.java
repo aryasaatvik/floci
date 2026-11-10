@@ -2038,6 +2038,10 @@ public interface EmulatorConfig {
     }
 
     interface CloudWatchLogsServiceConfig {
+        /** Emulator-wide event age ceiling in seconds; zero preserves each group's retention policy. */
+        @WithDefault("0")
+        long retentionSeconds();
+
         @WithDefault("true")
         boolean enabled();
 
@@ -2064,6 +2068,10 @@ public interface EmulatorConfig {
     }
 
     interface CloudWatchMetricsServiceConfig {
+        /** Emulator-wide datapoint age ceiling in seconds; zero preserves existing retention. */
+        @WithDefault("0")
+        long retentionSeconds();
+
         @WithDefault("true")
         boolean enabled();
     }

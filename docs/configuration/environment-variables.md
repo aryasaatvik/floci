@@ -331,6 +331,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 
 | Variable | Default | Description |
 |---|---|---|
+| `FLOCI_CLOUDWATCH_LOGS_RETENTION_SECONDS` | `0` | Optional emulator-wide log event age ceiling in seconds, applied at startup and once a minute even without a group policy; zero preserves current retention |
 | `FLOCI_SERVICES_CLOUDWATCHLOGS_ENABLED` | `true` | Enable the CloudWatch Logs service |
 | `FLOCI_SERVICES_CLOUDWATCHLOGS_MAX_EVENTS_PER_QUERY` | `10000` | Maximum log events returned by a single `FilterLogEvents` or `GetLogEvents` call, and the upper bound for a Logs Insights `limit` |
 | `FLOCI_SERVICES_CLOUDWATCHLOGS_MAX_STORED_EVENTS` | `20000` | Maximum log events retained per account across all groups; oldest events are evicted first |
@@ -340,6 +341,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 
 | Variable | Default | Description |
 |---|---|---|
+| `FLOCI_CLOUDWATCH_METRICS_RETENTION_SECONDS` | `0` | Optional datapoint age ceiling in seconds across every namespace and account, applied at startup and once a minute; zero preserves current behavior, including the existing 15-day SQS cleanup and 30-day alarm history |
 | `FLOCI_SERVICES_CLOUDWATCHMETRICS_ENABLED` | `true` | Enable the CloudWatch Metrics service |
 
 ### Secrets Manager

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
@@ -81,6 +82,27 @@ public class LambdaConcurrencyLimiter implements Resettable {
     /** Test-only no-arg constructor using AWS defaults (1000 / 100). */
     LambdaConcurrencyLimiter() {
         this(1000, 100);
+    }
+
+    @Override
+    public void checkAccountReset(String accountId) {
+        if (inflight.entrySet().stream().anyMatch(entry -> accountId.equals(
+                AwsArnUtils.accountOrDefault(entry.getKey(), "")) && entry.getValue().get() > 0)) {
+            throw new AwsException("ConflictException", "Wait for Lambda invocations before resetting account " + accountId, 409);
+        }
+    }
+
+    @Override
+    public void clearAccount(String accountId) {
+        synchronized (reservedLock) {
+            for (ConcurrentHashMap<String, Integer> reservations : reservedByRegion.values()) {
+                for (String arn : Set.copyOf(reservations.keySet())) {
+                    if (accountId.equals(AwsArnUtils.accountOrDefault(arn, ""))) {
+                        writeReserved(arn, null);
+                    }
+                }
+            }
+        }
     }
 
     public Permit acquire(LambdaFunction fn) {

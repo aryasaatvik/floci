@@ -30,6 +30,18 @@ class LambdaConcurrencyLimiterTest {
     }
 
     @Test
+    void accountResetReleasesOnlyItsReservations() {
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(10, 0);
+        String otherArn = "arn:aws:lambda:us-east-1:222222222222:function:other";
+        limiter.setReserved(ARN, 3);
+        limiter.setReserved(otherArn, 4);
+        limiter.clearAccount("000000000000");
+        assertEquals(4, limiter.totalReserved(REGION));
+        assertNull(limiter.clearReserved(ARN));
+        assertEquals(4, limiter.clearReserved(otherArn));
+    }
+
+    @Test
     void unsetReserved_countsAgainstAccountPool() {
         LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(2, 0);
         LambdaConcurrencyLimiter.Permit p1 = limiter.acquire(fn(null));

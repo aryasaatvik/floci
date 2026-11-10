@@ -268,3 +268,12 @@ FLOCI_STORAGE_HOST_PERSISTENT_PATH=/absolute/host/path/data
     `FLOCI_STORAGE_HOST_PERSISTENT_PATH` must be an absolute path (starting with `/`). Volume
     names and relative paths are not supported and will be silently ignored, falling back to
     named-volume mode.
+
+### Append-heavy journal compaction
+
+Under persistent and WAL modes, append-heavy stores such as CloudWatch metric datapoints and log
+events append each mutation to their existing WAL. The configured compaction interval is a check
+cadence: compaction runs when the journal reaches the larger of 1 MiB and one quarter of the
+snapshot size, or after at least two minutes without a mutation. Explicit flush, account reset,
+and shutdown still compact immediately. Existing JSON snapshots and WALs remain readable without
+migration. A startup retention sweep compacts once to reclaim expired history from existing volumes.

@@ -433,6 +433,36 @@ public class S3Service implements Resettable, ResourceProvider {
         }
     }
 
+    @Override
+    public void clearAccount(String accountId) {
+        memoryDataStore.keySet().removeIf(key -> key.startsWith(accountId + "/"));
+        memoryAnnotationStore.keySet().removeIf(key -> key.startsWith(accountId + "/"));
+        for (MultipartUpload upload : List.copyOf(multipartUploads.values())) {
+            if (accountId.equals(upload.getOwnerAccountId())) {
+                withMultipartBucketWriteLock(upload.getBucket(), () -> cleanupMultipart(upload.getUploadId()));
+            }
+        }
+        if (!inMemory) {
+            try {
+                FileTrees.delete(dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(accountId));
+                if (bucketStore instanceof AccountAwareStorageBackend<Bucket> aware) {
+                    List<AccountAwareStorageBackend.AccountEntry<Bucket>> buckets = aware.scanAllAccountEntries(key -> true);
+                    for (AccountAwareStorageBackend.AccountEntry<Bucket> entry : buckets) {
+                        String name = entry.value().getName();
+                        boolean shared = buckets.stream().anyMatch(other -> !accountId.equals(other.accountId())
+                                && name.equals(other.value().getName()));
+                        if (accountId.equals(entry.accountId()) && !shared) {
+                            FileTrees.delete(bucketDirectory(dataRoot, name));
+                            FileTrees.delete(bucketDirectory(dataRoot.resolve(VERSION_STORAGE_ROOT), name));
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to purge S3 data for account " + accountId, e);
+            }
+        }
+    }
+
     /**
      * Deletes the part and assembled files of every multipart upload. Uploads are tracked only in
      * memory, so at startup or after a reset these files belong to uploads that no longer exist, and

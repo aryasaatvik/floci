@@ -197,6 +197,16 @@ public class CloudWatchMetricsService {
         deleteInEveryAccount(metricStore, d -> namespace.equals(d.getNamespace()) && d.getTimestamp() < cutoffSeconds);
     }
 
+    /** Removes expired datapoints in every namespace and account, including loaded legacy entries. */
+    public void deleteMetricDataBefore(Instant cutoff) {
+        deleteInEveryAccount(metricStore, datum -> datum.getTimestamp() < cutoff.getEpochSecond());
+    }
+
+    /** Reclaims a startup retention sweep before the regular journal compaction policy takes over. */
+    public void flushMetricData() {
+        metricStore.flush();
+    }
+
     private static <V> void deleteInEveryAccount(StorageBackend<String, V> store, Predicate<V> expired) {
         if (store instanceof AccountAwareStorageBackend<V> aware) {
             aware.deleteAllAccountsMatching(expired);

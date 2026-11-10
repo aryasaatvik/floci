@@ -20,6 +20,7 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
@@ -42,6 +43,33 @@ class WalStorageTest {
     @AfterEach
     void tearDown() {
         storage.shutdown();
+    }
+
+    @Test
+    void appendHeavyTimerWaitsForGrowthButExplicitFlushAndReloadRemainDurable() throws Exception {
+        Path snapshot = tempDir.resolve("heavy.json");
+        Path log = tempDir.resolve("heavy.wal");
+        WalStorage<String, String> heavy = new WalStorage<>(snapshot, log, new TypeReference<>() {}, 60_000, true);
+        heavy.load();
+        heavy.put("first", "value");
+        heavy.compactIfNeeded();
+        assertFalse(Files.exists(snapshot), "a small append must not rewrite the snapshot on each timer tick");
+        assertEquals("value", WalStorage.readContents(snapshot, log, new TypeReference<Map<String, String>>() {}).get("first"));
+        heavy.flush();
+        byte[] before = Files.readAllBytes(snapshot);
+        heavy.put("second", "next");
+        heavy.compactIfNeeded();
+        assertArrayEquals(before, Files.readAllBytes(snapshot));
+        heavy.put("large", "x".repeat(1_100_000));
+        heavy.compactIfNeeded();
+        assertEquals(0, Files.size(log));
+        assertTrue(Files.readString(snapshot).contains("second"));
+        heavy.put("idle", "settled");
+        heavy.compactIfNeeded(System.nanoTime() + TimeUnit.MINUTES.toNanos(3));
+        assertEquals(0, Files.size(log), "an idle store compacts even below the size threshold");
+        heavy.put("last", "shutdown");
+        heavy.shutdown();
+        assertEquals("shutdown", WalStorage.readContents(snapshot, log, new TypeReference<Map<String, String>>() {}).get("last"));
     }
 
     @Test

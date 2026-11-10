@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.core.storage;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
@@ -16,6 +18,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -115,7 +118,7 @@ public class StorageFactory {
                 // is current again. Only the .wal file next to it is new.
                 Path walFilePath = basePath.resolve(fileName.replace(".json", ".wal"));
                 WalStorage<String, V> wal = new WalStorage<>(filePath, walFilePath, typeReference,
-                        config.storage().wal().compactionIntervalMs());
+                        config.storage().wal().compactionIntervalMs(), true);
                 walBackends.add(wal);
                 LOG.infov("Journaling {0} for service {1} to {2}; the store file is rewritten on the WAL compaction interval",
                         filePath, serviceName, walFilePath);
@@ -130,7 +133,8 @@ public class StorageFactory {
                 Path snapshotPath = basePath.resolve(fileName.replace(".json", "-snapshot.json"));
                 Path walFilePath = basePath.resolve(fileName.replace(".json", ".wal"));
                 long compactionInterval = config.storage().wal().compactionIntervalMs();
-                WalStorage<String, V> wal = new WalStorage<>(snapshotPath, walFilePath, typeReference, compactionInterval);
+                WalStorage<String, V> wal = new WalStorage<>(snapshotPath, walFilePath, typeReference, compactionInterval,
+                        profile == WriteProfile.APPEND_HEAVY);
                 walBackends.add(wal);
                 yield wal;
             }
@@ -297,6 +301,94 @@ public class StorageFactory {
             backend.clear();
         }
         flushAll();
+    }
+
+    /** Purges one account from every managed store, leaving other account partitions live. */
+    public synchronized void clearAccount(String accountId) {
+        for (StorageBackend<?, ?> backend : allBackends) {
+            if (backend instanceof AccountAwareStorageBackend<?> aware) {
+                aware.clearAccount(accountId);
+            }
+        }
+        clearUnopenedAccountStores(accountId);
+        clearUnopenedPartitionedAccountStores(accountId);
+    }
+
+    // Services are lazy: a volume may contain a store that has not been opened in this process.
+    private void clearUnopenedAccountStores(String accountId) {
+        Path root = Path.of(config.storage().persistentPath());
+        if (!Files.isDirectory(root)) {
+            return;
+        }
+        try (Stream<Path> files = Files.list(root)) {
+            List<Path> stores = files.filter(path -> path.getFileName().toString().endsWith(".json")
+                    || path.getFileName().toString().endsWith(".wal")).toList();
+            Set<Path> visited = new HashSet<>();
+            for (Path file : stores) {
+                String name = file.getFileName().toString();
+                String stem = name.replaceFirst("(?:-snapshot)?\\.(?:json|wal)$", "");
+                Path plain = root.resolve(stem + ".json");
+                Path snapshot = root.resolve(stem + "-snapshot.json");
+                Path journal = root.resolve(stem + ".wal");
+                if (!visited.add(plain) || backendsByPath.containsKey(plain)
+                        || backendsByPath.containsKey(root.resolve(stem))) {
+                    continue;
+                }
+                Path liveSnapshot = Files.exists(snapshot) && (!Files.exists(plain)
+                        || Math.max(lastModified(snapshot), Files.exists(journal) ? lastModified(journal) : Long.MIN_VALUE)
+                        >= lastModified(plain)) ? snapshot : plain;
+                WalStorage<String, Object> unopened = new WalStorage<>(liveSnapshot, journal,
+                        new TypeReference<Map<String, Object>>() {}, Long.MAX_VALUE);
+                try {
+                    unopened.load();
+                    new AccountAwareStorageBackend<>(unopened, null, config.defaultAccountId()).clearAccount(accountId);
+                } finally {
+                    unopened.shutdown();
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to purge unopened account stores under " + root, e);
+        }
+    }
+
+    private void clearUnopenedPartitionedAccountStores(String accountId) {
+        Path root = Path.of(config.storage().persistentPath());
+        if (!Files.isDirectory(root)) {
+            return;
+        }
+        try (Stream<Path> directories = Files.list(root)) {
+            for (Path directory : directories.filter(Files::isDirectory).toList()) {
+                if (backendsByPath.containsKey(directory) || !isPartitionedStore(directory)) {
+                    continue;
+                }
+                PartitionedFileStorage<Object> unopened = new PartitionedFileStorage<>(directory,
+                        PartitionedFileStorage.LegacyStore.jsonFile(root.resolve(directory.getFileName() + ".json"), Object.class),
+                        Object.class, 1, PartitionedFileStorage.Mode.SYNC, 0);
+                try {
+                    unopened.load();
+                    new AccountAwareStorageBackend<>(unopened, null, config.defaultAccountId()).clearAccount(accountId);
+                } finally {
+                    unopened.shutdown();
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to purge unopened partitioned account stores under " + root, e);
+        }
+    }
+
+    private static boolean isPartitionedStore(Path directory) throws IOException {
+        if (Files.exists(directory.resolve("journal.wal"))) {
+            return true;
+        }
+        try (Stream<Path> files = Files.list(directory)) {
+            for (Path file : files.filter(path -> path.getFileName().toString().endsWith(".json")).toList()) {
+                JsonNode contents = new ObjectMapper().readTree(file.toFile());
+                if (contents.has("key") && contents.has("entries")) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

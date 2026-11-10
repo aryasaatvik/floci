@@ -18,6 +18,13 @@ public interface Resettable {
 
     void clear();
 
+    /** Refuses a scoped reset before any account state changes. */
+    default void checkAccountReset(String accountId) {}
+
+    /** Clears account-owned runtime caches and external files before that account's storage is erased. */
+    default void clearAccount(String accountId) {}
+
+
     /**
      * Resume after reset, including when a storage/clear operation failed or an earlier service's
      * beforeReset() threw, so this may run without a preceding {@link #beforeReset()} call.
