@@ -23,6 +23,8 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 /**
@@ -39,6 +41,7 @@ public class StorageFactory {
     private final EmulatorConfig config;
     private final ServiceConfigAccess serviceConfigAccess;
     private final List<StorageBackend<?, ?>> allBackends = new ArrayList<>();
+    private final List<Consumer<String>> accountCacheClears = new ArrayList<>();
     // A file path identifies one logical store: callers sharing a path are expected to agree on
     // its value type and storage mode. The first create() wins; repeat calls reuse that backend.
     private final Map<Path, StorageBackend<?, ?>> backendsByPath = new HashMap<>();
@@ -305,13 +308,75 @@ public class StorageFactory {
 
     /** Purges one account from every managed store, leaving other account partitions live. */
     public synchronized void clearAccount(String accountId) {
+        clearOpenAccountStores(accountId);
+        clearUnopenedAccountStores(accountId);
+        clearUnopenedPartitionedAccountStores(accountId);
+    }
+
+    private void clearOpenAccountStores(String accountId) {
         for (StorageBackend<?, ?> backend : allBackends) {
             if (backend instanceof AccountAwareStorageBackend<?> aware) {
                 aware.clearAccount(accountId);
             }
         }
-        clearUnopenedAccountStores(accountId);
-        clearUnopenedPartitionedAccountStores(accountId);
+    }
+
+    /**
+     * Initialize a cache from an already-resolved backend and register its account clear atomically
+     * with storage reclamation. Neither callback may initialize other services.
+     */
+    public synchronized <T> T initializeAccountCache(Supplier<T> initialize, Consumer<String> clear) {
+        T value = initialize.get();
+        accountCacheClears.add(clear);
+        return value;
+    }
+
+    /** Plans all dormant-store edits before account payload and cache mutation may start. */
+    public synchronized PreparedAccountReclaim prepareAccountReclaim(String accountId) throws IOException {
+        List<UnopenedAccountStores.Purge> plan = UnopenedAccountStores.plan(
+                Path.of(config.storage().persistentPath()), backendsByPath.keySet(), accountId, config.defaultAccountId());
+        return () -> applyAccountReclaim(accountId, plan);
+    }
+
+    private void applyAccountReclaim(String accountId, List<UnopenedAccountStores.Purge> plan) throws IOException {
+        List<Consumer<String>> caches = List.of();
+        try {
+            synchronized (this) {
+                caches = List.copyOf(accountCacheClears);
+                clearOpenAccountStores(accountId);
+                for (UnopenedAccountStores.Purge purge : plan) {
+                    // A foreign request can open a store after planning. Its live backend then
+                    // owns the clear and we must not overwrite its subsequent writes.
+                    if (purge.registeredPaths().stream().noneMatch(backendsByPath::containsKey)) {
+                        purge.write().run();
+                    }
+                }
+            }
+        } finally {
+            // Cached state that raced planning is cleared before admission resumes. A later
+            // initializer reads the erased backend. Avoid taking service locks under this monitor.
+            for (Consumer<String> clear : caches) {
+                clear.accept(accountId);
+            }
+        }
+    }
+
+    public interface PreparedAccountReclaim {
+        void apply() throws IOException;
+    }
+
+    /** Supplies legacy payload ownership without initializing the service that owns the store. */
+    public synchronized <V> Map<String, V> inspectAccountStore(String fileName, TypeReference<Map<String, V>> type)
+            throws IOException {
+        Path root = Path.of(config.storage().persistentPath());
+        StorageBackend<?, ?> existing = backendsByPath.get(root.resolve(fileName));
+        if (existing instanceof AccountAwareStorageBackend<?> aware) {
+            // The caller supplies the owning service's file name and value type.
+            @SuppressWarnings("unchecked")
+            Map<String, V> raw = ((AccountAwareStorageBackend<V>) aware).scanAllAccountsWithRawKeys();
+            return raw;
+        }
+        return UnopenedAccountStores.readFlat(root, fileName, type);
     }
 
     // Services are lazy: a volume may contain a store that has not been opened in this process.

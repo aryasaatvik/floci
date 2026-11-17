@@ -49,6 +49,7 @@ class EmulatorInfoControllerTest {
     @Mock private ContainerTeardown sageMakerTeardown;
     @Mock private ContainerTeardown batchTeardown;
     @Mock private Resettable resettable;
+    @Mock private AccountReclaim accountReclaim;
 
     private EmulatorInfoController controller;
 
@@ -56,7 +57,7 @@ class EmulatorInfoControllerTest {
     void setUp() {
         controller = new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
                 resettables, containerTeardowns, certificateAuthority, config, dynamoDbBackendSelector,
-                new LambdaEnvironmentLimiter());
+                new LambdaEnvironmentLimiter(), accountReclaim);
     }
 
     @Test
@@ -111,12 +112,13 @@ class EmulatorInfoControllerTest {
 
         Map<?, ?> info = (Map<?, ?>) new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
                 resettables, containerTeardowns, certificateAuthority, manifestConfig, dynamoDbBackendSelector,
-                new LambdaEnvironmentLimiter())
+                new LambdaEnvironmentLimiter(), accountReclaim)
                 .info().getEntity();
 
         assertEquals(1, info.get("manifest_version"));
         assertEquals(2, info.get("console_contract"));
         assertEquals("aws", info.get("cloud"));
+        assertEquals(Map.of("accountStateReset", true, "accountStateReclaim", true), info.get("capabilities"));
         assertEquals("floci", info.get("emulator"));
         assertEquals("http://floci:4566", info.get("endpoint"));
         assertEquals("/_floci/health", info.get("health_url"));
@@ -130,7 +132,7 @@ class EmulatorInfoControllerTest {
     private EmulatorInfoController manifestController() {
         return new EmulatorInfoController(serviceRegistry, initLifecycleState, storageFactory,
                 resettables, containerTeardowns, certificateAuthority, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
-                dynamoDbBackendSelector, new LambdaEnvironmentLimiter());
+                dynamoDbBackendSelector, new LambdaEnvironmentLimiter(), accountReclaim);
     }
 
     @Test

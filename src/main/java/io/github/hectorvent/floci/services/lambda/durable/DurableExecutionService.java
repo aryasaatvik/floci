@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda.durable;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AccountActivity;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
@@ -83,6 +84,7 @@ public class DurableExecutionService implements Resettable {
     static final String CALLBACK_CLOSED = "The callback is either timed out or already completed";
 
     private final AccountAwareStorageBackend<DurableExecution> store;
+    private final AccountActivity accountActivity;
     private final ObjectMapper objectMapper;
     private final Clock clock;
     private final DurableFunctionInvoker invoker;
@@ -99,10 +101,11 @@ public class DurableExecutionService implements Resettable {
 
     @Inject
     public DurableExecutionService(StorageFactory storageFactory, ObjectMapper objectMapper, Clock clock,
-                                   DurableFunctionInvoker invoker, DurableExecutionEventPublisher publisher) {
+                                   DurableFunctionInvoker invoker, DurableExecutionEventPublisher publisher,
+                                   AccountActivity accountActivity) {
         this(storageFactory, objectMapper, clock, invoker,
                 Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("lambda-durable-", 0).factory()),
-                INVOCATION_RETRY_DELAY, publisher::statusChange);
+                INVOCATION_RETRY_DELAY, publisher::statusChange, accountActivity);
     }
 
     /** For tests. An inline executor and a zero delay make every invocation chain synchronous. */
@@ -115,6 +118,15 @@ public class DurableExecutionService implements Resettable {
     DurableExecutionService(StorageFactory storageFactory, ObjectMapper objectMapper, Clock clock,
                             DurableFunctionInvoker invoker, Executor launchExecutor, Duration invocationRetryDelay,
                             Function<DurableExecution, Runnable> statusEvents) {
+        this(storageFactory, objectMapper, clock, invoker, launchExecutor, invocationRetryDelay, statusEvents,
+                new AccountActivity());
+    }
+
+    private DurableExecutionService(StorageFactory storageFactory, ObjectMapper objectMapper, Clock clock,
+                                    DurableFunctionInvoker invoker, Executor launchExecutor,
+                                    Duration invocationRetryDelay, Function<DurableExecution, Runnable> statusEvents,
+                                    AccountActivity accountActivity) {
+        this.accountActivity = accountActivity;
         this.store = storageFactory.create("lambda", "lambda-durable-executions.json",
                 new TypeReference<Map<String, DurableExecution>>() {}, WriteProfile.APPEND_HEAVY);
         this.objectMapper = objectMapper;
@@ -145,6 +157,12 @@ public class DurableExecutionService implements Resettable {
     }
 
     public DurableExecution start(StartRequest request) {
+        try (AccountActivity.Permit ignored = accountActivity.beginWork(request.accountId())) {
+            return startWhileAdmitted(request);
+        }
+    }
+
+    private DurableExecution startWhileAdmitted(StartRequest request) {
         ResolvedDurableTarget target = invoker.resolve(request.accountId(), request.region(),
                 request.functionName(), request.qualifier());
         if (!target.durable()) {
@@ -443,42 +461,50 @@ public class DurableExecutionService implements Resettable {
     public void sweep() {
         long now = clock.millis();
         for (AccountEntry<DurableExecution> entry : store.scanAllAccountEntries(key -> true)) {
-            List<Runnable> effects = new ArrayList<>();
-            synchronized (lockFor(entry.accountId(), entry.key())) {
-                DurableExecution execution = store.getForAccount(entry.accountId(), entry.key()).orElse(null);
-                if (execution == null) {
-                    continue;
-                }
-                if (execution.isClosed()) {
-                    if (execution.getRetentionDeadline() != null && execution.getRetentionDeadline() <= now) {
-                        store.deleteForAccount(entry.accountId(), entry.key());
-                    }
-                    continue;
-                }
-                boolean changed = false;
-                if (execution.getExecutionDeadline() != null && execution.getExecutionDeadline() <= now) {
-                    DurableErrorObject error = DurableErrorObject.of("Execution timed out after "
-                            + execution.getExecutionTimeoutSeconds() + " seconds.", null);
-                    close(execution, DurableExecutionStatus.TIMED_OUT, null, error, now, effects);
-                    changed = true;
-                } else {
-                    if (DurableCheckpointApplier.fireDueTimers(execution, now)) {
-                        trigger(execution, effects);
-                        changed = true;
-                    }
-                    if (execution.getCurrentInvocationId() == null && execution.getNextInvocationAttemptAt() != null
-                            && execution.getNextInvocationAttemptAt() <= now) {
-                        execution.setNextInvocationAttemptAt(null);
-                        trigger(execution, effects);
-                        changed = true;
-                    }
-                }
-                if (changed) {
-                    save(execution);
+            try (AccountActivity.Permit permit = accountActivity.tryWork(entry.accountId())) {
+                if (permit != null) {
+                    sweepExecution(entry, now);
                 }
             }
-            runEffects(effects);
         }
+    }
+
+    private void sweepExecution(AccountEntry<DurableExecution> entry, long now) {
+        List<Runnable> effects = new ArrayList<>();
+        synchronized (lockFor(entry.accountId(), entry.key())) {
+            DurableExecution execution = store.getForAccount(entry.accountId(), entry.key()).orElse(null);
+            if (execution == null) {
+                return;
+            }
+            if (execution.isClosed()) {
+                if (execution.getRetentionDeadline() != null && execution.getRetentionDeadline() <= now) {
+                    store.deleteForAccount(entry.accountId(), entry.key());
+                }
+                return;
+            }
+            boolean changed = false;
+            if (execution.getExecutionDeadline() != null && execution.getExecutionDeadline() <= now) {
+                DurableErrorObject error = DurableErrorObject.of("Execution timed out after "
+                        + execution.getExecutionTimeoutSeconds() + " seconds.", null);
+                close(execution, DurableExecutionStatus.TIMED_OUT, null, error, now, effects);
+                changed = true;
+            } else {
+                if (DurableCheckpointApplier.fireDueTimers(execution, now)) {
+                    trigger(execution, effects);
+                    changed = true;
+                }
+                if (execution.getCurrentInvocationId() == null && execution.getNextInvocationAttemptAt() != null
+                        && execution.getNextInvocationAttemptAt() <= now) {
+                    execution.setNextInvocationAttemptAt(null);
+                    trigger(execution, effects);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                save(execution);
+            }
+        }
+        runEffects(effects);
     }
 
     /**
@@ -524,9 +550,13 @@ public class DurableExecutionService implements Resettable {
     @Override
     public void checkAccountReset(String accountId) {
         for (AccountEntry<DurableExecution> entry : store.scanAllAccountEntries(key -> true)) {
-            if (accountId.equals(entry.accountId()) && entry.value().getCurrentInvocationId() != null) {
-                throw new AwsException("ConflictException", "Wait for durable invocations before resetting account "
-                        + accountId, 409);
+            if (accountId.equals(entry.accountId())) {
+                synchronized (lockFor(accountId, entry.key())) {
+                    if (entry.value().getCurrentInvocationId() != null) {
+                        throw new AwsException("ConflictException",
+                                "Wait for durable invocations before resetting account " + accountId, 409);
+                    }
+                }
             }
         }
     }

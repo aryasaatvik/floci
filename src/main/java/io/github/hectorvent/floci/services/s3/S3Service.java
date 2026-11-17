@@ -156,6 +156,8 @@ public class S3Service implements Resettable, ResourceProvider {
     private final StorageBackend<String, Bucket> bucketStore;
     private final StorageBackend<String, S3Object> objectStore;
     private final StorageBackend<String, ObjectAnnotation> annotationStore;
+    private static final String BUCKETS_FILE = "s3-buckets.json";
+    private static final TypeReference<Map<String, Bucket>> BUCKETS_TYPE = new TypeReference<>() {};
     private final Path dataRoot;
     private final boolean inMemory;
     private final ConcurrentHashMap<String, byte[]> memoryDataStore = new ConcurrentHashMap<>();
@@ -281,9 +283,7 @@ public class S3Service implements Resettable, ResourceProvider {
                      ObjectMapper objectMapper,
                      IamService iamService) {
         this(
-                storageFactory.create("s3", "s3-buckets.json",
-                        new TypeReference<Map<String, Bucket>>() {
-                        }),
+                storageFactory.create("s3", BUCKETS_FILE, BUCKETS_TYPE),
                 storageFactory.create("s3", "s3-objects.json",
                         new TypeReference<Map<String, S3Object>>() {
                         }, WriteProfile.APPEND_HEAVY),
@@ -293,8 +293,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 storageFactory.create("s3", "s3-account-public-access-block.json",
                         new TypeReference<Map<String, String>>() {
                         }),
-                Path.of(config.storage().persistentPath()).resolve("s3"),
-                "memory".equals(config.storage().services().s3().mode().orElse(config.storage().mode())),
+                dataRoot(config), !storesPayloadFiles(config),
                 sqsService, snsService, null, lambdaServiceProvider, null,
                 eventBridgeService, s3UpdatedEvent,
                 regionResolver,
@@ -302,6 +301,18 @@ public class S3Service implements Resettable, ResourceProvider {
                 config.services().s3().enforceAuth(), config.services().iam().enforcementEnabled(), iamService,
                 config.services().s3().globalBucketNamespace()
         );
+    }
+
+    public static Path dataRoot(EmulatorConfig config) {
+        return Path.of(config.storage().persistentPath()).resolve("s3");
+    }
+
+    public static boolean storesPayloadFiles(EmulatorConfig config) {
+        return !"memory".equals(config.storage().services().s3().mode().orElse(config.storage().mode()));
+    }
+
+    public static Path accountDataPath(Path dataRoot, String accountId) {
+        return dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(accountId);
     }
 
     /**
@@ -443,23 +454,48 @@ public class S3Service implements Resettable, ResourceProvider {
             }
         }
         if (!inMemory) {
-            try {
-                FileTrees.delete(dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(accountId));
-                if (bucketStore instanceof AccountAwareStorageBackend<Bucket> aware) {
-                    List<AccountAwareStorageBackend.AccountEntry<Bucket>> buckets = aware.scanAllAccountEntries(key -> true);
-                    for (AccountAwareStorageBackend.AccountEntry<Bucket> entry : buckets) {
-                        String name = entry.value().getName();
-                        boolean shared = buckets.stream().anyMatch(other -> !accountId.equals(other.accountId())
-                                && name.equals(other.value().getName()));
-                        if (accountId.equals(entry.accountId()) && !shared) {
-                            FileTrees.delete(bucketDirectory(dataRoot, name));
-                            FileTrees.delete(bucketDirectory(dataRoot.resolve(VERSION_STORAGE_ROOT), name));
-                        }
+            List<AccountAwareStorageBackend.AccountEntry<Bucket>> buckets =
+                    bucketStore instanceof AccountAwareStorageBackend<Bucket> aware
+                            ? aware.scanAllAccountEntries(key -> true) : List.of();
+            clearAccountFiles(dataRoot, accountId, buckets);
+        }
+    }
+
+    /** Clears a dormant S3 account without starting S3 or triggering its startup multipart sweep. */
+    public static StorageFactory.PreparedAccountReclaim prepareDormantAccountClear(
+            EmulatorConfig config, StorageFactory storage, String accountId) throws IOException {
+        if (!storesPayloadFiles(config)) {
+            return () -> { };
+        }
+        List<AccountAwareStorageBackend.AccountEntry<Bucket>> buckets =
+                storage.inspectAccountStore(BUCKETS_FILE, BUCKETS_TYPE).entrySet().stream().map(entry -> {
+                    String rawKey = entry.getKey();
+                    boolean prefixed = AccountAwareStorageBackend.hasAccountPrefix(rawKey);
+                    return new AccountAwareStorageBackend.AccountEntry<>(
+                            prefixed ? rawKey.substring(0, 12) : config.defaultAccountId(),
+                            prefixed ? rawKey.substring(13) : rawKey, entry.getValue());
+                }).toList();
+        return () -> clearAccountFiles(dataRoot(config), accountId, buckets);
+    }
+
+    private static void clearAccountFiles(Path dataRoot, String accountId,
+                                          List<AccountAwareStorageBackend.AccountEntry<Bucket>> buckets) {
+        try {
+            FileTrees.delete(accountDataPath(dataRoot, accountId));
+            for (AccountAwareStorageBackend.AccountEntry<Bucket> entry : buckets) {
+                String name = entry.value().getName();
+                boolean shared = buckets.stream().anyMatch(other -> !accountId.equals(other.accountId())
+                        && name.equals(other.value().getName()));
+                if (accountId.equals(entry.accountId()) && !shared) {
+                    FileTrees.delete(bucketDirectory(dataRoot, name));
+                    Path versions = dataRoot.resolve(VERSION_STORAGE_ROOT);
+                    if (FileTrees.checkScopedRoot(dataRoot, versions)) {
+                        FileTrees.delete(bucketDirectory(versions, name));
                     }
                 }
-            } catch (IOException e) {
-                throw new UncheckedIOException("Failed to purge S3 data for account " + accountId, e);
             }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to purge S3 data for account " + accountId, e);
         }
     }
 

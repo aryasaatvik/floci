@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.core.common;
 
 import jakarta.enterprise.context.RequestScoped;
 
+import java.util.function.Consumer;
+
 /**
  * Holds per-request derived values, account ID, region and partition, extracted from the
  * incoming AWS credential and Authorization header. Populated by
@@ -11,6 +13,7 @@ import jakarta.enterprise.context.RequestScoped;
 public class RequestContext {
 
     private String accountId;
+    private Consumer<String> accountAdmission;
     private String region;
     private String partition;
     private String accessKeyId;
@@ -22,7 +25,17 @@ public class RequestContext {
     }
 
     public void setAccountId(String accountId) {
+        if (accountAdmission != null && accountId != null) {
+            accountAdmission.accept(accountId);
+        }
         this.accountId = accountId;
+    }
+
+    void admitAccountsWith(Consumer<String> admission) {
+        if (accountId != null) {
+            admission.accept(accountId);
+        }
+        this.accountAdmission = admission;
     }
 
     public String getRegion() {

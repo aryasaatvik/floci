@@ -122,6 +122,16 @@ final class EntryJournal<E> {
      *                     were not applied and are kept, so the caller must not empty the journal
      */
     int replay(Consumer<Change<E>> apply) throws IOException {
+        return replay(apply, false);
+    }
+
+    void inspect(Consumer<Change<E>> apply) throws IOException {
+        if (StorageFiles.isRegularFileIfPresent(path)) {
+            replay(apply, true);
+        }
+    }
+
+    private int replay(Consumer<Change<E>> apply, boolean strict) throws IOException {
         if (!Files.exists(path)) {
             return 0;
         }
@@ -169,9 +179,15 @@ final class EntryJournal<E> {
                 replayed++;
             }
         } catch (EOFException | JsonProcessingException e) {
+            if (strict) {
+                throw e;
+            }
             LOG.warnv("{0} is unreadable from offset {1}: {2}", path, consumed, e.getMessage());
         }
         if (consumed < fileSize) {
+            if (strict) {
+                throw new IOException("Unreadable partitioned storage journal record");
+            }
             cutTail(consumed, fileSize);
         }
         return replayed;

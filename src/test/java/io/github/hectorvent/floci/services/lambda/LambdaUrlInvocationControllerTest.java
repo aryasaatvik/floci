@@ -28,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -58,6 +59,22 @@ class LambdaUrlInvocationControllerTest {
         when(uriInfo.getRequestUri()).thenReturn(URI.create(uri));
         when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
         return uriInfo;
+    }
+
+    @Test
+    void staleUrlDiscoveryCannotInvokeAfterItsBindingChanges() {
+        LambdaFunction earlier = new LambdaFunction();
+        earlier.setFunctionName("account-function");
+        earlier.setFunctionArn("arn:aws:lambda:us-east-1:100000000012:function:account-function");
+        LambdaFunction later = new LambdaFunction();
+        later.setFunctionArn(earlier.getFunctionArn());
+        LambdaService lambdaService = mock(LambdaService.class);
+        when(lambdaService.getTargetByUrlId("url-id")).thenReturn(earlier, later);
+
+        Response response = newController(lambdaService).handleGet("url-id", "", null, null);
+
+        assertEquals(404, response.getStatus());
+        verify(lambdaService, never()).invokeArn(any(), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
     @Test

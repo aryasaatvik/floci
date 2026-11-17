@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.storage;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import org.junit.jupiter.api.Test;
@@ -8,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
@@ -98,6 +100,117 @@ class StorageFactoryAccountResetTest {
         assertEquals(OTHER, reopened.getForAccount(OTHER, "same").orElseThrow());
         assertEquals(Map.of("id", OTHER), items.getForAccount(OTHER, "table").orElseThrow());
         lazy.shutdownAll();
+    }
+
+    @Test
+    void strictReclaimKeepsForeignShardsByteForByteWithTheirOriginalLayout() throws Exception {
+        StorageFactory first = factory("wal");
+        AccountAwareStorageBackend<Map<String, String>> partitioned = first.createPartitioned("svc", "items.json",
+                new TypeReference<>() {}, String.class, 4);
+        partitioned.putEntryForAccount(TARGET, "table", "id", "target");
+        partitioned.putEntryForAccount(OTHER, "table", "id", "foreign");
+        first.shutdownAll();
+        Path itemsDirectory = directory.resolve("items");
+        Path foreign = itemsDirectory.resolve(PartitionedFileStorage.fileNameFor(OTHER + "/table",
+                Math.floorMod("id".hashCode(), 4), 4));
+        String before = Files.readString(foreign);
+        FileTime marker = FileTime.from(Instant.EPOCH);
+        Files.setLastModifiedTime(foreign, marker);
+
+        StorageFactory cold = factory("wal");
+        cold.prepareAccountReclaim(TARGET).apply();
+
+        assertEquals(before, Files.readString(foreign));
+        assertEquals(marker, Files.getLastModifiedTime(foreign));
+        AccountAwareStorageBackend<Map<String, String>> reopened = cold.createPartitioned("svc", "items.json",
+                new TypeReference<>() {}, String.class, 4);
+        assertTrue(reopened.getForAccount(TARGET, "table").isEmpty());
+        assertEquals(Map.of("id", "foreign"), reopened.getForAccount(OTHER, "table").orElseThrow());
+        cold.shutdownAll();
+    }
+
+    @Test
+    void strictReclaimReplaysAClosedWalAndPreservesForeignUpdates() throws Exception {
+        Path snapshot = directory.resolve("cold-snapshot.json");
+        Path journal = directory.resolve("cold.wal");
+        WalStorage<String, String> original = new WalStorage<>(snapshot, journal, TYPE, Long.MAX_VALUE);
+        original.load();
+        original.put(TARGET + "/same", "remove");
+        original.put(OTHER + "/same", "old");
+        original.flush();
+        original.put(OTHER + "/same", "new");
+        Path fixture = Files.createDirectory(directory.resolve("fixture"));
+        Files.copy(snapshot, fixture.resolve(snapshot.getFileName()));
+        Files.copy(journal, fixture.resolve(journal.getFileName()));
+        original.shutdown();
+
+        StorageFactory cold = factory("wal", fixture);
+        cold.prepareAccountReclaim(TARGET).apply();
+
+        AccountAwareStorageBackend<String> reopened = cold.create("svc", "cold.json", TYPE);
+        assertTrue(reopened.getForAccount(TARGET, "same").isEmpty());
+        assertEquals("new", reopened.getForAccount(OTHER, "same").orElseThrow());
+        cold.shutdownAll();
+    }
+
+    @Test
+    void strictReclaimDeletesDormantJournalOnlyKeysAndRepetitionLeavesTheJournalAlone() throws Exception {
+        Path items = Files.createDirectory(directory.resolve("items"));
+        Path journalPath = items.resolve(PartitionedFileStorage.JOURNAL_FILE);
+        ObjectMapper mapper = new ObjectMapper();
+        EntryJournal<String> journal = new EntryJournal<>(journalPath, mapper.constructType(String.class),
+                mapper.getTypeFactory().constructMapType(Map.class, String.class, String.class));
+        journal.open();
+        try {
+            assertTrue(journal.putEntry(TARGET + "/table", "id", "remove"));
+            assertTrue(journal.putEntry(OTHER + "/table", "id", "preserve"));
+        } finally {
+            journal.close();
+        }
+        StorageFactory cold = factory("wal");
+        cold.prepareAccountReclaim(TARGET).apply();
+        byte[] after = Files.readAllBytes(journalPath);
+
+        cold.prepareAccountReclaim(TARGET).apply();
+
+        assertArrayEquals(after, Files.readAllBytes(journalPath));
+        AccountAwareStorageBackend<Map<String, String>> reopened = cold.createPartitioned("svc", "items.json",
+                new TypeReference<>() {}, String.class, 4);
+        assertTrue(reopened.getForAccount(TARGET, "table").isEmpty());
+        assertEquals(Map.of("id", "preserve"), reopened.getForAccount(OTHER, "table").orElseThrow());
+        cold.shutdownAll();
+    }
+
+    @Test
+    void strictReclaimUsesTheLiveBackendIfAnAccountOpensItAfterPlanning() throws Exception {
+        Files.writeString(directory.resolve("cold.json"), "{\"" + TARGET + "/same\":\"target\",\""
+                + OTHER + "/same\":\"before\"}");
+        StorageFactory storage = factory("persistent");
+        StorageFactory.PreparedAccountReclaim reclaim = storage.prepareAccountReclaim(TARGET);
+        AccountAwareStorageBackend<String> opened = storage.create("svc", "cold.json", TYPE);
+        opened.putForAccount(OTHER, "same", "new foreign value");
+
+        reclaim.apply();
+
+        assertTrue(opened.getForAccount(TARGET, "same").isEmpty());
+        assertEquals("new foreign value", opened.getForAccount(OTHER, "same").orElseThrow());
+        StorageFactory reopened = factory("persistent");
+        AccountAwareStorageBackend<String> persisted = reopened.create("svc", "cold.json", TYPE);
+        assertTrue(persisted.getForAccount(TARGET, "same").isEmpty());
+        assertEquals("new foreign value", persisted.getForAccount(OTHER, "same").orElseThrow());
+    }
+
+    @Test
+    void strictReclaimRefusesATornDormantJournalWithoutTruncatingIt() throws Exception {
+        Path journal = directory.resolve("dormant.wal");
+        byte[] torn = {WalStorage.OP_PUT, 0, 0};
+        Files.write(journal, torn);
+        StorageFactory cold = factory("wal");
+
+        assertThrows(IOException.class, () -> cold.prepareAccountReclaim(TARGET));
+
+        assertArrayEquals(torn, Files.readAllBytes(journal));
+        assertFalse(Files.exists(directory.resolve("dormant-snapshot.json")));
     }
 
     @Test

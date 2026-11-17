@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.lambda;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountActivity;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
@@ -64,17 +65,27 @@ public class LambdaConcurrencyLimiter implements Resettable {
     private final ConcurrentHashMap<String, AtomicInteger> unreservedByRegion = new ConcurrentHashMap<>();
     /** Guards atomic validate-then-set and rollback operations on the reserved state. */
     private final Object reservedLock = new Object();
+    private final AccountActivity accountActivity;
     private final int regionLimit;
     private final int unreservedMin;
 
     @Inject
-    public LambdaConcurrencyLimiter(EmulatorConfig config) {
+    public LambdaConcurrencyLimiter(EmulatorConfig config, AccountActivity accountActivity) {
         this(config.services().lambda().regionConcurrencyLimit(),
-             config.services().lambda().unreservedConcurrencyMin());
+             config.services().lambda().unreservedConcurrencyMin(), accountActivity);
+    }
+
+    public LambdaConcurrencyLimiter(EmulatorConfig config) {
+        this(config, new AccountActivity());
     }
 
     /** Test-only constructor with explicit limits. */
     LambdaConcurrencyLimiter(int regionLimit, int unreservedMin) {
+        this(regionLimit, unreservedMin, new AccountActivity());
+    }
+
+    LambdaConcurrencyLimiter(int regionLimit, int unreservedMin, AccountActivity accountActivity) {
+        this.accountActivity = accountActivity;
         this.regionLimit = regionLimit;
         this.unreservedMin = unreservedMin;
     }
@@ -105,13 +116,26 @@ public class LambdaConcurrencyLimiter implements Resettable {
         }
     }
 
+    AccountActivity.Permit beginAccountWork(LambdaFunction fn) {
+        String accountId = AwsArnUtils.accountOrDefault(fn.getFunctionArn(),
+                fn.getAccountId() == null ? "" : fn.getAccountId());
+        return accountActivity.beginWork(accountId);
+    }
+
     public Permit acquire(LambdaFunction fn) {
-        Integer r = fn.getReservedConcurrentExecutions();
-        String region = regionOf(fn.getFunctionArn());
-        if (r == null) {
-            return acquireUnreserved(region);
+        AccountActivity.Permit activity = beginAccountWork(fn);
+        try {
+            Integer reserved = fn.getReservedConcurrentExecutions();
+            Permit capacity = reserved == null ? acquireUnreserved(regionOf(fn.getFunctionArn()))
+                    : acquireReserved(fn.getFunctionArn(), reserved);
+            return () -> {
+                capacity.close();
+                activity.close();
+            };
+        } catch (RuntimeException failure) {
+            activity.close();
+            throw failure;
         }
-        return acquireReserved(fn.getFunctionArn(), r);
     }
 
     private Permit acquireReserved(String key, int limit) {

@@ -161,8 +161,7 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
 
     /** Purges exactly one account, including unprefixed legacy entries owned by the default account. */
     public synchronized void clearAccount(String accountId) {
-        Set<String> keys = delegate.keys().stream().filter(key -> hasAccountPrefix(key)
-                ? key.startsWith(accountId + "/") : defaultAccountId.equals(accountId))
+        Set<String> keys = delegate.keys().stream().filter(key -> ownsKey(key, accountId, defaultAccountId))
                 .collect(Collectors.toSet());
         if (!keys.isEmpty()) {
             if (delegate instanceof PartitionedFileStorage<?>) {
@@ -173,6 +172,10 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
             delegate.flush();
         }
         ownerAccounts.remove(accountId);
+    }
+
+    static boolean ownsKey(String key, String accountId, String defaultAccountId) {
+        return hasAccountPrefix(key) ? key.startsWith(accountId + "/") : defaultAccountId.equals(accountId);
     }
 
     // --- Explicit-account methods for async workers ---

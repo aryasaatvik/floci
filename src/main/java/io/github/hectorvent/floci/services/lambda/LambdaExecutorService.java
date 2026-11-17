@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountActivity;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
@@ -74,6 +75,7 @@ public class LambdaExecutorService implements Resettable {
     /** Moved on by a reset so that retries still waiting from before it are dropped. */
     private final AtomicLong generation = new AtomicLong();
     private final Map<String, Long> deletions = new ConcurrentHashMap<>();
+    private final Map<String, Long> accountResets = new ConcurrentHashMap<>();
     private final ExecutorService asyncExecutor = new ThreadPoolExecutor(
             Math.max(4, Runtime.getRuntime().availableProcessors() * 2),
             Math.max(8, Runtime.getRuntime().availableProcessors() * 4),
@@ -207,8 +209,31 @@ public class LambdaExecutorService implements Resettable {
             return new InvokeResult(202, null, new byte[0], null, requestId);
         }
 
+        String account = AwsArnUtils.accountOrDefault(fn.getFunctionArn(), "");
+        long accountGeneration = accountResets.getOrDefault(account, 0L);
         LambdaService lambdaService = resolveLambdaService();
         LambdaConcurrencyLimiter.Permit permit = acquire(lambdaService, fn);
+        if (accountGeneration != accountResets.getOrDefault(account, 0L)) {
+            permit.close();
+            throw new AwsException("ResourceNotFoundException", "Function not found: " + fn.getFunctionArn(), 404);
+        }
+
+        long functionGeneration = type == InvocationType.Event
+                ? deletions.getOrDefault(functionKey(fn), 0L) : 0;
+        boolean live;
+        try {
+            live = lambdaService == null || lambdaService.isLive(fn);
+        } catch (RuntimeException failure) {
+            permit.close();
+            throw failure;
+        }
+        if (!live) {
+            permit.close();
+            if (type == InvocationType.Event) {
+                return new InvokeResult(202, null, new byte[0], null, requestId);
+            }
+            throw new AwsException("ResourceNotFoundException", "Function not found: " + fn.getFunctionArn(), 404);
+        }
 
         if (type == InvocationType.Event) {
             FunctionEventInvokeConfig eventInvokeConfig = null;
@@ -229,14 +254,7 @@ public class LambdaExecutorService implements Resettable {
 
             AsyncEvent event = new AsyncEvent(fn, payload, requestId, chainDepth, invokedQualifier,
                     maxRetries, clock.millis() + maxEventAgeSeconds * 1000L, generation.get(),
-                    deletions.getOrDefault(functionKey(fn), 0L));
-            // The deletion count is read above, before this store check, and DeleteFunction moves the count
-            // again after it removes the function from the store. So either this check sees the function
-            // gone, or the count moves after the event's snapshot and stale() drops the event.
-            if (lambdaService != null && !lambdaService.isLive(fn)) {
-                permit.close();
-                return new InvokeResult(202, null, new byte[0], null, requestId);
-            }
+                    functionGeneration, account, accountGeneration);
             try {
                 asyncExecutor.submit(() -> attempt(event, 1, null, permit));
             } catch (RuntimeException e) {
@@ -268,8 +286,13 @@ public class LambdaExecutorService implements Resettable {
      * record, which holds the reservation, rather than a version's snapshot, which has none.
      */
     private LambdaConcurrencyLimiter.Permit acquire(LambdaService lambdaService, LambdaFunction fn) {
-        LambdaFunction function = lambdaService != null ? lambdaService.findLatest(fn).orElse(fn) : fn;
-        return concurrencyLimiter.acquire(function);
+        if (lambdaService == null) {
+            return concurrencyLimiter.acquire(fn);
+        }
+        try (AccountActivity.Permit ignored = concurrencyLimiter.beginAccountWork(fn)) {
+            // Reading legacy records can migrate them, so even the reservation lookup needs admission.
+            return concurrencyLimiter.acquire(lambdaService.findLatest(fn).orElse(fn));
+        }
     }
 
     /**
@@ -303,6 +326,9 @@ public class LambdaExecutorService implements Resettable {
         }
         InvokeResult result;
         try (permit) {
+            if (stale(event)) {
+                return;
+            }
             result = executeSync(event.fn(), event.payload(), event.requestId(), null, event.invokedQualifier());
         } catch (RuntimeException e) {
             LOG.warnv("Error in async Lambda execution for {0}: {1}", event.fn().getFunctionName(), e.getMessage());
@@ -463,7 +489,13 @@ public class LambdaExecutorService implements Resettable {
 
     private boolean stale(AsyncEvent event) {
         return event.generation() != generation.get()
+                || event.accountGeneration() != accountResets.getOrDefault(event.account(), 0L)
                 || event.deletions() != deletions.getOrDefault(functionKey(event.fn()), 0L);
+    }
+
+    @Override
+    public void clearAccount(String accountId) {
+        accountResets.merge(accountId, 1L, Long::sum);
     }
 
     @PreDestroy
@@ -490,7 +522,7 @@ public class LambdaExecutorService implements Resettable {
 
     private record AsyncEvent(LambdaFunction fn, byte[] payload, String requestId, int chainDepth,
                               String invokedQualifier, int maxRetries, long expiresAtMs, long generation,
-                              long deletions) {}
+                              long deletions, String account, long accountGeneration) {}
 
     private byte[] buildErrorPayload(String message, String errorType) {
         try {

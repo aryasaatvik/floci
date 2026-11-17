@@ -10,9 +10,11 @@ import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
@@ -23,6 +25,8 @@ import java.util.function.Predicate;
 @ApplicationScoped
 public class LambdaFunctionStore implements Resettable {
 
+    private static final String FUNCTIONS_FILE = "lambda-functions.json";
+    private static final TypeReference<Map<String, LambdaFunction>> FUNCTIONS_TYPE = new TypeReference<>() {};
     private final StorageBackend<String, LambdaFunction> backend;
     private final ConcurrentHashMap<String, LambdaFunction> urlIdIndex = new ConcurrentHashMap<>();
     // Retain locks across deletion and reset so a queued operation cannot race a newly created lock.
@@ -30,10 +34,11 @@ public class LambdaFunctionStore implements Resettable {
 
     @Inject
     public LambdaFunctionStore(StorageFactory storageFactory) {
-        this.backend = storageFactory.create("lambda", "lambda-functions.json",
-                new TypeReference<>() {
-                });
-        loadIndex();
+        this.backend = storageFactory.create("lambda", FUNCTIONS_FILE, FUNCTIONS_TYPE);
+        storageFactory.initializeAccountCache(() -> {
+            loadIndex();
+            return null;
+        }, this::clearAccount);
     }
 
     LambdaFunctionStore(StorageBackend<String, LambdaFunction> backend) {
@@ -43,6 +48,23 @@ public class LambdaFunctionStore implements Resettable {
 
     Object lockForConcurrencyOp(String functionArn) {
         return concurrencyOpLocks.computeIfAbsent(functionArn, key -> new Object());
+    }
+
+    int restoreReservedConcurrency(StorageFactory storage, LambdaConcurrencyLimiter limiter) {
+        return storage.initializeAccountCache(() -> restoreReservedConcurrency(limiter), limiter::clearAccount);
+    }
+
+    int restoreReservedConcurrency(LambdaConcurrencyLimiter limiter) {
+        int count = 0;
+        for (LambdaFunction function : listAll()) {
+            // Published versions share the function-level reservation on $LATEST.
+            Integer reserved = function.getReservedConcurrentExecutions();
+            if ("$LATEST".equals(function.getVersion()) && reserved != null) {
+                limiter.setReserved(function.getFunctionArn(), reserved);
+                count++;
+            }
+        }
+        return count;
     }
 
     private void loadIndex() {
@@ -180,6 +202,10 @@ public class LambdaFunctionStore implements Resettable {
                     .toList();
         }
         return backend.scan(filter);
+    }
+
+    public static List<LambdaFunction> inspectForReclaim(StorageFactory storage) throws IOException {
+        return List.copyOf(storage.inspectAccountStore(FUNCTIONS_FILE, FUNCTIONS_TYPE).values());
     }
 
     public List<LambdaFunction> listAll() {

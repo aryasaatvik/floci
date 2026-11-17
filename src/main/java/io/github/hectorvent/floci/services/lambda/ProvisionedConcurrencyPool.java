@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.lambda;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountActivity;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardowns;
@@ -54,12 +55,14 @@ public class ProvisionedConcurrencyPool implements Resettable {
     private final LambdaFunctionStore functions;
     private final LambdaAliasStore aliases;
     private final StorageBackend<String, Configuration> storage;
+    private final StorageFactory storageFactory;
     private final Clock clock;
     private final int maxPerFunction;
     private final int maxTotal;
     private final boolean ephemeral;
     private final long drainTimeoutNanos;
     private final LambdaEnvironmentLimiter environmentLimiter;
+    private final AccountActivity accountActivity;
     private final Map<String, Allocation> allocations = new HashMap<>();
     /** Each owned environment's place under the physical cap, until its stop is confirmed. */
     private final Map<ContainerHandle, LambdaEnvironmentLimiter.Slot> slots = new HashMap<>();
@@ -106,16 +109,22 @@ public class ProvisionedConcurrencyPool implements Resettable {
         }
     }
 
+    public ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                                     LambdaAliasStore aliases, StorageFactory storageFactory,
+                                     EmulatorConfig config, Clock clock, LambdaEnvironmentLimiter environmentLimiter) {
+        this(launcher, functions, aliases, storageFactory, config, clock, environmentLimiter, new AccountActivity());
+    }
+
     @Inject
     public ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
                                      LambdaAliasStore aliases, StorageFactory storageFactory,
                                      EmulatorConfig config, Clock clock,
-                                     LambdaEnvironmentLimiter environmentLimiter) {
+                                     LambdaEnvironmentLimiter environmentLimiter, AccountActivity accountActivity) {
         this(launcher, functions, aliases, storageFactory.create("lambda",
                         "lambda-provisioned-concurrency.json", new TypeReference<>() {}),
                 clock, WarmPool.resolveMaxPerFunction(config), WarmPool.resolveMaxTotal(config),
                 config.services().lambda().ephemeral(), WarmPool.resolveDrainTimeout(config),
-                environmentLimiter);
+                environmentLimiter, accountActivity, storageFactory);
     }
 
     ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
@@ -129,7 +138,18 @@ public class ProvisionedConcurrencyPool implements Resettable {
                               LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
                               Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
                               LambdaEnvironmentLimiter environmentLimiter) {
+        this(launcher, functions, aliases, storage, clock, maxPerFunction, maxTotal, ephemeral, drainSeconds,
+                environmentLimiter, new AccountActivity(), null);
+    }
+
+    private ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
+                                       LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
+                                       Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
+                                       LambdaEnvironmentLimiter environmentLimiter, AccountActivity accountActivity,
+                                       StorageFactory storageFactory) {
+        this.storageFactory = storageFactory;
         this.environmentLimiter = environmentLimiter;
+        this.accountActivity = accountActivity;
         this.launcher = launcher;
         this.functions = functions;
         this.aliases = aliases;
@@ -143,12 +163,13 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     @PostConstruct
     void start() {
-        synchronized (lock) {
-            List<Configuration> stored = storage instanceof AccountAwareStorageBackend<Configuration> aware
-                    ? aware.scanAllAccounts() : storage.scan(ignored -> true);
-            for (Configuration configuration : stored) {
-                allocations.put(configuration.key(), new Allocation(configuration));
-            }
+        if (storageFactory == null) {
+            restoreAllocations();
+        } else {
+            storageFactory.initializeAccountCache(() -> {
+                restoreAllocations();
+                return null;
+            }, this::clearAccount);
         }
         scheduler.scheduleWithFixedDelay(() -> {
             try {
@@ -157,6 +178,16 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 LOG.errorv(failure, "Provisioned concurrency reconciliation failed");
             }
         }, 0, 1, TimeUnit.SECONDS);
+    }
+
+    private void restoreAllocations() {
+        synchronized (lock) {
+            List<Configuration> stored = storage instanceof AccountAwareStorageBackend<Configuration> aware
+                    ? aware.scanAllAccounts() : storage.scan(ignored -> true);
+            for (Configuration configuration : stored) {
+                allocations.put(configuration.key(), new Allocation(configuration));
+            }
+        }
     }
 
     public Status put(String region, String name, String qualifier, int count, String account) {
@@ -433,6 +464,10 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 return;
             }
             for (Allocation previous : new ArrayList<>(allocations.values())) {
+                // Reclaim sets the flag before checking this pool under the same lock.
+                if (accountActivity.isReclaiming(previous.configuration.account())) {
+                    continue;
+                }
                 Allocation allocation;
                 try {
                     allocation = refreshAlias(previous, retired);

@@ -173,6 +173,13 @@ public class SqsService implements Resettable, ResourceProvider {
             return entries.values().stream().map(Entry::task).toList();
         }
 
+        private synchronized boolean hasActiveTask(String accountId) {
+            return entries.values().stream().map(Entry::task)
+                    .anyMatch(task -> isActive(task.status()) && (accountId.equals(
+                            AwsArnUtils.accountOrDefault(task.sourceArn(), "")) || accountId.equals(
+                            AwsArnUtils.accountOrDefault(task.destinationArn(), ""))));
+        }
+
         private synchronized void put(String taskHandle, MoveTask task) {
             boolean terminal = !isActive(task.status());
             Long terminalAtMillis = terminal ? clock.millis() : null;
@@ -471,8 +478,7 @@ public class SqsService implements Resettable, ResourceProvider {
 
     @Override
     public void checkAccountReset(String accountId) {
-        if (moveTasksByHandle.values().stream().anyMatch(task -> accountId.equals(
-                AwsArnUtils.accountOrDefault(task.sourceArn(), "")) && MoveTaskStore.isActive(task.status()))) {
+        if (moveTasksByHandle.hasActiveTask(accountId)) {
             throw new AwsException("ConflictException", "Wait for SQS move tasks before resetting account " + accountId, 409);
         }
     }

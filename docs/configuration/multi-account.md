@@ -226,3 +226,32 @@ local trust model as global reset. It is not an AWS API.
 `GET /_floci/info` advertises `capabilities.accountStateReset: true`. Older versions do not support
 the scoped path and return 404. Never replace a missing scoped reset with the global
 `POST /_floci/state/reset` or `POST /_floci/state/nuke` on a shared emulator.
+
+## Reclaiming an Unallocated Account
+
+`GET /_floci/state/accounts/{accountId}/reclaim` previews one exact account. It uses the
+current runtime checks and file metadata without opening account stores or reading payloads.
+The response contains `accountId`, `eligible`, `blocker` (`null` or `account-busy`),
+`s3Bytes`, and `lambdaCodeBytes`. The byte counts are logical file lengths under the
+account-scoped S3 and extracted Lambda directories. Shared storage and WAL files, legacy payload
+paths, and Docker volumes are outside these totals. A filesystem or container inventory error
+returns an error response.
+
+`POST` to the same path with `X-Floci-Confirm-Account` set to the exact account ID. The request
+checks for admitted work, native reset conflicts and owned Docker containers before clearing the
+account. It returns HTTP 409 when busy and otherwise uses the scoped reset's success shape.
+Reclaim leaves dormant services dormant. It validates unopened metadata without repairing it and
+writes only stores that hold the account's keys. An unreadable store stops the reclaim before cache
+or payload deletion. Dormant partitioned journals retain their history until a later compaction.
+The process holds the account gate through the clear and storage flush. Requests hold the gate
+for their signing account and any owner selected while routing. Guarded Lambda and Step Functions
+runtime admissions share the same gate.
+
+Use the caller's allocation inventory to select unallocated accounts and keep the selection
+fenced during apply. Preview is a point-in-time observation. The account gate coordinates
+admission in this Floci process and existing reset hooks cover tracked runtime state. Keep other
+processes and account clients away during reclaim. Read the preview again after apply to verify
+the account payload directories are empty. The API leaves container and volume lifecycle to their
+owners.
+
+`GET /_floci/info` advertises `capabilities.accountStateReclaim: true`.

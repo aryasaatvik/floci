@@ -132,6 +132,11 @@ public class LambdaUrlInvocationController {
 
         requestContext.setAccountId(accountId);
         requestContext.setRegion(region);
+        // The first URL lookup discovers the account. Verify the binding again while admitted
+        // so a reclaimed URL cannot invoke a function later recreated with the same ARN.
+        if (lambdaService.getTargetByUrlId(urlId) != target) {
+            return Response.status(404).entity(jsonMessage("Function URL not found")).type(MediaType.APPLICATION_JSON).build();
+        }
 
         String requestId = UUID.randomUUID().toString();
         String event = buildEvent(method, urlId, proxy, headers, uriInfo, body, requestId, region);
