@@ -83,15 +83,16 @@ public class AccountReclaim {
             Path codeRoot = Path.of(config.services().lambda().codePath());
             FileTrees.checkScopedRoot(codeRoot, CodeStore.accountCodePath(codeRoot, accountId));
 
-            List<StorageFactory.PreparedAccountReclaim> unopened = new ArrayList<>();
+            StorageFactory.PreparedAccountReclaim clearStorage = storage.prepareAccountReclaim(accountId);
+            services = liveServices.get();
+            StorageFactory.PreparedAccountReclaim coldCode = null;
+            StorageFactory.PreparedAccountReclaim coldS3 = null;
             try {
-                if (services.stream().noneMatch(CodeStore.class::isInstance)
-                        || services.stream().noneMatch(LambdaFunctionStore.class::isInstance)) {
-                    unopened.add(CodeStore.prepareDormantAccountClear(config, storage, accountId));
-                    services = services.stream().filter(service -> !(service instanceof CodeStore)).toList();
+                if (!codeStoreReady(services)) {
+                    coldCode = CodeStore.prepareDormantAccountClear(config, storage, accountId);
                 }
                 if (services.stream().noneMatch(S3Service.class::isInstance)) {
-                    unopened.add(S3Service.prepareDormantAccountClear(config, storage, accountId));
+                    coldS3 = S3Service.prepareDormantAccountClear(config, storage, accountId);
                 }
             } catch (AwsException failure) {
                 if (failure.getHttpStatus() != 409) {
@@ -99,19 +100,30 @@ public class AccountReclaim {
                 }
                 return false;
             }
-            StorageFactory.PreparedAccountReclaim clearStorage = storage.prepareAccountReclaim(accountId);
-            if (isBusy(accountId, liveServices.get()) || hasContainers(accountId)) {
+            List<Resettable> current = liveServices.get();
+            if (isBusy(accountId, current) || hasContainers(accountId)) {
                 return false;
             }
-            for (Resettable service : services) {
-                service.clearAccount(accountId);
+            boolean codeReady = codeStoreReady(current);
+            for (Resettable service : current) {
+                if (codeReady || !(service instanceof CodeStore)) {
+                    service.clearAccount(accountId);
+                }
             }
-            for (StorageFactory.PreparedAccountReclaim clearFiles : unopened) {
-                clearFiles.apply();
+            if (coldCode != null && !codeReady) {
+                coldCode.apply();
+            }
+            if (coldS3 != null && current.stream().noneMatch(S3Service.class::isInstance)) {
+                coldS3.apply();
             }
             clearStorage.apply();
             return true;
         }
+    }
+
+    private static boolean codeStoreReady(List<Resettable> services) {
+        return services.stream().anyMatch(CodeStore.class::isInstance)
+                && services.stream().anyMatch(LambdaFunctionStore.class::isInstance);
     }
 
     private static boolean isBusy(String accountId, List<Resettable> services) {

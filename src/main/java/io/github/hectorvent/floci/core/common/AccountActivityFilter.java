@@ -12,6 +12,9 @@ import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.ext.Provider;
 import org.jboss.resteasy.reactive.server.spi.ResteasyReactiveContainerRequestContext;
 
+import java.util.HashSet;
+import java.util.Set;
+
 /** Keep a request admitted until its response, including a streamed response, has completed. */
 @Provider
 @ApplicationScoped
@@ -35,16 +38,21 @@ public class AccountActivityFilter implements ContainerRequestFilter {
         if (EmulatorInfoController.class.equals(resourceInfo.getResourceClass())) {
             return;
         }
-        String account = requestContext.getAccountId();
-        if (account != null) {
-            AccountActivity.Permit permit = activity.beginWork(account);
-            try {
-                ResteasyReactiveContainerRequestContext request = (ResteasyReactiveContainerRequestContext) context;
-                request.getServerRequestContext().registerCompletionCallback(failure -> permit.close());
-            } catch (RuntimeException failure) {
-                permit.close();
-                throw failure;
+        ResteasyReactiveContainerRequestContext request = (ResteasyReactiveContainerRequestContext) context;
+        Set<String> admitted = new HashSet<>();
+        // Host routes and integrations can select a resource owner after the signing account is
+        // known. Admit each owner before changing request context, for the same response lifetime.
+        requestContext.admitAccountsWith(account -> {
+            if (!admitted.contains(account)) {
+                AccountActivity.Permit permit = activity.beginWork(account);
+                try {
+                    request.getServerRequestContext().registerCompletionCallback(failure -> permit.close());
+                    admitted.add(account);
+                } catch (RuntimeException failure) {
+                    permit.close();
+                    throw failure;
+                }
             }
-        }
+        });
     }
 }

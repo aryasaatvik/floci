@@ -116,10 +116,14 @@ public class LambdaConcurrencyLimiter implements Resettable {
         }
     }
 
-    public Permit acquire(LambdaFunction fn) {
+    AccountActivity.Permit beginAccountWork(LambdaFunction fn) {
         String accountId = AwsArnUtils.accountOrDefault(fn.getFunctionArn(),
                 fn.getAccountId() == null ? "" : fn.getAccountId());
-        AccountActivity.Permit activity = accountActivity.beginWork(accountId);
+        return accountActivity.beginWork(accountId);
+    }
+
+    public Permit acquire(LambdaFunction fn) {
+        AccountActivity.Permit activity = beginAccountWork(fn);
         try {
             Integer reserved = fn.getReservedConcurrentExecutions();
             Permit capacity = reserved == null ? acquireUnreserved(regionOf(fn.getFunctionArn()))

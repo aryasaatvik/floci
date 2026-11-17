@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.lifecycle;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -11,6 +12,7 @@ import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.quarkus.arc.InjectableContext;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -34,6 +36,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
@@ -259,6 +262,41 @@ class AccountReclaimTest {
     }
 
     @Test
+    void cacheBootstrappedAfterTheFinalServiceSnapshotIsClearedBeforeAdmissionResumes() throws Exception {
+        ServiceConfigAccess modes = mock(ServiceConfigAccess.class);
+        when(modes.storageMode("fixture")).thenReturn("memory");
+        StorageFactory factory = new StorageFactory(config, modes);
+        AccountAwareStorageBackend<String> backend = factory.create("fixture", "cache.json", new TypeReference<>() {});
+        backend.putForAccount(TARGET, "same", "target");
+        backend.putForAccount(FOREIGN, "same", "foreign");
+        EmulatorInfoController reclaimable = controllerUsing(factory);
+        AtomicReference<List<String>> cache = new AtomicReference<>();
+        AtomicInteger inventories = new AtomicInteger();
+        when(containers.listContainersByLabels(TARGET_CONTAINERS)).thenAnswer(ignored -> {
+            if (inventories.incrementAndGet() == 2) {
+                factory.initializeAccountCache(() -> {
+                    // The final service snapshot has already been read. Simulate a cache restoring
+                    // before its owning bean is published for inspection.
+                    cache.set(List.of(backend.getForAccount(TARGET, "same").orElseThrow(),
+                            backend.getForAccount(FOREIGN, "same").orElseThrow()));
+                    return null;
+                }, accountId -> {
+                    assertEquals(TARGET, accountId);
+                    assertTrue(activity.isReclaiming(TARGET));
+                    assertTrue(backend.getForAccount(TARGET, "same").isEmpty());
+                    cache.updateAndGet(values -> values.stream().filter(value -> !value.equals("target")).toList());
+                });
+            }
+            return List.of();
+        });
+
+        assertEquals(200, reclaimable.reclaimAccount(TARGET, List.of(TARGET)).getStatus());
+
+        assertEquals(List.of("foreign"), cache.get());
+        assertFalse(activity.isBusy(TARGET));
+    }
+
+    @Test
     void dormantAccountReclaimPreservesForeignMultipartAndColdMetadata() throws Exception {
         live.set(List.of());
         StorageFactory factory = new StorageFactory(config, mock(ServiceConfigAccess.class));
@@ -297,6 +335,23 @@ class AccountReclaimTest {
         assertEquals(before, entries());
         assertEquals("intact", Files.readString(payload));
         assertEquals("{invalid", Files.readString(invalid));
+        verifyNoInteractions(services, teardowns);
+    }
+
+    @Test
+    void malformedDormantShardStopsBeforeAnyDeletesOrRecovery() throws Exception {
+        live.set(List.of());
+        StorageFactory factory = new StorageFactory(config, mock(ServiceConfigAccess.class));
+        EmulatorInfoController cold = controllerUsing(factory);
+        Path payload = write("s3/.accounts/" + TARGET + "/bucket/object.s3data", "intact");
+        String contents = "{\"key\":\"" + TARGET + "/table\",\"entries\":null}";
+        Path invalid = write("dynamodb-items/dormant.json", contents);
+        List<Path> before = entries();
+
+        assertThrows(IOException.class, () -> cold.reclaimAccount(TARGET, List.of(TARGET)));
+        assertEquals(before, entries());
+        assertEquals("intact", Files.readString(payload));
+        assertEquals(contents, Files.readString(invalid));
         verifyNoInteractions(services, teardowns);
     }
 

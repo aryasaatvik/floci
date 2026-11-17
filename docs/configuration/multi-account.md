@@ -243,8 +243,9 @@ account. It returns HTTP 409 when busy and otherwise uses the scoped reset's suc
 Reclaim leaves dormant services dormant. It validates unopened metadata without repairing it and
 writes only stores that hold the account's keys. An unreadable store stops the reclaim before cache
 or payload deletion. Dormant partitioned journals retain their history until a later compaction.
-The process holds the account gate through the clear and storage flush. Direct requests under
-the account and the guarded Lambda and Step Functions runtime admissions share that gate.
+The process holds the account gate through the clear and storage flush. Requests hold the gate
+for their signing account and any owner selected while routing. Guarded Lambda and Step Functions
+runtime admissions share the same gate.
 
 Use the caller's allocation inventory to select unallocated accounts and keep the selection
 fenced during apply. Preview is a point-in-time observation. The account gate coordinates

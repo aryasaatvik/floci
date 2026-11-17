@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.lambda;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.lambda.launcher.ContainerHandle;
 import io.github.hectorvent.floci.services.lambda.model.ContainerState;
 import io.github.hectorvent.floci.services.lambda.model.FunctionEventInvokeConfig;
@@ -10,11 +12,16 @@ import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.lambda.model.PendingInvocation;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
+import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
+import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import io.github.hectorvent.floci.testing.MutableClock;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.mockito.Mock;
@@ -22,6 +29,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
 import org.mockito.quality.Strictness;
 
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -114,6 +122,47 @@ class LambdaExecutorServiceTest {
 
         assertEquals("TooManyRequestsException", ex.getErrorCode());
         verify(warmPool, never()).acquire(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"$LATEST", "7"})
+    void staleSynchronousImageCannotStartAfterItsAccountIsReclaimed(String version, @TempDir Path code) {
+        String account = "000000000000";
+        String region = "us-east-1";
+        String name = fn.getFunctionName();
+        String arn = fn.getFunctionArn() + ("$LATEST".equals(version) ? "" : ":" + version);
+        InMemoryStorage<String, LambdaFunction> backend = new InMemoryStorage<>();
+        LambdaFunctionStore store = new LambdaFunctionStore(backend);
+        LambdaService service = new LambdaService(store, warmPool, new CodeStore(code), new ZipExtractor(),
+                new RegionResolver(region, account));
+        LambdaExecutorService scopedExecutor = new LambdaExecutorService(warmPool, new ObjectMapper(),
+                new LambdaConcurrencyLimiter(), null, service);
+
+        fn.setFunctionArn(arn);
+        fn.setVersion(version);
+        fn.setPackageType("Image");
+        fn.setImageUri("local.invalid/image:old");
+        fn.setRevisionId("old-revision");
+        store.save(region, fn);
+
+        // The caller keeps the resolved function while the account is cleared and reused.
+        backend.clear();
+        scopedExecutor.clearAccount(account);
+        AwsException missing = assertThrows(AwsException.class,
+                () -> scopedExecutor.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse));
+        assertEquals(404, missing.getHttpStatus());
+
+        LambdaFunction replacement = new LambdaFunction();
+        replacement.setFunctionArn(arn);
+        replacement.setFunctionName(name);
+        replacement.setVersion(version);
+        replacement.setRevisionId("new-revision");
+        store.save(region, replacement);
+        AwsException replaced = assertThrows(AwsException.class,
+                () -> scopedExecutor.invoke(fn, "{}".getBytes(), InvocationType.RequestResponse));
+        assertEquals(404, replaced.getHttpStatus());
+        verify(warmPool, never()).acquire(any());
+        verify(warmPool, never()).acquireProvisioned(any(), any());
     }
 
     @Test

@@ -390,20 +390,8 @@ public class LambdaService implements ResourceProvider {
         if (concurrencyLimiter == null) {
             return;
         }
-        int count = 0;
-        for (LambdaFunction fn : functionStore.listAll()) {
-            // Reserved concurrency is a function-level property; published
-            // versions share the $LATEST record's value. Skip non-$LATEST
-            // entries to avoid double-counting into totalReserved().
-            if (!"$LATEST".equals(fn.getVersion())) {
-                continue;
-            }
-            Integer reserved = fn.getReservedConcurrentExecutions();
-            if (reserved != null) {
-                concurrencyLimiter.setReserved(fn.getFunctionArn(), reserved);
-                count++;
-            }
-        }
+        int count = storageFactory == null ? functionStore.restoreReservedConcurrency(concurrencyLimiter)
+                : functionStore.restoreReservedConcurrency(storageFactory, concurrencyLimiter);
         if (count > 0) {
             LOG.infov("Restored reserved concurrency for {0} function(s)", count);
         }
@@ -1172,7 +1160,14 @@ public class LambdaService implements ResourceProvider {
 
     /** Whether this version and its function still admit invocations. */
     boolean isLive(LambdaFunction fn) {
-        return !fn.isDeleted() && findLatest(fn).filter(latest -> !latest.isDeleted()).isPresent();
+        if (fn.isDeleted()) {
+            return false;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(fn.getFunctionArn());
+        return functionStore.getForAccount(arn.accountId(), arn.region(), fn.getFunctionName(), fn.getVersion())
+                .filter(current -> !current.isDeleted() && (current == fn || fn.getRevisionId() != null
+                        && fn.getRevisionId().equals(current.getRevisionId())))
+                .isPresent();
     }
 
     /**

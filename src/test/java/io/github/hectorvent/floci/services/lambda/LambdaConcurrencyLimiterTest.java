@@ -1,15 +1,24 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AccountActivity;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.nio.file.Path;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class LambdaConcurrencyLimiterTest {
 
@@ -41,6 +50,36 @@ class LambdaConcurrencyLimiterTest {
         assertEquals(4, limiter.totalReserved(REGION));
         assertNull(limiter.clearReserved(ARN));
         assertEquals(4, limiter.clearReserved(otherArn));
+    }
+
+    @Test
+    void reclaimClearsAnAccountReservationRestoredAfterPlanning(@TempDir Path data) throws Exception {
+        String target = "000000000000";
+        String foreign = "222222222222";
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.defaultAccountId()).thenReturn(target);
+        when(config.storage().persistentPath()).thenReturn(data.toString());
+        ServiceConfigAccess modes = mock(ServiceConfigAccess.class);
+        when(modes.storageMode("lambda")).thenReturn("memory");
+        StorageFactory storage = new StorageFactory(config, modes);
+        LambdaFunctionStore functions = new LambdaFunctionStore(storage);
+        LambdaFunction targetFunction = fn(ARN, 4);
+        LambdaFunction foreignFunction = fn("arn:aws:lambda:us-east-1:222222222222:function:other", 3);
+        targetFunction.setVersion("$LATEST");
+        foreignFunction.setVersion("$LATEST");
+        functions.saveForAccount(target, REGION, targetFunction);
+        functions.saveForAccount(foreign, REGION, foreignFunction);
+        StorageFactory.PreparedAccountReclaim reclaim = storage.prepareAccountReclaim(target);
+
+        LambdaConcurrencyLimiter initializing = new LambdaConcurrencyLimiter(10, 0);
+        assertEquals(2, functions.restoreReservedConcurrency(storage, initializing));
+        assertEquals(7, initializing.totalReserved(REGION));
+        reclaim.apply();
+
+        assertEquals(3, initializing.totalReserved(REGION));
+        LambdaConcurrencyLimiter afterReclaim = new LambdaConcurrencyLimiter(10, 0);
+        assertEquals(1, functions.restoreReservedConcurrency(storage, afterReclaim));
+        assertEquals(3, afterReclaim.totalReserved(REGION));
     }
 
     @Test

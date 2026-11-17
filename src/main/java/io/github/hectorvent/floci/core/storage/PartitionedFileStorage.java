@@ -75,8 +75,8 @@ public class PartitionedFileStorage<E> implements StorageBackend<String, Map<Str
     static final String FILE_SUFFIX = ".json";
     static final String JOURNAL_FILE = "journal.wal";
     static final String MIGRATING_SUFFIX = ".migrating";
-    private static final String KEY_FIELD = "key";
-    private static final String ENTRIES_FIELD = "entries";
+    static final String KEY_FIELD = "key";
+    static final String ENTRIES_FIELD = "entries";
     private static final int READABLE_PREFIX_LENGTH = 80;
 
     /** When a change reaches disk. */

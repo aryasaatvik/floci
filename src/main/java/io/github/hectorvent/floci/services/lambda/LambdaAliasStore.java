@@ -24,7 +24,11 @@ public class LambdaAliasStore {
     public LambdaAliasStore(StorageFactory storageFactory) {
         this.backend = storageFactory.create("lambda", "lambda-aliases.json",
                 new TypeReference<Map<String, LambdaAlias>>() {});
-        loadIndex();
+        storageFactory.initializeAccountCache(() -> {
+            loadIndex();
+            return null;
+        }, accountId -> urlIdIndex.values().removeIf(alias ->
+                accountId.equals(AwsArnUtils.accountOrDefault(alias.getAliasArn(), ""))));
     }
 
     LambdaAliasStore(StorageBackend<String, LambdaAlias> backend) {

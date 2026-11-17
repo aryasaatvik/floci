@@ -17,12 +17,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /** Plans changes to dormant stores without creating, migrating, or repairing a backend. */
 final class UnopenedAccountStores {
 
+    private static final Pattern SHARD_NAME = Pattern.compile(".*-[0-9a-f]{16}(?:\\.[0-9]+-of-[0-9]+)?\\.json");
     private static final TypeReference<Map<String, JsonNode>> RAW_STORE = new TypeReference<>() {};
     private static final ObjectMapper MAPPER = new ObjectMapper()
             .registerModule(new JavaTimeModule())
@@ -96,21 +98,33 @@ final class UnopenedAccountStores {
     }
 
     private static void planPartitioned(Path directory, Predicate<String> ownsKey, List<Purge> purges) throws IOException {
+        Path journalPath = directory.resolve(PartitionedFileStorage.JOURNAL_FILE);
+        boolean recognized = StorageFiles.isRegularFileIfPresent(journalPath);
         List<Path> targetShards = new ArrayList<>();
+        boolean malformed = false;
         try (Stream<Path> files = Files.list(directory)) {
-            for (Path file : files.filter(path -> path.getFileName().toString().endsWith(".json")
+            for (Path file : files.filter(path -> path.getFileName().toString().endsWith(PartitionedFileStorage.FILE_SUFFIX)
                     && !Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)).toList()) {
-                if (StorageFiles.isRegularFileIfPresent(file)) {
-                    JsonNode contents = MAPPER.readTree(file.toFile());
-                    JsonNode key = contents.get("key");
-                    if (key != null && key.isTextual() && contents.path("entries").isObject() && ownsKey.test(key.asText())) {
-                        targetShards.add(file);
-                    }
+                if (!StorageFiles.isRegularFileIfPresent(file)) {
+                    continue;
+                }
+                JsonNode contents = MAPPER.readTree(file.toFile());
+                JsonNode key = contents.path(PartitionedFileStorage.KEY_FIELD);
+                JsonNode entries = contents.path(PartitionedFileStorage.ENTRIES_FIELD);
+                recognized |= !key.isMissingNode() || !entries.isMissingNode()
+                        || SHARD_NAME.matcher(file.getFileName().toString()).matches();
+                if (!key.isTextual() || key.asText().isEmpty() || !entries.isObject()
+                        || entries.valueStream().anyMatch(JsonNode::isNull)) {
+                    malformed = true;
+                } else if (ownsKey.test(key.asText())) {
+                    targetShards.add(file);
                 }
             }
         }
+        if (recognized && malformed) {
+            throw new IOException("Unreadable partitioned storage shard");
+        }
 
-        Path journalPath = directory.resolve(PartitionedFileStorage.JOURNAL_FILE);
         EntryJournal<JsonNode> journal = new EntryJournal<>(journalPath, MAPPER.constructType(JsonNode.class),
                 MAPPER.getTypeFactory().constructMapType(Map.class, String.class, JsonNode.class));
         Set<String> journalKeys = new HashSet<>();

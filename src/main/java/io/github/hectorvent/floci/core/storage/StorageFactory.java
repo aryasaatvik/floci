@@ -23,6 +23,8 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 /**
@@ -39,6 +41,7 @@ public class StorageFactory {
     private final EmulatorConfig config;
     private final ServiceConfigAccess serviceConfigAccess;
     private final List<StorageBackend<?, ?>> allBackends = new ArrayList<>();
+    private final List<Consumer<String>> accountCacheClears = new ArrayList<>();
     // A file path identifies one logical store: callers sharing a path are expected to agree on
     // its value type and storage mode. The first create() wins; repeat calls reuse that backend.
     private final Map<Path, StorageBackend<?, ?>> backendsByPath = new HashMap<>();
@@ -318,6 +321,16 @@ public class StorageFactory {
         }
     }
 
+    /**
+     * Initialize a cache from an already-resolved backend and register its account clear atomically
+     * with storage reclamation. Neither callback may initialize other services.
+     */
+    public synchronized <T> T initializeAccountCache(Supplier<T> initialize, Consumer<String> clear) {
+        T value = initialize.get();
+        accountCacheClears.add(clear);
+        return value;
+    }
+
     /** Plans all dormant-store edits before account payload and cache mutation may start. */
     public synchronized PreparedAccountReclaim prepareAccountReclaim(String accountId) throws IOException {
         List<UnopenedAccountStores.Purge> plan = UnopenedAccountStores.plan(
@@ -325,14 +338,25 @@ public class StorageFactory {
         return () -> applyAccountReclaim(accountId, plan);
     }
 
-    private synchronized void applyAccountReclaim(String accountId, List<UnopenedAccountStores.Purge> plan)
-            throws IOException {
-        clearOpenAccountStores(accountId);
-        for (UnopenedAccountStores.Purge purge : plan) {
-            // A foreign account request may have opened this store after planning. Its live
-            // backend then owns the same account's clear and we must not write the file twice.
-            if (purge.registeredPaths().stream().noneMatch(backendsByPath::containsKey)) {
-                purge.write().run();
+    private void applyAccountReclaim(String accountId, List<UnopenedAccountStores.Purge> plan) throws IOException {
+        List<Consumer<String>> caches = List.of();
+        try {
+            synchronized (this) {
+                caches = List.copyOf(accountCacheClears);
+                clearOpenAccountStores(accountId);
+                for (UnopenedAccountStores.Purge purge : plan) {
+                    // A foreign request can open a store after planning. Its live backend then
+                    // owns the clear and we must not overwrite its subsequent writes.
+                    if (purge.registeredPaths().stream().noneMatch(backendsByPath::containsKey)) {
+                        purge.write().run();
+                    }
+                }
+            }
+        } finally {
+            // Cached state that raced planning is cleared before admission resumes. A later
+            // initializer reads the erased backend. Avoid taking service locks under this monitor.
+            for (Consumer<String> clear : caches) {
+                clear.accept(accountId);
             }
         }
     }

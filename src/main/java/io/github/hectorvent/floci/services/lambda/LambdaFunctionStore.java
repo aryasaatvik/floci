@@ -35,7 +35,10 @@ public class LambdaFunctionStore implements Resettable {
     @Inject
     public LambdaFunctionStore(StorageFactory storageFactory) {
         this.backend = storageFactory.create("lambda", FUNCTIONS_FILE, FUNCTIONS_TYPE);
-        loadIndex();
+        storageFactory.initializeAccountCache(() -> {
+            loadIndex();
+            return null;
+        }, this::clearAccount);
     }
 
     LambdaFunctionStore(StorageBackend<String, LambdaFunction> backend) {
@@ -45,6 +48,23 @@ public class LambdaFunctionStore implements Resettable {
 
     Object lockForConcurrencyOp(String functionArn) {
         return concurrencyOpLocks.computeIfAbsent(functionArn, key -> new Object());
+    }
+
+    int restoreReservedConcurrency(StorageFactory storage, LambdaConcurrencyLimiter limiter) {
+        return storage.initializeAccountCache(() -> restoreReservedConcurrency(limiter), limiter::clearAccount);
+    }
+
+    int restoreReservedConcurrency(LambdaConcurrencyLimiter limiter) {
+        int count = 0;
+        for (LambdaFunction function : listAll()) {
+            // Published versions share the function-level reservation on $LATEST.
+            Integer reserved = function.getReservedConcurrentExecutions();
+            if ("$LATEST".equals(function.getVersion()) && reserved != null) {
+                limiter.setReserved(function.getFunctionArn(), reserved);
+                count++;
+            }
+        }
+        return count;
     }
 
     private void loadIndex() {

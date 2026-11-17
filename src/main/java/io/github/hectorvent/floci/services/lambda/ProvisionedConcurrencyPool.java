@@ -55,6 +55,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
     private final LambdaFunctionStore functions;
     private final LambdaAliasStore aliases;
     private final StorageBackend<String, Configuration> storage;
+    private final StorageFactory storageFactory;
     private final Clock clock;
     private final int maxPerFunction;
     private final int maxTotal;
@@ -123,7 +124,7 @@ public class ProvisionedConcurrencyPool implements Resettable {
                         "lambda-provisioned-concurrency.json", new TypeReference<>() {}),
                 clock, WarmPool.resolveMaxPerFunction(config), WarmPool.resolveMaxTotal(config),
                 config.services().lambda().ephemeral(), WarmPool.resolveDrainTimeout(config),
-                environmentLimiter, accountActivity);
+                environmentLimiter, accountActivity, storageFactory);
     }
 
     ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
@@ -138,13 +139,15 @@ public class ProvisionedConcurrencyPool implements Resettable {
                               Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
                               LambdaEnvironmentLimiter environmentLimiter) {
         this(launcher, functions, aliases, storage, clock, maxPerFunction, maxTotal, ephemeral, drainSeconds,
-                environmentLimiter, new AccountActivity());
+                environmentLimiter, new AccountActivity(), null);
     }
 
     private ProvisionedConcurrencyPool(LambdaRuntimeLauncher launcher, LambdaFunctionStore functions,
                                        LambdaAliasStore aliases, StorageBackend<String, Configuration> storage,
                                        Clock clock, int maxPerFunction, int maxTotal, boolean ephemeral, int drainSeconds,
-                                       LambdaEnvironmentLimiter environmentLimiter, AccountActivity accountActivity) {
+                                       LambdaEnvironmentLimiter environmentLimiter, AccountActivity accountActivity,
+                                       StorageFactory storageFactory) {
+        this.storageFactory = storageFactory;
         this.environmentLimiter = environmentLimiter;
         this.accountActivity = accountActivity;
         this.launcher = launcher;
@@ -160,12 +163,13 @@ public class ProvisionedConcurrencyPool implements Resettable {
 
     @PostConstruct
     void start() {
-        synchronized (lock) {
-            List<Configuration> stored = storage instanceof AccountAwareStorageBackend<Configuration> aware
-                    ? aware.scanAllAccounts() : storage.scan(ignored -> true);
-            for (Configuration configuration : stored) {
-                allocations.put(configuration.key(), new Allocation(configuration));
-            }
+        if (storageFactory == null) {
+            restoreAllocations();
+        } else {
+            storageFactory.initializeAccountCache(() -> {
+                restoreAllocations();
+                return null;
+            }, this::clearAccount);
         }
         scheduler.scheduleWithFixedDelay(() -> {
             try {
@@ -174,6 +178,16 @@ public class ProvisionedConcurrencyPool implements Resettable {
                 LOG.errorv(failure, "Provisioned concurrency reconciliation failed");
             }
         }, 0, 1, TimeUnit.SECONDS);
+    }
+
+    private void restoreAllocations() {
+        synchronized (lock) {
+            List<Configuration> stored = storage instanceof AccountAwareStorageBackend<Configuration> aware
+                    ? aware.scanAllAccounts() : storage.scan(ignored -> true);
+            for (Configuration configuration : stored) {
+                allocations.put(configuration.key(), new Allocation(configuration));
+            }
+        }
     }
 
     public Status put(String region, String name, String qualifier, int count, String account) {

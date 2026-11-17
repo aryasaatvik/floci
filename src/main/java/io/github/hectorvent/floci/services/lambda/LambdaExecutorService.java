@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.lambda;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AccountActivity;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
@@ -217,6 +218,23 @@ public class LambdaExecutorService implements Resettable {
             throw new AwsException("ResourceNotFoundException", "Function not found: " + fn.getFunctionArn(), 404);
         }
 
+        long functionGeneration = type == InvocationType.Event
+                ? deletions.getOrDefault(functionKey(fn), 0L) : 0;
+        boolean live;
+        try {
+            live = lambdaService == null || lambdaService.isLive(fn);
+        } catch (RuntimeException failure) {
+            permit.close();
+            throw failure;
+        }
+        if (!live) {
+            permit.close();
+            if (type == InvocationType.Event) {
+                return new InvokeResult(202, null, new byte[0], null, requestId);
+            }
+            throw new AwsException("ResourceNotFoundException", "Function not found: " + fn.getFunctionArn(), 404);
+        }
+
         if (type == InvocationType.Event) {
             FunctionEventInvokeConfig eventInvokeConfig = null;
             if (lambdaService != null) {
@@ -236,14 +254,7 @@ public class LambdaExecutorService implements Resettable {
 
             AsyncEvent event = new AsyncEvent(fn, payload, requestId, chainDepth, invokedQualifier,
                     maxRetries, clock.millis() + maxEventAgeSeconds * 1000L, generation.get(),
-                    deletions.getOrDefault(functionKey(fn), 0L), account, accountGeneration);
-            // The deletion count is read above, before this store check, and DeleteFunction moves the count
-            // again after it removes the function from the store. So either this check sees the function
-            // gone, or the count moves after the event's snapshot and stale() drops the event.
-            if (lambdaService != null && !lambdaService.isLive(fn)) {
-                permit.close();
-                return new InvokeResult(202, null, new byte[0], null, requestId);
-            }
+                    functionGeneration, account, accountGeneration);
             try {
                 asyncExecutor.submit(() -> attempt(event, 1, null, permit));
             } catch (RuntimeException e) {
@@ -275,8 +286,13 @@ public class LambdaExecutorService implements Resettable {
      * record, which holds the reservation, rather than a version's snapshot, which has none.
      */
     private LambdaConcurrencyLimiter.Permit acquire(LambdaService lambdaService, LambdaFunction fn) {
-        LambdaFunction function = lambdaService != null ? lambdaService.findLatest(fn).orElse(fn) : fn;
-        return concurrencyLimiter.acquire(function);
+        if (lambdaService == null) {
+            return concurrencyLimiter.acquire(fn);
+        }
+        try (AccountActivity.Permit ignored = concurrencyLimiter.beginAccountWork(fn)) {
+            // Reading legacy records can migrate them, so even the reservation lookup needs admission.
+            return concurrencyLimiter.acquire(lambdaService.findLatest(fn).orElse(fn));
+        }
     }
 
     /**
