@@ -1,11 +1,13 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.core.common.AccountActivity;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -39,6 +41,28 @@ class LambdaConcurrencyLimiterTest {
         assertEquals(4, limiter.totalReserved(REGION));
         assertNull(limiter.clearReserved(ARN));
         assertEquals(4, limiter.clearReserved(otherArn));
+    }
+
+    @Test
+    void unreservedInvocationAdmissionSharesTheReclaimGate() {
+        String target = "000000000000";
+        LambdaFunction other = fn("arn:aws:lambda:us-east-1:222222222222:function:other", null);
+        AccountActivity activity = new AccountActivity();
+        LambdaConcurrencyLimiter limiter = new LambdaConcurrencyLimiter(2, 0, activity);
+
+        try (LambdaConcurrencyLimiter.Permit attempt = limiter.acquire(fn(null))) {
+            assertNull(activity.tryReclaim(target));
+        }
+        try (AccountActivity.Permit reclaim = activity.tryReclaim(target)) {
+            assertNotNull(reclaim);
+            assertEquals(409, assertThrows(AwsException.class, () -> limiter.acquire(fn(null))).getHttpStatus());
+            try (LambdaConcurrencyLimiter.Permit foreignAttempt = limiter.acquire(other)) {
+                assertEquals(1, limiter.unreservedInflightCount(REGION));
+            }
+        }
+        try (LambdaConcurrencyLimiter.Permit attempt = limiter.acquire(fn(null))) {
+            assertEquals(1, limiter.unreservedInflightCount(REGION));
+        }
     }
 
     @Test

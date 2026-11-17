@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.lambda.LambdaEnvironmentLimiter;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
+import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
@@ -52,6 +53,7 @@ public class EmulatorInfoController {
     private final EmulatorConfig config;
     private final DynamoDbBackendSelector dynamoDbBackendSelector;
     private final LambdaEnvironmentLimiter environmentLimiter;
+    private final AccountReclaim accountReclaim;
 
     @Inject
     public EmulatorInfoController(ServiceRegistry serviceRegistry,
@@ -62,7 +64,8 @@ public class EmulatorInfoController {
                                   FlociCertificateAuthority certificateAuthority,
                                   EmulatorConfig config,
                                   DynamoDbBackendSelector dynamoDbBackendSelector,
-                                  LambdaEnvironmentLimiter environmentLimiter) {
+                                  LambdaEnvironmentLimiter environmentLimiter,
+                                  AccountReclaim accountReclaim) {
         this.serviceRegistry = serviceRegistry;
         this.initLifecycleState = initLifecycleState;
         this.storageFactory = storageFactory;
@@ -72,6 +75,7 @@ public class EmulatorInfoController {
         this.config = config;
         this.dynamoDbBackendSelector = dynamoDbBackendSelector;
         this.environmentLimiter = environmentLimiter;
+        this.accountReclaim = accountReclaim;
         this.version = FlociVersion.current();
     }
 
@@ -119,7 +123,7 @@ public class EmulatorInfoController {
         body.put("manifest_version", MANIFEST_VERSION);
         body.put("console_contract", CONSOLE_CONTRACT);
         body.put("cloud", "aws");
-        body.put("capabilities", Map.of("accountStateReset", true));
+        body.put("capabilities", Map.of("accountStateReset", true, "accountStateReclaim", true));
         body.put("emulator", "floci");
         body.put("version", version);
         body.put("edition", "community");
@@ -230,31 +234,75 @@ public class EmulatorInfoController {
     @POST
     @Path("/state/accounts/{accountId}/reset")
     public synchronized Response resetAccount(@PathParam("accountId") String accountId) {
-        if (accountId == null || !accountId.matches("[0-9]{12}")) {
-            return Response.status(400).entity(Map.of("error", "accountId must contain exactly 12 ASCII digits")).build();
+        if (!validAccountId(accountId)) {
+            return invalidAccountId();
         }
+        List<Resettable> services = resetServices();
+        for (Resettable service : services) {
+            service.checkAccountReset(accountId);
+        }
+        clearAccountState(accountId, services);
+        return accountResetResponse(accountId);
+    }
+
+    @GET
+    @Path("/state/accounts/{accountId}/reclaim")
+    public Response previewAccountReclaim(@PathParam("accountId") String accountId) throws IOException {
+        if (!validAccountId(accountId)) {
+            return invalidAccountId();
+        }
+        return Response.ok(accountReclaim.preview(accountId)).build();
+    }
+
+    @POST
+    @Path("/state/accounts/{accountId}/reclaim")
+    public synchronized Response reclaimAccount(@PathParam("accountId") String accountId,
+                                              @HeaderParam("X-Floci-Confirm-Account") List<String> confirm)
+            throws IOException {
+        if (!validAccountId(accountId)) {
+            return invalidAccountId();
+        }
+        if (!List.of(accountId).equals(confirm)) {
+            return Response.status(400).entity(Map.of("error", "X-Floci-Confirm-Account must match accountId")).build();
+        }
+        if (!accountReclaim.reclaim(accountId, this::resetServices, services -> clearAccountState(accountId, services))) {
+            return Response.status(409).entity(Map.of("error", "account-busy", "accountId", accountId)).build();
+        }
+        return accountResetResponse(accountId);
+    }
+
+    private static boolean validAccountId(String accountId) {
+        return accountId != null && accountId.matches("[0-9]{12}");
+    }
+
+    private static Response invalidAccountId() {
+        return Response.status(400).entity(Map.of("error", "accountId must contain exactly 12 ASCII digits")).build();
+    }
+
+    private static Response accountResetResponse(String accountId) {
+        return Response.ok(Map.of("status", "OK", "accountId", accountId)).build();
+    }
+
+    private List<Resettable> resetServices() {
         List<Resettable> services = new ArrayList<>();
         for (Resettable service : resettables) {
             services.add(service);
         }
-        for (Resettable service : services) {
-            service.checkAccountReset(accountId);
-        }
+        return services;
+    }
+
+    private void clearAccountState(String accountId, List<Resettable> services) {
         // Unlike global reset, this must never stop container pools or clear another account's caches.
         for (Resettable service : services) {
             service.clearAccount(accountId);
         }
         storageFactory.clearAccount(accountId);
-        return Response.ok(Map.of("status", "OK", "accountId", accountId)).build();
     }
 
     private synchronized void performReset() {
         // Resolve live instances before taking any storage locks. Serialize resets so one reset
         // cannot resume a publisher while another is still wiping its storage.
-        List<Resettable> services = new ArrayList<>();
-        for (Resettable service : resettables) {
-            services.add(service);
-        }
+        List<Resettable> services = resetServices();
         // Every service may refuse before the first destructive step, so a refusal changes nothing.
         for (Resettable service : services) {
             service.checkReset();

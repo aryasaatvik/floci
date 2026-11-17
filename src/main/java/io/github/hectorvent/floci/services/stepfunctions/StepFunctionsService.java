@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnShapes;
+import io.github.hectorvent.floci.core.common.AccountActivity;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
@@ -97,6 +98,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     private final Map<String, Long> taskHeartbeatNanos = new ConcurrentHashMap<>();
     // Serializes the StartExecution check-and-create so two concurrent calls with the same name cannot
     // both create and launch an execution; also enables AWS idempotent-success for STANDARD workflows.
+    private final AccountActivity accountActivity;
     private final Object executionStartLock = new Object();
     private final RegionResolver regionResolver;
     private final AslExecutor aslExecutor;
@@ -152,10 +154,19 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             new FieldStateTypeRule("Catch", Set.of("Task", "Parallel", "Map")),
             new FieldStateTypeRule("Retry", Set.of("Task", "Parallel", "Map")));
 
-    @Inject
     public StepFunctionsService(StorageFactory storageFactory, RegionResolver regionResolver,
                                 AslExecutor aslExecutor, ObjectMapper objectMapper,
                                 SfnMockLoader mockLoader, StepFunctionsEventPublisher eventPublisher) {
+        this(storageFactory, regionResolver, aslExecutor, objectMapper, mockLoader, eventPublisher,
+                new AccountActivity());
+    }
+
+    @Inject
+    public StepFunctionsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                                AslExecutor aslExecutor, ObjectMapper objectMapper,
+                                SfnMockLoader mockLoader, StepFunctionsEventPublisher eventPublisher,
+                                AccountActivity accountActivity) {
+        this.accountActivity = accountActivity;
         this.stateMachineStore = storageFactory.create("stepfunctions", "sfn-state-machines.json",
                 new TypeReference<Map<String, StateMachine>>() {});
         this.executionStore = storageFactory.create("stepfunctions", "sfn-executions.json",
@@ -820,6 +831,13 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     // ──────────────────────────── Executions ────────────────────────────
 
     public Execution startExecution(String stateMachineArn, String name, String input, String region) {
+        String accountId = AwsArnUtils.accountOrDefault(stateMachineArn, executionStore.accountId());
+        try (AccountActivity.Permit ignored = accountActivity.beginWork(accountId)) {
+            return startExecutionWhileAdmitted(stateMachineArn, name, input, region);
+        }
+    }
+
+    private Execution startExecutionWhileAdmitted(String stateMachineArn, String name, String input, String region) {
         TestCaseSelection selection = splitTestCaseSuffix(stateMachineArn);
         ResolvedStateMachine resolved = resolveStateMachineForExecution(selection.stateMachineArn());
         StateMachine sm = resolved.stateMachine();
@@ -903,6 +921,13 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     }
 
     public Execution startSyncExecution(String stateMachineArn, String name, String input, String region) {
+        String accountId = AwsArnUtils.accountOrDefault(stateMachineArn, executionStore.accountId());
+        try (AccountActivity.Permit ignored = accountActivity.beginWork(accountId)) {
+            return startSyncExecutionWhileAdmitted(stateMachineArn, name, input, region);
+        }
+    }
+
+    private Execution startSyncExecutionWhileAdmitted(String stateMachineArn, String name, String input, String region) {
         TestCaseSelection selection = splitTestCaseSuffix(stateMachineArn);
         if (selection.testCaseName() != null) {
             // Matches Step Functions Local, which rejects a test case suffix here.

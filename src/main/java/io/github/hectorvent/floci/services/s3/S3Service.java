@@ -293,8 +293,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 storageFactory.create("s3", "s3-account-public-access-block.json",
                         new TypeReference<Map<String, String>>() {
                         }),
-                Path.of(config.storage().persistentPath()).resolve("s3"),
-                "memory".equals(config.storage().services().s3().mode().orElse(config.storage().mode())),
+                dataRoot(config), !storesPayloadFiles(config),
                 sqsService, snsService, null, lambdaServiceProvider, null,
                 eventBridgeService, s3UpdatedEvent,
                 regionResolver,
@@ -302,6 +301,18 @@ public class S3Service implements Resettable, ResourceProvider {
                 config.services().s3().enforceAuth(), config.services().iam().enforcementEnabled(), iamService,
                 config.services().s3().globalBucketNamespace()
         );
+    }
+
+    public static Path dataRoot(EmulatorConfig config) {
+        return Path.of(config.storage().persistentPath()).resolve("s3");
+    }
+
+    public static boolean storesPayloadFiles(EmulatorConfig config) {
+        return !"memory".equals(config.storage().services().s3().mode().orElse(config.storage().mode()));
+    }
+
+    public static Path accountDataPath(Path dataRoot, String accountId) {
+        return dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(accountId);
     }
 
     /**
@@ -444,7 +455,7 @@ public class S3Service implements Resettable, ResourceProvider {
         }
         if (!inMemory) {
             try {
-                FileTrees.delete(dataRoot.resolve(ACCOUNT_STORAGE_ROOT).resolve(accountId));
+                FileTrees.delete(accountDataPath(dataRoot, accountId));
                 if (bucketStore instanceof AccountAwareStorageBackend<Bucket> aware) {
                     List<AccountAwareStorageBackend.AccountEntry<Bucket>> buckets = aware.scanAllAccountEntries(key -> true);
                     for (AccountAwareStorageBackend.AccountEntry<Bucket> entry : buckets) {

@@ -72,7 +72,7 @@ public class CodeStore implements Resettable {
         }
         List<LambdaFunction> all = functions.listAll();
         List<Path> candidates = new ArrayList<>();
-        candidates.add(baseDir.resolve(accountId).toAbsolutePath().normalize());
+        candidates.add(accountCodePath(baseDir, accountId).toAbsolutePath().normalize());
         for (LambdaFunction function : all) {
             if (accountId.equals(owner(function))) {
                 candidates.add(getLegacyCodePath(function.getFunctionName()).toAbsolutePath().normalize());
@@ -122,7 +122,11 @@ public class CodeStore implements Resettable {
             }
         }
         // This also removes the preceding account/function layout and every version's code.
-        deleteAccountDirectory(baseDir.resolve(accountId));
+        deleteAccountDirectory(accountCodePath(baseDir, accountId));
+    }
+
+    public static Path accountCodePath(Path baseDir, String accountId) {
+        return baseDir.resolve(accountId);
     }
 
     private static void deleteAccountDirectory(Path directory) {
