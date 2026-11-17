@@ -2,8 +2,11 @@ package io.github.hectorvent.floci.core.storage;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -23,6 +26,17 @@ final class StorageFiles {
     }
 
     private StorageFiles() {
+    }
+
+    static boolean isRegularFileIfPresent(Path path) throws IOException {
+        try {
+            if (!Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).isRegularFile()) {
+                throw new IOException("Expected a regular storage file");
+            }
+            return true;
+        } catch (NoSuchFileException absent) {
+            return false;
+        }
     }
 
     /**

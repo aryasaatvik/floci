@@ -305,13 +305,54 @@ public class StorageFactory {
 
     /** Purges one account from every managed store, leaving other account partitions live. */
     public synchronized void clearAccount(String accountId) {
+        clearOpenAccountStores(accountId);
+        clearUnopenedAccountStores(accountId);
+        clearUnopenedPartitionedAccountStores(accountId);
+    }
+
+    private void clearOpenAccountStores(String accountId) {
         for (StorageBackend<?, ?> backend : allBackends) {
             if (backend instanceof AccountAwareStorageBackend<?> aware) {
                 aware.clearAccount(accountId);
             }
         }
-        clearUnopenedAccountStores(accountId);
-        clearUnopenedPartitionedAccountStores(accountId);
+    }
+
+    /** Plans all dormant-store edits before account payload and cache mutation may start. */
+    public synchronized PreparedAccountReclaim prepareAccountReclaim(String accountId) throws IOException {
+        List<UnopenedAccountStores.Purge> plan = UnopenedAccountStores.plan(
+                Path.of(config.storage().persistentPath()), backendsByPath.keySet(), accountId, config.defaultAccountId());
+        return () -> applyAccountReclaim(accountId, plan);
+    }
+
+    private synchronized void applyAccountReclaim(String accountId, List<UnopenedAccountStores.Purge> plan)
+            throws IOException {
+        clearOpenAccountStores(accountId);
+        for (UnopenedAccountStores.Purge purge : plan) {
+            // A foreign account request may have opened this store after planning. Its live
+            // backend then owns the same account's clear and we must not write the file twice.
+            if (purge.registeredPaths().stream().noneMatch(backendsByPath::containsKey)) {
+                purge.write().run();
+            }
+        }
+    }
+
+    public interface PreparedAccountReclaim {
+        void apply() throws IOException;
+    }
+
+    /** Supplies legacy payload ownership without initializing the service that owns the store. */
+    public synchronized <V> Map<String, V> inspectAccountStore(String fileName, TypeReference<Map<String, V>> type)
+            throws IOException {
+        Path root = Path.of(config.storage().persistentPath());
+        StorageBackend<?, ?> existing = backendsByPath.get(root.resolve(fileName));
+        if (existing instanceof AccountAwareStorageBackend<?> aware) {
+            // The caller supplies the owning service's file name and value type.
+            @SuppressWarnings("unchecked")
+            Map<String, V> raw = ((AccountAwareStorageBackend<V>) aware).scanAllAccountsWithRawKeys();
+            return raw;
+        }
+        return UnopenedAccountStores.readFlat(root, fileName, type);
     }
 
     // Services are lazy: a volume may contain a store that has not been opened in this process.

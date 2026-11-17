@@ -240,6 +240,9 @@ returns an error response.
 `POST` to the same path with `X-Floci-Confirm-Account` set to the exact account ID. The request
 checks for admitted work, native reset conflicts and owned Docker containers before clearing the
 account. It returns HTTP 409 when busy and otherwise uses the scoped reset's success shape.
+Reclaim leaves dormant services dormant. It validates unopened metadata without repairing it and
+writes only stores that hold the account's keys. An unreadable store stops the reclaim before cache
+or payload deletion. Dormant partitioned journals retain their history until a later compaction.
 The process holds the account gate through the clear and storage flush. Direct requests under
 the account and the guarded Lambda and Step Functions runtime admissions share that gate.
 

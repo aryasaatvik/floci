@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.FileTrees;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -33,6 +34,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -50,25 +52,31 @@ class AccountReclaimTest {
 
     private final AccountActivity activity = new AccountActivity();
     private final Resettable guard = mock(Resettable.class);
+    private final AtomicReference<List<Resettable>> live = new AtomicReference<>(List.of(guard));
     private final ContainerLifecycleManager containers = mock(ContainerLifecycleManager.class);
     private final StorageFactory storage = mock(StorageFactory.class);
     @SuppressWarnings("unchecked")
     private final Instance<Resettable> services = mock(Instance.class);
     @SuppressWarnings("unchecked")
     private final Instance<ContainerTeardown> teardowns = mock(Instance.class);
+    private EmulatorConfig config;
     private EmulatorInfoController controller;
 
     @BeforeEach
     void setUp() {
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.storage().persistentPath()).thenReturn(directory.toString());
         when(config.storage().services().s3().mode()).thenReturn(Optional.of("persistent"));
         when(config.services().lambda().codePath()).thenReturn(directory.resolve("lambda-code").toString());
         when(config.docker().resourceNamespace()).thenReturn(Optional.of("test"));
         when(config.port()).thenReturn(4566);
+        when(config.defaultAccountId()).thenReturn("000000000000");
+        controller = controllerUsing(storage);
+    }
 
-        AccountReclaim reclaim = new AccountReclaim(activity, config, () -> List.of(guard), containers);
-        controller = new EmulatorInfoController(null, null, storage, services, teardowns,
+    private EmulatorInfoController controllerUsing(StorageFactory factory) {
+        AccountReclaim reclaim = new AccountReclaim(activity, config, live::get, containers, factory);
+        return new EmulatorInfoController(null, null, factory, services, teardowns,
                 null, config, null, null, reclaim);
     }
 
@@ -133,7 +141,7 @@ class AccountReclaimTest {
         Resettable lateGuard = mock(Resettable.class);
         doThrow(new AwsException("ConflictException", "private details", 409)).when(lateGuard)
                 .checkAccountReset(TARGET);
-        when(services.iterator()).thenAnswer(ignored -> List.of(guard, lateGuard).iterator());
+        live.set(List.of(guard, lateGuard));
 
         Response response = controller.reclaimAccount(TARGET, List.of(TARGET));
 
@@ -143,6 +151,23 @@ class AccountReclaimTest {
         verify(lateGuard, never()).clearAccount(TARGET);
         verifyNoInteractions(storage, teardowns);
         assertFalse(activity.isBusy(TARGET));
+    }
+
+    @Test
+    void accountBecomingBusyWhilePreparingStoragePreventsAllClears() throws Exception {
+        Resettable lateGuard = mock(Resettable.class);
+        doThrow(new AwsException("ConflictException", "busy", 409)).when(lateGuard).checkAccountReset(TARGET);
+        StorageFactory.PreparedAccountReclaim prepared = mock(StorageFactory.PreparedAccountReclaim.class);
+        when(storage.prepareAccountReclaim(TARGET)).thenAnswer(ignored -> {
+            live.set(List.of(guard, lateGuard));
+            return prepared;
+        });
+
+        assertEquals(409, controller.reclaimAccount(TARGET, List.of(TARGET)).getStatus());
+
+        verify(guard, never()).clearAccount(TARGET);
+        verify(lateGuard, never()).clearAccount(TARGET);
+        verifyNoInteractions(prepared, services, teardowns);
     }
 
     @Test
@@ -194,18 +219,21 @@ class AccountReclaimTest {
     void reclaimHoldsTheAccountGateThroughNativeClearAndFlush() throws Exception {
         Path target = write("s3/.accounts/" + TARGET + "/bucket/data.s3data", "target");
         Path foreign = write("s3/.accounts/" + FOREIGN + "/bucket/data.s3data", "foreign");
-        when(services.iterator()).thenAnswer(ignored -> List.of(guard).iterator());
         doAnswer(ignored -> {
             FileTrees.delete(target.getParent().getParent());
             return null;
         }).when(guard).clearAccount(TARGET);
         CountDownLatch flushing = new CountDownLatch(1);
         CountDownLatch releaseFlush = new CountDownLatch(1);
-        doAnswer(ignored -> {
+        when(storage.prepareAccountReclaim(TARGET)).thenReturn(() -> {
             flushing.countDown();
-            assertTrue(releaseFlush.await(10, TimeUnit.SECONDS));
-            return null;
-        }).when(storage).clearAccount(TARGET);
+            try {
+                assertTrue(releaseFlush.await(10, TimeUnit.SECONDS));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IOException(interrupted);
+            }
+        });
 
         try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
             Future<Response> result = executor.submit(() -> controller.reclaimAccount(TARGET, List.of(TARGET)));
@@ -225,9 +253,51 @@ class AccountReclaimTest {
         assertFalse(activity.isBusy(TARGET));
         assertFalse(Files.exists(target));
         assertEquals("foreign", Files.readString(foreign));
-        verify(storage).clearAccount(TARGET);
-        verifyNoMoreInteractions(storage);
+        verify(storage).prepareAccountReclaim(TARGET);
+        verify(storage, never()).clearAccount(TARGET);
         verifyNoInteractions(teardowns);
+    }
+
+    @Test
+    void dormantAccountReclaimPreservesForeignMultipartAndColdMetadata() throws Exception {
+        live.set(List.of());
+        StorageFactory factory = new StorageFactory(config, mock(ServiceConfigAccess.class));
+        EmulatorInfoController cold = controllerUsing(factory);
+        Path s3 = write("s3/.accounts/" + TARGET + "/bucket/object.s3data", "remove");
+        Path code = write("lambda-code/" + TARGET + "/fn/file", "remove");
+        Path multipart = write("s3/.multipart/foreign-upload/part", "preserve");
+        Path foreign = write("s3/.accounts/" + FOREIGN + "/bucket/object.s3data", "preserve");
+        Path buckets = write("s3-buckets.json", "{\"" + TARGET + "/target\":{\"name\":\"target\"},\""
+                + FOREIGN + "/foreign\":{\"name\":\"foreign\"}}");
+        Path unrelated = write("opaque.json", "{\"" + FOREIGN + "/key\":{\"value\":1}}");
+        String bytes = Files.readString(unrelated);
+
+        assertEquals(200, cold.reclaimAccount(TARGET, List.of(TARGET)).getStatus());
+
+        assertFalse(Files.exists(s3));
+        assertFalse(Files.exists(code));
+        assertEquals("preserve", Files.readString(multipart));
+        assertEquals("preserve", Files.readString(foreign));
+        assertEquals(bytes, Files.readString(unrelated));
+        assertFalse(Files.exists(directory.resolve("opaque.wal")));
+        assertEquals("{\"" + FOREIGN + "/foreign\":{\"name\":\"foreign\"}}", Files.readString(buckets));
+        verifyNoInteractions(services, teardowns);
+    }
+
+    @Test
+    void dormantUnreadableStoreIsLeftInPlaceBeforePayloadClear() throws Exception {
+        live.set(List.of());
+        StorageFactory factory = new StorageFactory(config, mock(ServiceConfigAccess.class));
+        EmulatorInfoController cold = controllerUsing(factory);
+        Path payload = write("s3/.accounts/" + TARGET + "/bucket/object.s3data", "intact");
+        Path invalid = write("unopened.json", "{invalid");
+        List<Path> before = entries();
+
+        assertThrows(IOException.class, () -> cold.reclaimAccount(TARGET, List.of(TARGET)));
+        assertEquals(before, entries());
+        assertEquals("intact", Files.readString(payload));
+        assertEquals("{invalid", Files.readString(invalid));
+        verifyNoInteractions(services, teardowns);
     }
 
     @Test

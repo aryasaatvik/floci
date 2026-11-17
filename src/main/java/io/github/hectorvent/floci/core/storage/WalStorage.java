@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.storage;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
@@ -83,6 +84,11 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
 
     public WalStorage(Path snapshotPath, Path walPath, TypeReference<Map<K, V>> typeReference,
                       long compactionIntervalMs, boolean appendHeavy) {
+        this(snapshotPath, walPath, typeReference, compactionIntervalMs, appendHeavy, true);
+    }
+
+    private WalStorage(Path snapshotPath, Path walPath, TypeReference<Map<K, V>> typeReference,
+                       long compactionIntervalMs, boolean appendHeavy, boolean scheduleCompaction) {
         this.appendHeavy = appendHeavy;
         this.idleCompactionNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(120_000L, compactionIntervalMs));
         this.snapshotPath = snapshotPath;
@@ -98,7 +104,9 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
         this.walMapper.registerModule(new JavaTimeModule());
         this.walMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
-        this.scheduler = StorageFiles.scheduleEvery("wal-storage-compaction", compactionIntervalMs, this::compactIfNeeded);
+        this.scheduler = scheduleCompaction
+                ? StorageFiles.scheduleEvery("wal-storage-compaction", compactionIntervalMs, this::compactIfNeeded)
+                : null;
     }
 
     @Override
@@ -331,6 +339,37 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
         }
     }
 
+    /** Reads an unopened store without starting its writer, repairing its files, or scheduling compaction. */
+    static <K, V> WalStorage<K, V> inspectForReclaim(Path snapshotPath, Path walPath,
+                                                    TypeReference<Map<K, V>> typeReference) throws IOException {
+        WalStorage<K, V> store = new WalStorage<>(snapshotPath, walPath, typeReference, Long.MAX_VALUE, false, false);
+        store.snapshotMapper.enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS,
+                DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
+        store.walMapper.enable(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS,
+                DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
+        if (StorageFiles.isRegularFileIfPresent(snapshotPath)) {
+            store.store.putAll(store.snapshotMapper.readValue(snapshotPath.toFile(), typeReference));
+        }
+        if (StorageFiles.isRegularFileIfPresent(walPath)) {
+            store.replayWal(true);
+        }
+        return store;
+    }
+
+    void reclaimUnopenedKeys(Set<K> keys) {
+        openWalWriter();
+        try {
+            deleteAllAtomically(keys);
+            flush();
+        } finally {
+            closeWalWriter();
+        }
+    }
+
+    Map<K, V> snapshot() {
+        return Map.copyOf(store);
+    }
+
     /** Timer ticks bound journal growth without repeatedly rewriting an almost unchanged large snapshot. */
     void compactIfNeeded() {
         compactIfNeeded(System.nanoTime());
@@ -457,13 +496,24 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
      * behind a valid record and are replayed on the next load instead of being lost behind the
      * garbage. A read error that is not a framing problem leaves the file alone.
      */
-    @SuppressWarnings("unchecked")
     private int replayWal() {
+        try {
+            return replayWal(false);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private int replayWal(boolean strict) throws IOException {
         int replayed = 0;
         long fileSize;
         try {
             fileSize = Files.size(walPath);
         } catch (IOException e) {
+            if (strict) {
+                throw e;
+            }
             LOG.errorv(e, "Failed to read the size of WAL {0}", walPath);
             return 0;
         }
@@ -516,13 +566,22 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
                 replayed++;
             }
         } catch (EOFException | JsonProcessingException e) {
+            if (strict) {
+                throw e;
+            }
             LOG.warnv("WAL {0} is unreadable from offset {1}: {2}", walPath, consumed, e.getMessage());
         } catch (IOException e) {
+            if (strict) {
+                throw e;
+            }
             cutTail = false;
             LOG.errorv(e, "Failed to replay WAL from {0} (replayed {1} entries before error)",
                     walPath, replayed);
         }
         if (cutTail && consumed < fileSize) {
+            if (strict) {
+                throw new IOException("Unreadable WAL record");
+            }
             cutWalTail(consumed, fileSize);
         }
         return replayed;

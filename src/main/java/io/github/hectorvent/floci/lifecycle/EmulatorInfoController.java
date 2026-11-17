@@ -265,7 +265,7 @@ public class EmulatorInfoController {
         if (!List.of(accountId).equals(confirm)) {
             return Response.status(400).entity(Map.of("error", "X-Floci-Confirm-Account must match accountId")).build();
         }
-        if (!accountReclaim.reclaim(accountId, this::resetServices, services -> clearAccountState(accountId, services))) {
+        if (!accountReclaim.reclaim(accountId)) {
             return Response.status(409).entity(Map.of("error", "account-busy", "accountId", accountId)).build();
         }
         return accountResetResponse(accountId);

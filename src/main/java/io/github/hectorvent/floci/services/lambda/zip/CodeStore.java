@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.FileTrees;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -67,10 +68,12 @@ public class CodeStore implements Resettable {
 
     @Override
     public void checkAccountReset(String accountId) {
-        if (functions == null) {
-            return;
+        if (functions != null) {
+            checkAccountPaths(accountId, functions.listAll());
         }
-        List<LambdaFunction> all = functions.listAll();
+    }
+
+    private void checkAccountPaths(String accountId, List<LambdaFunction> all) {
         List<Path> candidates = new ArrayList<>();
         candidates.add(accountCodePath(baseDir, accountId).toAbsolutePath().normalize());
         for (LambdaFunction function : all) {
@@ -105,20 +108,31 @@ public class CodeStore implements Resettable {
 
     @Override
     public void clearAccount(String accountId) {
-        checkAccountReset(accountId);
-        if (functions != null) {
-            List<LambdaFunction> all = functions.listAll();
-            for (LambdaFunction function : all) {
-                if (!accountId.equals(owner(function))) {
-                    continue;
-                }
-                Path legacy = getLegacyCodePath(function.getFunctionName());
-                boolean shared = all.stream().anyMatch(other -> other != function
-                        && !accountId.equals(owner(other))
-                        && legacy.toString().equals(other.getCodeLocalPath()));
-                if (!shared && !Files.isDirectory(legacy.resolve(REGIONS_DIR))) {
-                    deleteAccountDirectory(legacy);
-                }
+        List<LambdaFunction> all = functions == null ? List.of() : functions.listAll();
+        checkAccountPaths(accountId, all);
+        clearAccountFiles(accountId, all);
+    }
+
+    /** Resolves legacy code ownership from the store without initializing Lambda. */
+    public static StorageFactory.PreparedAccountReclaim prepareDormantAccountClear(
+            EmulatorConfig config, StorageFactory storage, String accountId) throws IOException {
+        CodeStore code = new CodeStore(config);
+        List<LambdaFunction> all = LambdaFunctionStore.inspectForReclaim(storage);
+        code.checkAccountPaths(accountId, all);
+        return () -> code.clearAccountFiles(accountId, all);
+    }
+
+    private void clearAccountFiles(String accountId, List<LambdaFunction> all) {
+        for (LambdaFunction function : all) {
+            if (!accountId.equals(owner(function))) {
+                continue;
+            }
+            Path legacy = getLegacyCodePath(function.getFunctionName());
+            boolean shared = all.stream().anyMatch(other -> other != function
+                    && !accountId.equals(owner(other))
+                    && legacy.toString().equals(other.getCodeLocalPath()));
+            if (!shared && !Files.isDirectory(legacy.resolve(REGIONS_DIR))) {
+                deleteAccountDirectory(legacy);
             }
         }
         // This also removes the preceding account/function layout and every version's code.

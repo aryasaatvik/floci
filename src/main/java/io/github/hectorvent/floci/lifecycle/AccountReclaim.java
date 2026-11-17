@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.FileTrees;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
 import io.github.hectorvent.floci.services.s3.S3Service;
@@ -25,7 +26,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -38,19 +38,21 @@ public class AccountReclaim {
     private final EmulatorConfig config;
     private final Supplier<List<Resettable>> liveServices;
     private final ContainerLifecycleManager containers;
+    private final StorageFactory storage;
 
     @Inject
     AccountReclaim(AccountActivity activity, EmulatorConfig config, Instance<Resettable> resettables,
-                   ContainerLifecycleManager containers) {
-        this(activity, config, () -> existingServices(resettables, Arc.container()::getActiveContext), containers);
+                   ContainerLifecycleManager containers, StorageFactory storage) {
+        this(activity, config, () -> existingServices(resettables, Arc.container()::getActiveContext), containers, storage);
     }
 
     AccountReclaim(AccountActivity activity, EmulatorConfig config, Supplier<List<Resettable>> liveServices,
-                   ContainerLifecycleManager containers) {
+                   ContainerLifecycleManager containers, StorageFactory storage) {
         this.activity = activity;
         this.config = config;
         this.liveServices = liveServices;
         this.containers = containers;
+        this.storage = storage;
     }
 
     Preview preview(String accountId) throws IOException {
@@ -61,14 +63,17 @@ public class AccountReclaim {
                 : 0;
         long lambdaCodeBytes = FileTrees.regularFileBytes(codeRoot, CodeStore.accountCodePath(codeRoot, accountId));
 
-        boolean busy = activity.isBusy(accountId) || isBusy(accountId, liveServices.get(), true) || hasContainers(accountId);
+        boolean busy = activity.isBusy(accountId) || isBusy(accountId, liveServices.get()) || hasContainers(accountId);
         return new Preview(accountId, !busy, busy ? "account-busy" : null, s3Bytes, lambdaCodeBytes);
     }
 
-    boolean reclaim(String accountId, Supplier<List<Resettable>> configuredServices,
-                    Consumer<List<Resettable>> reset) throws IOException {
+    boolean reclaim(String accountId) throws IOException {
         try (AccountActivity.Permit permit = activity.tryReclaim(accountId)) {
-            if (permit == null || isBusy(accountId, liveServices.get(), true) || hasContainers(accountId)) {
+            if (permit == null) {
+                return false;
+            }
+            List<Resettable> services = liveServices.get();
+            if (isBusy(accountId, services) || hasContainers(accountId)) {
                 return false;
             }
             Path persistentRoot = Path.of(config.storage().persistentPath());
@@ -77,19 +82,42 @@ public class AccountReclaim {
             }
             Path codeRoot = Path.of(config.services().lambda().codePath());
             FileTrees.checkScopedRoot(codeRoot, CodeStore.accountCodePath(codeRoot, accountId));
-            List<Resettable> services = configuredServices.get();
-            if (isBusy(accountId, services, false)) {
+
+            List<StorageFactory.PreparedAccountReclaim> unopened = new ArrayList<>();
+            try {
+                if (services.stream().noneMatch(CodeStore.class::isInstance)
+                        || services.stream().noneMatch(LambdaFunctionStore.class::isInstance)) {
+                    unopened.add(CodeStore.prepareDormantAccountClear(config, storage, accountId));
+                    services = services.stream().filter(service -> !(service instanceof CodeStore)).toList();
+                }
+                if (services.stream().noneMatch(S3Service.class::isInstance)) {
+                    unopened.add(S3Service.prepareDormantAccountClear(config, storage, accountId));
+                }
+            } catch (AwsException failure) {
+                if (failure.getHttpStatus() != 409) {
+                    throw failure;
+                }
                 return false;
             }
-            reset.accept(services);
+            StorageFactory.PreparedAccountReclaim clearStorage = storage.prepareAccountReclaim(accountId);
+            if (isBusy(accountId, liveServices.get()) || hasContainers(accountId)) {
+                return false;
+            }
+            for (Resettable service : services) {
+                service.clearAccount(accountId);
+            }
+            for (StorageFactory.PreparedAccountReclaim clearFiles : unopened) {
+                clearFiles.apply();
+            }
+            clearStorage.apply();
             return true;
         }
     }
 
-    private static boolean isBusy(String accountId, List<Resettable> services, boolean liveOnly) {
+    private static boolean isBusy(String accountId, List<Resettable> services) {
         // CodeStore delegates legacy path validation to LambdaFunctionStore. Checking through a
-        // dormant dependency here could open its backend. The scoped reset always runs that check.
-        boolean functionsLive = !liveOnly || services.stream().anyMatch(LambdaFunctionStore.class::isInstance);
+        // dormant dependency could open its backend. Reclaim checks dormant metadata before clearing.
+        boolean functionsLive = services.stream().anyMatch(LambdaFunctionStore.class::isInstance);
         for (Resettable service : services) {
             if (service instanceof CodeStore && !functionsLive) {
                 continue;
