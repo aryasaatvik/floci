@@ -59,6 +59,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
@@ -330,6 +331,9 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                 && (scheduleExpression == null || scheduleExpression.isBlank())) {
             throw new AwsException("ValidationException",
                     "Parameter(s) EventPattern or ScheduleExpression must be specified.", 400);
+        }
+        if (eventPattern != null && !eventPattern.isBlank()) {
+            parseAndValidatePattern(eventPattern);
         }
         String effectiveBus = resolvedBusName(busName);
         ensureBusExists(effectiveBus, region);
@@ -1042,12 +1046,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         if (eventJson == null || eventJson.isBlank()) {
             throw new AwsException("InvalidEventPatternException", "Event is required.", 400);
         }
-        try {
-            objectMapper.readTree(eventPattern);
-        } catch (Exception e) {
-            throw new AwsException("InvalidEventPatternException",
-                    "Event pattern is not valid JSON: " + e.getMessage(), 400);
-        }
+        parseAndValidatePattern(eventPattern);
         JsonNode event;
         try {
             event = objectMapper.readTree(eventJson);
@@ -1060,11 +1059,11 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
                     "Event must be a JSON object.", 400);
         }
         Map<String, Object> entry = new HashMap<>();
-        if (event.hasNonNull("source")) {
-            entry.put("Source", event.get("source").asText());
+        if (event.path("source").isTextual()) {
+            entry.put("Source", event.get("source").textValue());
         }
-        if (event.hasNonNull("detail-type")) {
-            entry.put("DetailType", event.get("detail-type").asText());
+        if (event.path("detail-type").isTextual()) {
+            entry.put("DetailType", event.get("detail-type").textValue());
         }
         if (event.hasNonNull("detail")) {
             JsonNode detail = event.get("detail");
@@ -1074,12 +1073,70 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             entry.put("Resources", event.get("resources"));
         }
         if (event.hasNonNull("account")) {
-            entry.put("Account", event.get("account").asText());
+            entry.put("Account", event.get("account").textValue());
         }
         if (event.hasNonNull("region")) {
-            entry.put("Region", event.get("region").asText());
+            entry.put("Region", event.get("region").textValue());
         }
         return matchesPattern(entry, eventPattern);
+    }
+
+    private void parseAndValidatePattern(String eventPattern) {
+        JsonNode pattern;
+        try {
+            pattern = objectMapper.reader()
+                    .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .readTree(eventPattern);
+        } catch (JsonProcessingException e) {
+            throw WildcardPattern.invalid("Event pattern is not valid JSON: " + e.getOriginalMessage());
+        }
+        if (!pattern.isObject()) {
+            throw WildcardPattern.invalid("Event pattern must be a JSON object.");
+        }
+        validateWildcardOperators(pattern);
+    }
+
+    private void validateWildcardOperators(JsonNode pattern) {
+        for (Map.Entry<String, JsonNode> field : pattern.properties()) {
+            JsonNode value = field.getValue();
+            if (value.isObject()) {
+                validateWildcardOperators(value);
+            } else if (value.isArray()) {
+                for (JsonNode element : value) {
+                    if ("$or".equals(field.getKey())) {
+                        validateWildcardOperators(element);
+                    } else if (element.has("wildcard")) {
+                        validateWildcardOperator(element);
+                        WildcardPattern.parse(element.get("wildcard"));
+                    } else if (element.path("anything-but").has("wildcard")) {
+                        JsonNode exclusion = element.get("anything-but");
+                        validateWildcardOperator(element);
+                        validateWildcardOperator(exclusion);
+                        wildcardExclusions(exclusion.get("wildcard"));
+                    }
+                }
+            }
+        }
+    }
+
+    private void validateWildcardOperator(JsonNode expression) {
+        if (expression.size() != 1) {
+            throw WildcardPattern.invalid("Only one operator is allowed in a wildcard expression.");
+        }
+    }
+
+    private List<WildcardPattern> wildcardExclusions(JsonNode operand) {
+        if (!operand.isArray()) {
+            return List.of(WildcardPattern.parse(operand));
+        }
+        List<WildcardPattern> patterns = new ArrayList<>();
+        for (JsonNode item : operand) {
+            patterns.add(WildcardPattern.parse(item));
+        }
+        if (patterns.isEmpty()) {
+            throw WildcardPattern.invalid("Wildcard exclusion list must contain at least one string.");
+        }
+        return patterns;
     }
 
     boolean matchesPattern(Map<String, Object> event, String eventPattern) {
@@ -1149,10 +1206,11 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             }
             JsonNode resourcesPattern = pattern.get("resources");
             if (resourcesPattern != null && resourcesPattern.isArray()) {
-                var resources = ((ArrayNode) event.get("Resources")).elements();
-                while (resources.hasNext()) {
-                    var resource = resources.next().asText(null);
-                    if (matchesArrayField(resourcesPattern, resource)) {
+                if (!(event.get("Resources") instanceof ArrayNode resources)) {
+                    return false;
+                }
+                for (JsonNode resource : resources) {
+                    if (resource.isTextual() && matchesArrayField(resourcesPattern, resource)) {
                         return true;
                     }
                 }
@@ -1238,8 +1296,16 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             if (element.has("equals-ignore-case")) {
                 return value != null && value.equalsIgnoreCase(element.get("equals-ignore-case").asText());
             }
+            if (element.has("wildcard")) {
+                return matchesWildcard(actual, WildcardPattern.parse(element.get("wildcard"))::matches);
+            }
             if (element.has("anything-but")) {
                 JsonNode anythingBut = element.get("anything-but");
+                if (anythingBut.has("wildcard")) {
+                    List<WildcardPattern> exclusions = wildcardExclusions(anythingBut.get("wildcard"));
+                    return matchesWildcard(actual,
+                            text -> exclusions.stream().noneMatch(pattern -> pattern.matches(text)));
+                }
                 if (anythingBut.isValueNode()) {
                     return actual != null && !actual.isNull() && !matchesExactValue(anythingBut, actual);
                 }
@@ -1264,6 +1330,21 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         }
         // Exact literal match (string, null, boolean, number)
         return matchesExactValue(element, actual);
+    }
+
+    private boolean matchesWildcard(JsonNode actual, Predicate<String> matcher) {
+        if (actual == null) {
+            return false;
+        }
+        if (actual.isArray()) {
+            for (JsonNode item : actual) {
+                if (item.isTextual() && matcher.test(item.textValue())) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        return actual.isTextual() && matcher.test(actual.textValue());
     }
 
     private boolean matchesExactValue(JsonNode expected, JsonNode actual) {
